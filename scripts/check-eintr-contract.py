@@ -89,6 +89,12 @@ INVENTORY = {
         "forbids",
         "The timeout is spent in 1 ms chunks before this reports EINTR.",
     ),
+    "syscall/io.c::tty_drain_interruptible": (
+        "forbids",
+        "The kernel returns a plain -EINTR from the TCSBRK/TCSBRKP/TIOCSBRK "
+        "drain (tty_io.c, no ERESTARTSYS), and part of the output has already "
+        "drained, so a restart would wait the interval again.",
+    ),
     "syscall/fuse.c::fuse_request_locked": (
         "forbids",
         "FUSE_INTERRUPT is on the wire and the request is detached, so a "

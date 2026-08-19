@@ -137,6 +137,29 @@ typedef struct {
 #define LINUX_FIOASYNC 0x5452   /* set/clear O_ASYNC (arg: int *) */
 #define LINUX_TIOCNOTTY 0x5422  /* -> macOS TIOCNOTTY (same semantics) */
 #define LINUX_TIOCGSID 0x5429   /* -> macOS TIOCGSID (same semantics) */
+
+/* Serial line control. Linux encodes the argument in the ioctl arg word itself;
+ * macOS has no ioctl form and exposes tcsendbreak/tcdrain/tcflush/tcflow.
+ */
+#define LINUX_TCSBRK 0x5409   /* arg 0: tcsendbreak; nonzero: tcdrain (glibc) */
+#define LINUX_TCXONC 0x540A   /* arg 0..3 -> tcflow TCOOFF/TCOON/TCIOFF/TCION */
+#define LINUX_TCFLSH 0x540B   /* arg 0..2 -> tcflush TCI/TCO/TCIOFLUSH */
+#define LINUX_TIOCEXCL 0x540C /* -> macOS TIOCEXCL (same semantics) */
+#define LINUX_TIOCNXCL 0x540D /* -> macOS TIOCNXCL (same semantics) */
+#define LINUX_TIOCOUTQ 0x5411 /* -> macOS TIOCOUTQ (int *) */
+#define LINUX_TCSBRKP 0x5425  /* POSIX tcsendbreak; arg is duration */
+#define LINUX_TIOCSBRK 0x5427 /* -> macOS TIOCSBRK (break on) */
+#define LINUX_TIOCCBRK 0x5428 /* -> macOS TIOCCBRK (break off) */
+
+/* Modem control lines. TIOCM_* bit values (LE=0x001 DTR=0x002 RTS=0x004
+ * ST=0x008 SR=0x010 CTS=0x020 CAR=0x040 RNG=0x080 DSR=0x100) are identical on
+ * Linux (asm-generic/termios.h) and macOS (sys/ttycom.h), so the int travels
+ * as-is.
+ */
+#define LINUX_TIOCMGET 0x5415 /* -> macOS TIOCMGET (int *) */
+#define LINUX_TIOCMBIS 0x5416 /* -> macOS TIOCMBIS (int *) */
+#define LINUX_TIOCMBIC 0x5417 /* -> macOS TIOCMBIC (int *) */
+#define LINUX_TIOCMSET 0x5418 /* -> macOS TIOCMSET (int *) */
 /* termios2 variant (adds c_ispeed/c_ospeed) */
 #define LINUX_TCGETS2 0x802c542a
 #define LINUX_TCSETS2 0x402c542b  /* termios2 set (TCSANOW) */
