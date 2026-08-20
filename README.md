@@ -202,6 +202,13 @@ do.
   mask); the host scheduler picks the actual CPU.
 - `/proc`, `/dev`, and mount data are synthetic compatibility views,
   not host pass-throughs.
+- USB interfaces bound to an Apple class driver (CDC serial, HID, FTDI)
+  cannot be claimed; `CLAIMINTERFACE` reports `EBUSY`, and root-mode
+  device capture is not implemented. CDC serial devices are reachable by
+  opening the host's `/dev/cu.*` node instead.
+- USB mass storage will never be claimable, even with capture; macOS
+  does not release it.
+- Isochronous URBs are unimplemented; submitting one reports `EINVAL`.
 - `uname` and `/proc/version` report Linux 6.18 LTS, a floor for
   version-gated userspace; `src/syscall/dispatch.tbl` states what is
   implemented.
