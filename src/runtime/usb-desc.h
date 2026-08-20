@@ -25,6 +25,7 @@
 #define USB_DT_DEVICE 1
 #define USB_DT_CONFIG 2
 #define USB_DT_INTERFACE 4
+#define USB_DT_ENDPOINT 5
 
 /* Shortest descriptor that can carry a type: bLength + bDescriptorType. */
 #define USB_DESC_MIN_LEN 2
@@ -33,6 +34,7 @@
 #define USB_DEVICE_DESC_LEN 18
 #define USB_CONFIG_DESC_LEN 9
 #define USB_INTERFACE_DESC_LEN 9
+#define USB_ENDPOINT_DESC_LEN 7
 
 typedef struct {
     const uint8_t *buf;

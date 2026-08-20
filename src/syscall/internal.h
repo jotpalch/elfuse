@@ -113,6 +113,21 @@
  *                                     which is what pins a session against
  *                                     daemon exit while a request is in flight
  *   inotify_lock (syscall/inotify.c): inotify watch table
+ *   usbdev_table_lock (syscall/usbdev.c): FD_USBDEV side table. It is never
+ *                                     held together with the per-entry usbdev
+ *                                     lock: usbdev_acquire and
+ *                                     usbdev_fd_cleanup both find their entry
+ *                                     under the table lock, drop it, and only
+ *                                     then take the entry lock, because a sync
+ *                                     transfer can hold that lock for a whole
+ *                                     timeout and no other fd may wait behind
+ *                                     it. What keeps the slot from being torn
+ *                                     down and reused in between is the refs
+ *                                     and dead pair the lookup sets under the
+ *                                     table lock, not a nesting. Never held
+ *                                     together with any other file-scope lock
+ *                                     in this list either, in either direction,
+ *                                     so its position here is nominal
  *
  * Leaves. Each of these is the innermost lock on every path that takes it, so
  * it has no position in the order above and cannot be half of an inversion:
@@ -608,7 +623,7 @@ static inline bool fd_type_is_synthetic(int type)
 {
     return type == FD_EVENTFD || type == FD_SIGNALFD || type == FD_TIMERFD ||
            type == FD_INOTIFY || type == FD_NETLINK || type == FD_PIDFD ||
-           type == FD_EPOLL;
+           type == FD_EPOLL || type == FD_USBDEV;
 }
 
 /* The status bits the host description is authoritative for. Everything outside

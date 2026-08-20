@@ -71,6 +71,7 @@ SRCS := \
     syscall/net-absock.c \
     syscall/net-sockopt.c \
     syscall/netlink.c \
+    syscall/usbdev.c \
     syscall/sysvipc.c \
     debug/crashreport.c \
     debug/gdbstub.c \
@@ -351,6 +352,12 @@ CROSS_TEST_CFLAGS = -D_GNU_SOURCE -static -O2 -MMD -MP
 $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
+
+# test-usbdev-ioctl churns open/read/close on one usbdevfs node from four
+# threads, so a close and a sibling's open contend for the same fd number.
+$(BUILD_DIR)/test-usbdev-ioctl: tests/test-usbdev-ioctl.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 # test-eventfd-semaphore-contended races two blocking readers on one eventfd.
 $(BUILD_DIR)/test-eventfd-semaphore-contended: \

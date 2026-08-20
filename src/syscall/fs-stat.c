@@ -24,6 +24,7 @@
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
+#include "syscall/usbdev.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "utils.h"
@@ -241,6 +242,20 @@ static int64_t stat_empty_path_fd(int dirfd, struct stat *mac_st)
     }
 
     int64_t rc = 0;
+
+    /* usbdevfs fds are char device 189:minor and the host fd behind them is a
+     * pipe, whose fstat must not leak through. Ahead of the stamp branch for
+     * the same reason the FUSE shim is ahead of both: the descriptor is
+     * answered by the emulation layer that owns it, not by re-resolving the
+     * name it was opened under. Behind it the branch was unreachable -- every
+     * FD_USBDEV fd carries a /dev/bus stamp, so fd_stat_answers_from_stamp
+     * claimed all of them and answered from the path.
+     */
+    if (snap.type == FD_USBDEV) {
+        rc = usbdev_fstat(dirfd, mac_st);
+        goto done;
+    }
+
     if (fd_stat_answers_from_stamp(&snap)) {
         /* The descriptor already names one object: an O_PATH open that followed
          * refers to the target, one made with O_NOFOLLOW to the link itself, so
@@ -256,6 +271,7 @@ static int64_t stat_empty_path_fd(int dirfd, struct stat *mac_st)
             goto done;
         }
     }
+
     if (fstat(ref.fd, mac_st) < 0)
         rc = linux_errno();
 

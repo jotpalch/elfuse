@@ -438,11 +438,12 @@ bash tests/driver.sh -f test-proc
 
 ## Fault Injection And Recorded Rows
 
-Three failures the directory and identity lanes have to pin cannot be provoked
-from a test: a `malloc` coming back NULL part-way through a backing listing, a
-`readdir` that fails part-way through a directory elfuse itself materialized,
-and a slot replaced inside a window that is sub-microsecond wide unaided. Each
-has an environment hook, read once and with no effect at all when unset:
+Several failures these lanes have to pin cannot be provoked from a test: a
+`malloc` coming back NULL part-way through a backing listing, a `readdir` that
+fails part-way through a directory elfuse itself materialized, a slot replaced
+inside a window that is sub-microsecond wide unaided, and, on the usbdevfs fd,
+each of the three ways an open can fail before it returns. Each has an
+environment hook, read once and with no effect at all when unset:
 
 | Variable | Effect | Driven by |
 |----------|--------|-----------|
@@ -450,12 +451,18 @@ has an environment hook, read once and with no effect at all when unset:
 | `ELFUSE_DIR_PRIMARY_READ_FAULT=N` | `readdir` on the synthetic stream fails with `EIO` after N entries | `test-dir-primary-read-error` |
 | `ELFUSE_DIR_UNION_BACKING_DELAY_US=N` | widens the window between pinning a directory stream and looking its backing up | `test-dir-union-fd-reuse` |
 | `ELFUSE_FD_IDENTITY_WINDOW_US=N` | widens the window between reading a descriptor's stamp and pinning its host fd | `test-fstatfs-fd-identity` |
+| `ELFUSE_USBDEV_OPEN_FAULT=info\|blob\|pipe` | fails one step of a usbdevfs open: the model lookup or the descriptor copy with `ENOMEM`, the readiness pipe with `ENFILE` | `test-usbdev-faults` |
+| `ELFUSE_USBDEV_PUBLISH_DELAY_US=N` | widens the window between `fd_alloc` publishing a usbdevfs fd and the side table binding it, where a close finds no entry | `test-usbdev-faults` |
+| `ELFUSE_USBDEV_RETIRE_DELAY_US=N` | widens the window between the side table binding a usbdevfs fd and the open's recheck, where a close can reap the entry and a sibling open can take its slot | `test-usbdev-faults` |
 
 `ELFUSE_USB_FIXTURE` is the same shape pointing at enumeration rather than
 failure: it stands a deterministic synthetic USB tree up in place of whatever
 IOKit reports, so the lanes below have devices to walk on any host.
 `ELFUSE_USB_FIXTURE=overflow` stands up 129 address-less devices on one bus for
-the `devnum` cap.
+the `devnum` cap. `ELFUSE_USB_FIXTURE=badifnum` adds one device whose only
+interface declares `bInterfaceNumber` 200: every byte is well formed and the
+range is the field's own, but nothing anyone can plug in emits it, so it is the
+only way to reach the paths that index by that number.
 
 The lanes these drive:
 
@@ -469,6 +476,7 @@ The lanes these drive:
 | `test-dir-union-alias` | every route to a second fd on one description shares one position and one union state |
 | `test-dir-fd-budget-union` | a union directory fd costs one host descriptor, like a plain one |
 | `test-fstatfs-fd-identity` | `fstatfs` answers for the descriptor it pinned, not for the fd number |
+| `test-usbdev-faults` | an interface number wider than the table that indexes it, each open-time failure reported as itself, and a close inside the fd publish window leaking nothing |
 
 Two lanes carry rows that are recorded rather than asserted, and print as
 `XFAIL`. An `XFAIL` row is a measured Linux value the build knowingly does not

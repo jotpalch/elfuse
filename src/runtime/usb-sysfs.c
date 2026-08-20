@@ -24,11 +24,11 @@
  * canonicalizes to itself, which libusb (opens attrs relative to the entry) and
  * nusb (canonicalize() of the entry path) both tolerate.
  *
- * Stage-1 open contract for /dev/bus/usb/BBB/DDD: O_RDONLY returns a synthetic
- * host fd holding the descriptors blob (matching the usbfs read() view,
- * devio.c:311-390); O_RDWR/O_WRONLY fails with EACCES. TEMPORARY: stage 2
- * replaces this constructor with a typed FD_USBDEV fd whose read() serves the
- * same blob via usb_sysfs_descriptors_dup and whose ioctl set talks to IOKit.
+ * /dev/bus/usb/BBB/DDD opens: since stage 2, every non-O_PATH open is served by
+ * the typed FD_USBDEV constructor (syscall/usbdev.c) before this intercept
+ * runs; the node branch here only backs O_PATH opens with a synthetic blob fd
+ * (the FD_PATH + stat-stamp path). The blob it serves and the FD_USBDEV read()
+ * view are the same bytes (usb_sysfs_descriptors_dup).
  */
 
 #include <ctype.h>
@@ -297,6 +297,16 @@ typedef struct {
     unsigned vid;
     unsigned pid;
     unsigned nifaces;
+
+    /* bInterfaceNumber of the first interface; each further one counts up from
+     * it. Normally 0, so the numbers are 0, 1, ... and match the array
+     * positions. The knob exists because bInterfaceNumber is a device-supplied
+     * byte with the whole 0..255 range behind it while the consumers of it are
+     * sized for far fewer, and no device anyone can plug in declares a large
+     * one, so without a fixture that can emit one there is no way to assert
+     * what happens when a device does.
+     */
+    unsigned ifnum_base;
 } usb_fixture_spec_t;
 
 /* The number of interface descriptors is the only thing that varies the blob
@@ -306,7 +316,7 @@ typedef struct {
 static size_t usb_fixture_blob_len(unsigned nifaces)
 {
     return USB_DEVICE_DESC_LEN + USB_CONFIG_DESC_LEN +
-           (size_t) nifaces * USB_INTERFACE_DESC_LEN;
+           (size_t) nifaces * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
 }
 
 /* Fill @d from @s, writing the device, configuration and interface descriptors
@@ -337,7 +347,8 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     snprintf(d->name, sizeof(d->name), "%d-%d", s->busnum, s->port);
 
     size_t cfg_total =
-        USB_CONFIG_DESC_LEN + (size_t) s->nifaces * USB_INTERFACE_DESC_LEN;
+        USB_CONFIG_DESC_LEN +
+        (size_t) s->nifaces * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
     build_device_descriptor(d, blob);
     uint8_t *c = blob + USB_DEVICE_DESC_LEN;
     c[0] = USB_CONFIG_DESC_LEN;
@@ -351,16 +362,34 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     c[8] = 50;                   /* bMaxPower: 100 mA */
     for (unsigned i = 0; i < s->nifaces; i++) {
         uint8_t *q =
-            c + USB_CONFIG_DESC_LEN + (size_t) i * USB_INTERFACE_DESC_LEN;
+            c + USB_CONFIG_DESC_LEN +
+            (size_t) i * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
         q[0] = USB_INTERFACE_DESC_LEN;
         q[1] = USB_DT_INTERFACE;
-        q[2] = (uint8_t) i; /* bInterfaceNumber */
-        q[3] = 0;           /* bAlternateSetting */
-        q[4] = 1;           /* bNumEndpoints */
-        q[5] = 0xff;        /* bInterfaceClass: vendor-specific */
+        unsigned ifnum = s->ifnum_base + i;
+        q[2] = (uint8_t) ifnum; /* bInterfaceNumber */
+        q[3] = 0;               /* bAlternateSetting */
+        q[4] = 1;               /* bNumEndpoints */
+        q[5] = 0xff;            /* bInterfaceClass: vendor-specific */
         q[6] = 0x00;
         q[7] = 0x00;
         q[8] = 0;
+
+        /* The endpoint the interface descriptor above says it has. Without it
+         * the blob was self-contradictory, and every endpoint-addressed
+         * usbdevfs path (BULK, CLEAR_HALT, RESETEP, the control endpoint
+         * recipient) had nothing to resolve against, so the fixture could not
+         * reach the code that decides between "no such endpoint" and "bad
+         * argument". Bulk IN, one per interface: 0x81, 0x82, ...
+         */
+        uint8_t *e = q + USB_INTERFACE_DESC_LEN;
+        e[0] = USB_ENDPOINT_DESC_LEN;
+        e[1] = USB_DT_ENDPOINT;
+        e[2] = (uint8_t) (0x81 + i); /* bEndpointAddress: bulk IN */
+        e[3] = 0x02;                 /* bmAttributes: bulk */
+        e[4] = 0x40;                 /* wMaxPacketSize: 64 */
+        e[5] = 0x00;
+        e[6] = 0; /* bInterval */
     }
 }
 
@@ -378,6 +407,14 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
  * regression fixture for the devnum cap -- without the cap bus1's 129th device
  * takes devnum 129 and shares minor 128 with bus2's first, so the cap must drop
  * everything past devnum 127.
+ *
+ * ELFUSE_USB_FIXTURE=badifnum: the default set plus /dev/bus/usb/001/002, whose
+ * one interface declares bInterfaceNumber 200 and carries endpoint 0x81. It is
+ * a malformed descriptor only in the sense that no sane device emits one: every
+ * byte is well formed and the range is the field's own, which is why nothing
+ * short of a fixture reaches the paths that index by that number. Added as a
+ * separate mode rather than to the default set so the lanes that walk the tree
+ * keep the device list they were written against.
  */
 static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
 {
@@ -385,15 +422,18 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
     int n = 0;
     if (mode && !strcmp(mode, "overflow")) {
         for (int port = 1; port <= 129 && n < cap; port++)
-            specs[n++] = (usb_fixture_spec_t) {1, port, 0, 0x1d6b, 0x0002, 1};
+            specs[n++] =
+                (usb_fixture_spec_t) {1, port, 0, 0x1d6b, 0x0002, 1, 0};
         if (n < cap)
-            specs[n++] = (usb_fixture_spec_t) {2, 1, 0, 0x2109, 0x0100, 1};
+            specs[n++] = (usb_fixture_spec_t) {2, 1, 0, 0x2109, 0x0100, 1, 0};
         return n;
     }
     if (n < cap)
-        specs[n++] = (usb_fixture_spec_t) {1, 1, 1, 0x1d6b, 0x0002, 2};
+        specs[n++] = (usb_fixture_spec_t) {1, 1, 1, 0x1d6b, 0x0002, 2, 0};
     if (n < cap)
-        specs[n++] = (usb_fixture_spec_t) {2, 1, 1, 0x2109, 0x0100, 1};
+        specs[n++] = (usb_fixture_spec_t) {2, 1, 1, 0x2109, 0x0100, 1, 0};
+    if (mode && !strcmp(mode, "badifnum") && n < cap)
+        specs[n++] = (usb_fixture_spec_t) {1, 2, 2, 0x1d6b, 0x0002, 1, 200};
     return n;
 }
 
@@ -1327,10 +1367,15 @@ static void fill_synth_chardev(struct stat *st,
 {
     memset(st, 0, sizeof(*st));
 
-    /* 0664 rather than udev's root:root 0660 policy: the single-user guest must
-     * be able to open its own device nodes.
+    /* 0666 rather than udev's root:root 0660 policy: the single-user guest must
+     * be able to open its own device nodes, which is what a desktop Linux
+     * spells as a uaccess ACL for the seat owner. The owner reported below is
+     * the host user, and the guest's own uid need not equal it, so 0664 left
+     * access(W_OK) answering EACCES for a node that open(O_RDWR) then served --
+     * the two entry points onto one permission question disagreeing. Stage 1
+     * had no writable open to disagree with; stage 2 does.
      */
-    st->st_mode = S_IFCHR | 0664;
+    st->st_mode = S_IFCHR | 0666;
     st->st_nlink = 1;
     st->st_dev = USB_SYNTH_DEV;
     st->st_ino = usb_synth_ino(canon);
@@ -1868,12 +1913,14 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
         }
         int accmode = translate_open_flags(linux_flags) & O_ACCMODE;
         if (accmode != O_RDONLY) {
-            /* TEMPORARY (stage 1): writable opens are what stage 2's FD_USBDEV
-             * constructor will serve; until then they fail.
+            /* Unreachable through sys_openat_path: usbdev_open_path claims
+             * every non-O_PATH open of a node before proc_intercept_open runs
+             * (stage 2, syscall/usbdev.c). Kept as a guard for any other caller
+             * of the intercept.
              */
             log_warn(
-                "usb-sysfs: O_RDWR open of %s not implemented yet "
-                "(stage 2)",
+                "usb-sysfs: writable open of %s bypassed the FD_USBDEV "
+                "constructor",
                 path);
             err = EACCES;
             goto out;
@@ -2226,4 +2273,48 @@ uint8_t *usb_sysfs_descriptors_dup(int busnum, int devnum, size_t *len_out)
     }
     pthread_mutex_unlock(&usb_lock);
     return copy;
+}
+
+int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out)
+{
+    pthread_mutex_lock(&usb_lock);
+    int rc = -1;
+    if (ensure_usb_tree() == 0) {
+        usb_dev_t *d = find_dev(busnum, devnum);
+        if (d) {
+            out->location_id = d->location_id;
+            out->speed_code = d->speed_code;
+            out->cfg_value = d->cfg_value;
+            out->minor = usb_minor(d);
+            out->blob_len = d->blob_len;
+            out->vid = d->vid;
+            out->pid = d->pid;
+            str_copy_trunc(out->serial, d->serial, sizeof(out->serial));
+            rc = 0;
+        } else {
+            errno = ENODEV;
+        }
+    }
+    pthread_mutex_unlock(&usb_lock);
+    return rc;
+}
+
+int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st)
+{
+    pthread_mutex_lock(&usb_lock);
+    int rc = -1;
+    if (ensure_usb_tree() == 0) {
+        usb_dev_t *d = find_dev(busnum, devnum);
+        if (d) {
+            char node[64];
+            snprintf(node, sizeof(node), "/dev/bus/usb/%03d/%03d", busnum,
+                     devnum);
+            fill_synth_chardev(st, node, d);
+            rc = 0;
+        } else {
+            errno = ENODEV;
+        }
+    }
+    pthread_mutex_unlock(&usb_lock);
+    return rc;
 }

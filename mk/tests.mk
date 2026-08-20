@@ -43,7 +43,8 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-matrix \
-        test-usb-sysfs-overflow test-dir-fd-budget-union \
+        test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
+        test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
         test-fstatfs-fd-identity \
         test-dir-union-alias test-dir-primary-read-error \
@@ -266,6 +267,8 @@ $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
 $(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point against every path class)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
+$(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
+$(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
 $(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
 $(call run-lane,test-dir-backing-drain-error,a lost union listing is reported not truncated)
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
@@ -1625,6 +1628,10 @@ test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 ## Assert the synthetic USB tree's contract and its two agreeing views
 # The device-dependent half only runs against whatever is attached, so the lane
 # prints the device count rather than letting an empty bus read as full cover.
+# The fixture stays on: stage 2's FD_USBDEV constructor resolves its IOKit
+# device on first use rather than at open, so a modeled device with no hardware
+# behind it still opens, reads and stats like one -- which is what keeps this
+# lane's device half running on a machine with no USB device attached.
 test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 
@@ -1683,6 +1690,40 @@ test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
 ## whole model is synthetic here.
 test-usb-sysfs-overflow: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
 	ELFUSE_USB_FIXTURE=overflow $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+
+## The usbdevfs fd's contract, decided before anything reaches the wire
+# The fixture's devices are modeled with no IOKit service behind them, which is
+# exactly the shape of a device the machine cannot reach: every answer below is
+# the same on a host with no USB device attached and on one with a bus full of
+# them, so the file contract, the ioctl gates and the whole argument-validation
+# surface get a lane that does not depend on what is plugged in.
+test-usbdev-ioctl: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+
+## The usbdevfs fd's failures, one forced condition per run
+# Six things this descriptor has to get right cannot be provoked from a guest on
+# a healthy host: a device declaring an interface number wider than the table
+# that indexes by it, the three ways an open can fail before it returns, and the
+# two windows an open leaves around the moment the side table binds its guest
+# fd -- before the bind, where a close finds no entry, and after it, where a
+# close can reap the entry and a sibling open can take the slot back. Each run
+# below forces exactly one and the binary asserts only that one, so a failure
+# names the condition. The malformed-descriptor run is also where the
+# out-of-bounds read lives: it is invisible in the answer -- both sides report
+# EINVAL, which is what checkintf reports -- and shows up only under
+# -fsanitize=array-bounds, which is why this lane is in the sanitizer set.
+test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=badifnum $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=info \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=blob \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=pipe \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_PUBLISH_DELAY_US=20000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_RETIRE_DELAY_US=20000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 
 ## fstatfs answers for the descriptor it pinned, not for the fd number
 # The identity is decided from the slot's stamp and from the descriptor itself,

@@ -51,6 +51,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "syscall/io.h"  /* io_retry_backoff */
 #include "syscall/net.h" /* absock_unregister_fd */
 #include "syscall/path.h"
+#include "syscall/usbdev.h"
 #include "syscall/poll.h" /* epoll_dup_fd */
 #include "syscall/proc.h"
 
@@ -884,6 +885,13 @@ int64_t sys_openat_path(guest_t *g,
     if (path_might_use_open_intercept(tx.intercept_path)) {
         if (!strcmp(tx.intercept_path, "/dev/fuse"))
             return fuse_proc_open(linux_flags);
+
+        /* /dev/bus/usb/BBB/DDD: typed FD_USBDEV constructor (any access mode
+         * except O_PATH, which the stage-1 placeholder serves).
+         */
+        int64_t usb_fd = usbdev_open_path(tx.intercept_path, linux_flags);
+        if (usb_fd != INT64_MIN)
+            return usb_fd;
         int64_t fuse_fd =
             fuse_open_path(g, tx.intercept_path, linux_flags, mode);
         if (fuse_fd != INT64_MIN)
@@ -1300,6 +1308,18 @@ static int duplicate_guest_fd(int src_fd,
             close_keep_errno(new_host_fd);
         return fuse_dup_fd(src_fd, min_guest_fd, fixed_guest_fd, fixed_slot,
                            linux_flags);
+    }
+
+    /* TODO(stage 3): explicit usbdev alias sharing the side-table entry
+     * (fuse_dup_fd pattern). Refusing the dup beats handing out an alias whose
+     * ioctls would miss the side table keyed by the original fd.
+     */
+    if (src_snap.type == FD_USBDEV) {
+        proc_pty_unlock_for_dup();
+        if (new_host_fd >= 0)
+            close_keep_errno(new_host_fd);
+        errno = EBADF;
+        return -1;
     }
 
     /* eventfd dup must share the underlying counter and pipe state across the
@@ -2902,6 +2922,9 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
 int64_t sys_lseek(int fd, int64_t offset, int whence)
 {
     int64_t frc = fuse_lseek_fd(fd, offset, whence);
+    if (frc != INT64_MIN)
+        return frc;
+    frc = usbdev_lseek_fd(fd, offset, whence);
     if (frc != INT64_MIN)
         return frc;
 

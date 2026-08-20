@@ -112,6 +112,8 @@ typedef struct {
 #define LINUX_EILSEQ 84     /* Illegal byte sequence */
 #define LINUX_EHOSTDOWN 112 /* Host is down */
 #define LINUX_ENODATA 61    /* No data available (xattr missing, stream) */
+#define LINUX_EPIPE 32      /* Broken pipe; also usbfs endpoint stall */
+#define LINUX_ETIME 62      /* Timer expired (USB device not responding) */
 
 /* Linux FD flags. */
 #define LINUX_FD_CLOEXEC 1
@@ -508,6 +510,7 @@ typedef struct {
 #define FD_FUSE_FILE 15
 #define FD_FUSE_DIR 16
 #define FD_URANDOM 17
+#define FD_USBDEV 18
 #define FD_VIRTUAL_PATH_MAX 64
 
 /* File sealing flags (F_SEAL_*) for memfd_create. Tracked per-FD. */

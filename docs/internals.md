@@ -106,6 +106,7 @@ Key files:
 | `src/syscall/time.c` | clocks, timers, `setitimer`, clock-ID translation |
 | `src/syscall/sys.c` | `uname`, `sysinfo`, `getrandom`, `prlimit64` |
 | `src/syscall/net.c`, `net-abi.c`, `net-absock.c`, `net-msg.c`, `net-sockopt.c`, `netlink.c` | sockets, SCM_RIGHTS, abstract Unix sockets, netlink |
+| `src/syscall/usbdev.c` | usbdevfs fds over IOKit (see [USB Device Passthrough](#usb-device-passthrough)) |
 | `src/syscall/translate.c` | errno and shared `AT_*` flag translation |
 | `src/syscall/proc.c` | vCPU run loop, `wait4`, ptrace coordination, HVC #6 routing |
 | `src/syscall/exec.c` | `execve`: ELF reload, interpreter resolve, vCPU restart |
@@ -605,6 +606,7 @@ waiter enqueue, so the compare-and-wait is a single critical section.
 | FUSE (sessions, file/dir state) | global `fuse_lock` + per-session `session->lock` | `src/syscall/fuse.c` |
 | Sysroot snapshot | `pthread_mutex` | `src/syscall/proc-state.c` |
 | Synthetic USB tree (scratch dirs + device model) | `usb_lock` (leaf) | `src/runtime/usb-sysfs.c` |
+| usbdevfs fd side table | `usbdev_table_lock` + per-entry lock | `src/syscall/usbdev.c` |
 
 Lock ordering is documented inline in those files
 (`mmap_lock` is order 1, `fd_lock` is order 3, `sfd_lock` is order 5a)
@@ -858,6 +860,172 @@ Validation lives in `make test-fuse-alpine`, which exercises
 `/dev/fuse` plus `mount("fuse")` against the staged Alpine musl
 sysroot fixture.
 
+## USB Device Passthrough
+
+`src/syscall/usbdev.c` implements the usbdevfs character device
+(`/dev/bus/usb/BBB/DDD`) on top of IOKit's `IOUSBDeviceInterface650` and
+`IOUSBInterfaceInterface800` plugin interfaces, so Linux USB tools drive
+real devices attached to the Mac. macOS arbitrates that access per IOKit
+object and dynamically: `USBInterfaceOpen` refuses an interface exactly while
+some driver holds that interface open, and grants it while that driver is
+idle. An interface bound to an idle Apple class driver therefore does open --
+the ESP32-S3's CDC data interface opens whenever nothing holds
+`/dev/cu.usbmodem1101` and refuses while something does -- so the layer
+attempts the open and maps what IOKit answers rather than deciding from the
+presence of a bound driver.
+
+The fd model: opening a node constructs a typed `FD_USBDEV` fd. The open
+consults the model, not the hardware: `stat`, `access` and an `O_PATH` open
+of the same name are all answered from the model, so requiring a live IOKit
+service here would make a plain `O_RDONLY` the one entry point that reported
+`ENODEV` for a node the other three describe. The service is resolved on
+first use instead, and every operation that needs the wire reports `ENODEV`
+when it is not there.
+
+Per-fd state (the IOKit device handle, claimed interfaces, and the
+endpoint-to-pipe map) lives in a side table keyed by the guest fd and the fd
+generation, so a concurrently closed and reallocated guest fd cannot reach
+another open's state. A lookup pins its entry under `usbdev_table_lock` and
+then takes the per-entry lock with the table lock released: taking the two
+nested meant a thread blocked on one fd's transfer held the table lock on
+every other thread's behalf, and one transfer with usbdevfs's documented
+"unlimited" `timeout == 0` wedged every usbdevfs fd in the process,
+`close()` included. Teardown runs from the fd-cleanup hook, which is handed
+a bare fd number after the fd-table slot is already free, so a sibling
+thread's open can already hold the same number; among the entries that
+answer to it the closing one is the one with the smaller generation, since
+`fd_alloc` stamps a globally monotonic counter. `fd_alloc` also publishes the
+guest fd before the side table can bind it, so a close landing in that window
+would find no entry to tear down; the open rereads the fd's generation once its
+entry is findable and retires the entry itself if the close has already been
+and gone.
+
+That leaves two windows around the bind, and the entry keeps one identity
+across both. Before the bind its `guest_fd` is still -1, so a close finds
+nothing; after it, the entry is findable and therefore also freeable, so a
+close can reap it, the last unref can free the slot, and a sibling open can
+bind its own live fd there before the recheck runs. The generation is the one
+`fd_alloc_from` reports from inside the allocating `fd_lock` section, not a
+later read of the slot -- read back after the slot was publishable it is
+whatever the number carries by then, which in the first window is a reopening
+thread's stamp, and two entries then hold the same pair. And the retire path
+claims the whole tuple the caller allocated (used and alive, this fd number,
+this generation) rather than testing that the slot is not dead, which in the
+second window claims the sibling's entry instead. The tuple is sufficient
+because slot storage is static, so the read is always defined; all four fields
+are written and read under `usbdev_table_lock`, so they are read as one value;
+and `fd_next_generation` is globally monotonic, so each entry carries its own
+allocation's stamp and no two live entries can present the same pair.
+
+The entry's host fd is a pipe read end reserved for readiness signaling.
+`read()` serves the descriptors blob at a per-open file position,
+byte-identical to the sysfs `descriptors` attribute; `SEEK_END` is `EINVAL`,
+as on Linux usbfs; `fstat` reports a character device, major 189, answered from
+the entry's own identity ahead of the `/dev/bus` path stamp, the way a FUSE
+descriptor is answered by the layer that owns it. The whole
+write family -- `write`, `writev`, `pwrite`, `pwritev` -- is `EBADF` without
+`FMODE_WRITE` and `EINVAL` otherwise, the order `vfs_write` checks
+`FMODE_WRITE` and then `FMODE_CAN_WRITE`; none of them may fall through to
+the readiness pipe behind the fd. The two capability bits are derived once,
+the way `OPEN_FMODE` derives them -- `(flags + 1) & O_ACCMODE`, not a
+comparison against `O_RDONLY` -- and the four gates that need them (read,
+pread, the write family, and the ioctl surface) read that. Access mode 3 is
+the case the comparison gets wrong: `open(2)` takes it and `ACC_MODE(3)` asks
+this 0666 node for read plus write, which it grants, so Linux hands back a
+descriptor carrying neither `FMODE_READ` nor `FMODE_WRITE` and refuses
+everything on it. `dup` of the fd is refused with `EBADF`
+(the side table is keyed by the guest fd and IOKit plugin handles are
+process-local).
+
+The ioctl surface at this layer: `CLAIMINTERFACE` / `RELEASEINTERFACE`,
+`SETINTERFACE`, `SETCONFIGURATION`, `CLEAR_HALT` / `RESETEP`, `GETDRIVER`,
+`GET_CAPABILITIES`, `GET_SPEED`, `CONNECTINFO`, `DISCONNECT_CLAIM`,
+`USBDEVFS_IOCTL` `DISCONNECT` / `CONNECT`, and the synchronous `CONTROL`
+and `BULK` transfers, which bounce guest data through host buffers around
+`DeviceRequestTO` and `ReadPipeTO` / `WritePipeTO`. The transfers here are
+synchronous: the guest thread blocks in the ioctl for the duration of the
+request.
+
+errno fidelity is the design rule, because libusb and friends branch on
+exact values, and so is the *order* the answers are decided in, which is just
+as observable: `check_ctrlrecip` runs before the `wLength` cap and
+`findintfep` before the transfer-length checks, so a request naming an
+endpoint or interface the device does not have is `ENOENT` however long it
+is. The reserved-bit test on an endpoint address lives in the one lookup
+`BULK`, `CLEAR_HALT`, `RESETEP` and the control endpoint recipient all go
+through, so the four cannot disagree about it. The interface-number bound is
+64, `8 * sizeof(unsigned long)` as in `claimintf`; between 64 and 32 an
+interface is merely absent, which is a question about the device.
+
+Every argument that comes off the wire is bounded where it enters, not only
+where it is used. `bInterfaceNumber` is a device-supplied byte with the whole
+0..255 range behind it, and the endpoint-owner lookup reports it back as the
+`EINVAL` `checkintf` reports rather than handing a 64-entry array an index of
+200. An endpoint address arrives as a 32-bit word and is tested as one, since
+narrowing it to a byte first resolves the transfer to an endpoint the caller
+did not name; the control path is the exception Linux itself makes, masking
+`wIndex` to its low byte before the lookup. An altsetting above 255 matches no
+`bAlternateSetting` and is `EINVAL`, after the implicit claim, the order
+`proc_setintf` decides them in.
+
+The other half of errno fidelity is that a failure keeps the errno of whatever
+failed. `ENODEV` from the model, meaning nothing answers to this address,
+becomes the `ENOENT` open(2) owes for a name with nothing behind it; every
+other failure on the open path -- an allocation, a scratch-tree `mkdir`, a
+pipe the host would not give -- reports itself, so a host out of memory is not
+described to the guest as a missing node.
+
+Every ioctl needs `FMODE_WRITE` and is `EPERM` without it (Linux's gate in
+`devio.c`). `FIONBIO` and `FIOASYNC` are the exception, because they are not
+part of this file's ioctl set at all: `do_vfs_ioctl` answers both for every
+file before it reaches `f_op->unlocked_ioctl`, so they never meet that gate.
+They are answered where `FIOCLEX` and `FIONCLEX` already are. `FIONBIO` edits
+only the guest flag word, the way `F_SETFL` does -- the readiness pipe behind
+the fd stays nonblocking whatever the guest asks -- and always reports 0.
+`FIOASYNC` reports 0 when the requested `FASYNC` state already holds and
+`ENOTTY` when it would change, because `usbdev_file_operations` declares no
+`.fasync`.
+
+Transfer memory is one allowance for everything in flight, not a per-call
+size cap: Linux charges `len + sizeof(struct urb)` against a module-global
+`usbfs_memory_mb` (16 MB) and refunds it when the transfer settles, so a
+request of exactly the allowance never fits and concurrent transfers across
+different fds contend for the same total. An atomic counter carries it here,
+charged where Linux charges it and refunded on every exit including the error
+arms. A claim that IOKit answers `kIOReturnExclusiveAccess` is `EBUSY`,
+what Linux reports for an interface held by a kernel driver. `GETDRIVER`
+names the bound Apple driver, or `usbfs` for an interface any usbfs fd on
+this device holds, or reports `ENODATA`; a user-client child is not a driver,
+so another usbfs consumer's `USBInterfaceOpen` is not reported as one.
+Transfer errors map per `devio.c`: a stall is `EPIPE`, a timeout
+`ETIMEDOUT`, a vanished device `ENODEV`. `kIOReturnAborted` maps to `EINTR`
+with `syscall_restart_forbid()`, because the transfer was already on the wire
+and a dispatcher restart would send it twice.
+
+Known gaps at this stage, each printed as an XFAIL by
+`tests/test-usbdev-ioctl.c` rather than only written down here:
+
+- `GET_CAPABILITIES` reports 0. Every capability bit names part of the
+  SUBMITURB/REAPURB machinery, which answers `ENOTTY` here.
+- No disconnect gate. Linux answers `ENODEV` for every ioctl once the device
+  is gone; the answers served from the open-time model (`GET_SPEED`,
+  `CONNECTINFO`, `GET_CAPABILITIES`, `read()`) still report it. Noticing the
+  disconnect needs an IOKit termination notification on a run loop, which is
+  the async stage's machinery.
+- Two ioctls on one fd serialize, because the entry lock is held across the
+  blocking transfer. Linux drops the device lock around the URB wait.
+- `GETDRIVER` reports the IOKit class name (`AppleUSBACMControl`) where Linux
+  reports the driver's name (`cdc_acm`), and `DISCONNECT_CLAIM`'s name filters
+  compare against it.
+- `RESET` clears the claimed pipes' stalls and reports success instead of
+  re-enumerating the port, which would destroy the handles.
+- A short bulk OUT is `EIO`: `WritePipeTO` reports no length, and reporting
+  the requested count would spell a partial write as a complete one.
+- The side table holds 32 open fds per process and reports `ENOMEM` past
+  that; Linux allocates a `usb_dev_state` per open and has no such limit.
+- `USBDEVFS_IOCTL DISCONNECT` of an interface another usbfs fd holds is
+  `EBUSY`; Linux releases that claim and answers 0.
+
 ## procfs And Device Emulation
 
 `src/runtime/procemu.c` intercepts a focused set of guest-visible paths
@@ -986,9 +1154,8 @@ falls back to a usbfs directory scan.
 The `/dev/bus/usb/BBB/DDD` nodes are 0444 placeholder files on disk (the
 `/dev/pts` placeholder pattern); the stat intercept reports them as
 character devices, major 189, minor `(bus - 1) * 128 + (dev - 1)`, and the
-open intercept diverts an open away from the placeholder. Opening a node
-serves the shared descriptors blob read-only; a writable open reports
-`EACCES`.
+open intercept diverts an open away from the placeholder into the usbdevfs
+fd constructor (see [USB Device Passthrough](#usb-device-passthrough)).
 
 One layout deviation is deliberate: the `/sys/bus/usb/devices` entries are
 real directories, not symlinks into `/sys/devices/...`, so `realpath()` of

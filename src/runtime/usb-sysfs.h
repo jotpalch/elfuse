@@ -101,3 +101,34 @@ uint8_t *usb_sysfs_descriptors_dup(int busnum, int devnum, size_t *len_out);
  * tree (including when the tree does not exist).
  */
 int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz);
+
+/* Identity snapshot of one enumerated device, for the stage-2 usbdevfs fd
+ * (syscall/usbdev.c): location_id keys the IOKit service lookup, speed_code is
+ * the raw registry 'Device Speed' code, cfg_value the active
+ * bConfigurationValue, minor the usbfs char-dev minor. vid/pid/serial carry the
+ * modeled identity so the fd constructor can verify the service it looked up by
+ * location is still the device this bus/dev number was modeled from (locationID
+ * names the port, not the device).
+ */
+typedef struct {
+    uint32_t location_id;
+    unsigned speed_code;
+    unsigned cfg_value;
+    int minor;
+    size_t blob_len;
+    unsigned vid, pid;
+    char serial[128]; /* "" when the device reports none */
+} usb_sysfs_devinfo_t;
+
+/* Fill *out for the device at busnum/devnum.
+ *
+ * Returns 0, or -1 with errno set (ENODEV when no such device).
+ */
+int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out);
+
+/* Synthesize the char-dev stat for /dev/bus/usb/BBB/DDD (same bytes the path
+ * stat intercept reports).
+ *
+ * Returns 0, or -1 with errno set.
+ */
+int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st);

@@ -52,6 +52,7 @@
 #include "syscall/net.h"
 #include "syscall/net-identity.h"
 #include "syscall/net-sockopt.h"
+#include "syscall/usbdev.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
@@ -1533,6 +1534,12 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (type == FD_NETLINK)
         return netlink_send(fd, g, buf_gva, count);
 
+    /* usbdevfs has no write op. Falling through would scribble on the readiness
+     * pipe's read end.
+     */
+    if (type == FD_USBDEV)
+        return usbdev_write_refused(fd);
+
     host_fd_ref_t host_ref;
     fd_block_state_t write_st;
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, &write_st);
@@ -1612,6 +1619,8 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return netlink_read(fd, g, buf_gva, count);
     case FD_URANDOM:
         return urandom_read(g, fd, buf_gva, count);
+    case FD_USBDEV:
+        return usbdev_read(fd, g, buf_gva, count);
     }
 
     /* Pin the generation in the same fd_lock window as the host fd. The pty
@@ -1690,6 +1699,12 @@ int64_t sys_pread64(guest_t *g,
     if (fuse_is_file_fd(fd))
         return fuse_pread_fd(g, fd, buf_gva, count, offset);
 
+    /* usbdevfs serves its descriptors blob positionally too: every read path on
+     * the fd must agree, and the host fd behind it is a readiness pipe.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_pread(fd, g, buf_gva, count, offset);
+
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_io(fd, &host_ref);
     if (err < 0)
@@ -1726,6 +1741,14 @@ int64_t sys_pwrite64(guest_t *g,
                      uint64_t count,
                      int64_t offset)
 {
+    /* ksys_pwrite64 tests pos < 0 before it looks the descriptor up
+     * (read_write.c), so a malformed offset outranks the EBADF a usbdevfs fd
+     * opened O_RDONLY answers for having no write op at all. usbdev_pread
+     * already ordered the two this way; the write side did not, and the two
+     * halves of the same rule disagreed.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return offset < 0 ? -LINUX_EINVAL : usbdev_write_refused(fd);
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
     if (err < 0)
@@ -1913,6 +1936,18 @@ static int64_t vec_zero_iovcnt(int fd, bool op_is_write, bool positional)
     if (!fd_snapshot(fd, &snap) || snap.type == FD_PATH)
         return -LINUX_EBADF;
 
+    /* usbdevfs is the one type whose host fd says nothing useful and whose
+     * guest-visible mode is nonetheless known: the fd sits on a readiness pipe,
+     * and the open mode lives in the slot's linux_flags. It is seekable, so
+     * only the direction test applies, and it is answered by the same rule the
+     * non-empty calls use rather than by a second opinion.
+     */
+    if (snap.type == FD_USBDEV) {
+        if (op_is_write)
+            return usbdev_write_refused(fd);
+        return usbdev_read_refused(fd);
+    }
+
     bool host_mode_mirrors_guest =
         snap.type == FD_REGULAR || snap.type == FD_DIR ||
         snap.type == FD_PIPE || snap.type == FD_SOCKET ||
@@ -1935,6 +1970,61 @@ static int64_t vec_zero_iovcnt(int fd, bool op_is_write, bool positional)
             ret = -LINUX_EBADF;
     }
     host_fd_ref_close(&host_ref);
+    return ret;
+}
+
+
+/* readv()/preadv() on an FD_USBDEV fd. Linux's usbdev file has only a plain
+ * read op, so vectored reads take do_loop_readv_writev: one read per iovec
+ * entry, stopping at the first short transfer. positional keeps the fd position
+ * untouched and reads at offset plus the bytes already copied; otherwise each
+ * usbdev_read advances the fd position like read(2).
+ */
+static int64_t usbdev_vec_read(guest_t *g,
+                               int fd,
+                               uint64_t iov_gva,
+                               int iovcnt,
+                               int64_t offset,
+                               bool positional)
+{
+    if (positional && offset < 0)
+        return -LINUX_EINVAL; /* do_preadv: before the fd lookup */
+    if (!iov_count_ok(iovcnt))
+        return -LINUX_EINVAL;
+
+    linux_iovec_t stack_giov[SYSCALL_IOV_STACK_MAX];
+    linux_iovec_t *giov = stack_giov;
+    linux_iovec_t *heap_giov = NULL;
+    if (iovcnt > SYSCALL_IOV_STACK_MAX) {
+        heap_giov = malloc((size_t) iovcnt * sizeof(*giov));
+        if (!heap_giov)
+            return -LINUX_ENOMEM;
+        giov = heap_giov;
+    }
+    int64_t ret = validate_iov_total(g, iov_gva, iovcnt, giov);
+    if (ret == 0) {
+        for (int i = 0; i < iovcnt; i++) {
+            if (giov[i].iov_len == 0)
+                continue;
+            int64_t got =
+                positional
+                    ? usbdev_pread(fd, g, giov[i].iov_base, giov[i].iov_len,
+                                   offset + ret)
+                    : usbdev_read(fd, g, giov[i].iov_base, giov[i].iov_len);
+            if (got < 0) {
+                ret = ret > 0 ? ret : got;
+                break;
+            }
+            ret += got;
+
+            /* A short entry ends the transfer; POSIX forbids packing the tail
+             * of entry i into entry i+1.
+             */
+            if ((uint64_t) got < giov[i].iov_len)
+                break;
+        }
+    }
+    free(heap_giov);
     return ret;
 }
 
@@ -2035,6 +2125,8 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             return -LINUX_EFAULT;
         return sys_read(g, fd, giov.iov_base, giov.iov_len);
     }
+    if (type == FD_USBDEV)
+        return usbdev_vec_read(g, fd, iov_gva, iovcnt, 0, false);
 
     host_fd_ref_t host_ref;
     uint64_t readv_gen;
@@ -2098,6 +2190,11 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 
 int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
+    /* Ahead of every shortcut below, including the empty-vector one:
+     * do_iter_write refuses on the file's mode before it looks at the vector.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_write_refused(fd);
     if (iovcnt == 0)
         return vec_zero_iovcnt(fd, true, false);
 
@@ -2196,6 +2293,8 @@ int64_t sys_preadv(guest_t *g,
             return err;
         return sys_pread64(g, fd, giov.iov_base, giov.iov_len, offset);
     }
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_vec_read(g, fd, iov_gva, iovcnt, offset, true);
 
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_io(fd, &host_ref);
@@ -2230,6 +2329,12 @@ int64_t sys_pwritev(guest_t *g,
                     int iovcnt,
                     int64_t offset)
 {
+    /* do_pwritev tests pos < 0 before the fd lookup (read_write.c), so the
+     * negative-offset answer outranks the descriptor's own, empty vector or
+     * not. This was already the order for iovcnt == 0 below.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return offset < 0 ? -LINUX_EINVAL : usbdev_write_refused(fd);
     if (iovcnt == 0) {
         /* Same ordering as sys_preadv: negative offset EINVAL first. */
         if (offset < 0)
@@ -2365,6 +2470,15 @@ int64_t sys_pwritev2(guest_t *g,
             return -LINUX_EINVAL;
         return vec_zero_iovcnt(fd, true, offset != -1);
     }
+
+    /* do_iter_write refuses a descriptor with no write op before
+     * kiocb_set_rw_flags ever sees the RWF bits (read_write.c), so usbdevfs
+     * answers ahead of the flags. Without this the RWF_APPEND arm below was the
+     * one write path with no usbdevfs dispatch: it reached the readiness pipe
+     * and answered ESPIPE for a descriptor that owes EBADF or EINVAL.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return offset < -1 ? -LINUX_EINVAL : usbdev_write_refused(fd);
     if (flags & ~RWF_SUPPORTED)
         return -LINUX_EOPNOTSUPP;
     int64_t r;
@@ -2591,6 +2705,59 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
         pthread_mutex_unlock(&fd_lock);
         return 0;
+    }
+
+    /* usbdevfs fds answer their own ioctl set; the host fd behind them is a
+     * readiness pipe, so nothing below applies. usbdev_ioctl re-snapshots the
+     * fd and pins the side-table entry by generation itself.
+     *
+     * FIONBIO and FIOASYNC are not part of that set. do_vfs_ioctl answers both
+     * for every file before it ever calls f_op->unlocked_ioctl
+     * (fs/ioctl.c:818-822), so on Linux they never reach usbdevfs at all --
+     * which means they also never meet its FMODE_WRITE gate. Sent into
+     * usbdev_ioctl they came back EPERM on an O_RDONLY fd and ENOTTY on a
+     * writable one, while fcntl(F_SETFL, O_NONBLOCK) on the same descriptor
+     * succeeded: two entry points onto one flag, disagreeing. Answered here,
+     * where FIOCLEX and FIONCLEX are already answered, they sit exactly where
+     * the kernel puts them relative to the file's own ioctl handler, and no
+     * other fd type's path changes.
+     */
+    if (fd_get_type(fd) == FD_USBDEV) {
+        if (request == LINUX_FIONBIO || request == LINUX_FIOASYNC) {
+            /* get_user runs first in both kernel helpers, so a bad argument
+             * pointer outranks everything else, the access mode included.
+             */
+            int32_t on = 0;
+            if (guest_read_small(g, arg, &on, sizeof(on)) < 0)
+                return -LINUX_EFAULT;
+            if (request == LINUX_FIONBIO) {
+                /* ioctl_fionbio only edits f_flags (fs/ioctl.c:342-363): it
+                 * asks the file nothing and always reports success. The guest
+                 * flag word is where F_GETFL and the readiness paths read this
+                 * fd's O_NONBLOCK from, and the readiness pipe behind it must
+                 * stay nonblocking whatever the guest asks, so the request goes
+                 * to the shadow -- the same place F_SETFL sends it.
+                 */
+                if (!fd_apply_guest_nonblock(fd, on != 0))
+                    return -LINUX_EBADF;
+                return 0;
+            }
+
+            /* ioctl_fioasync (fs/ioctl.c:365-385) consults f_op->fasync only
+             * when the request would change the FASYNC state, and
+             * usbdev_file_operations declares no .fasync (devio.c:2846-2856).
+             * So a request for the state the fd already has is 0, and a request
+             * to change it is ENOTTY -- and it must not reach the O_ASYNC arm
+             * below, which would arm a SIGIO watcher on a file the kernel
+             * refuses to arm at all.
+             */
+            fd_entry_t snap;
+            if (!fd_snapshot(fd, &snap))
+                return -LINUX_EBADF;
+            bool armed = (snap.linux_flags & LINUX_O_ASYNC) != 0;
+            return armed == (on != 0) ? 0 : -LINUX_ENOTTY;
+        }
+        return usbdev_ioctl(g, fd, request, arg);
     }
 
     if (request == LINUX_SIOCGIFHWADDR) {
