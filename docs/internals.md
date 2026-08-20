@@ -112,6 +112,7 @@ Key files:
 | `src/runtime/forkipc.c`, `fork-state.c` | `fork`/`clone` state transfer over the fork IPC channel |
 | `src/runtime/thread.c`, `futex.c` | guest thread table, futex wait queues |
 | `src/runtime/procemu.c` | `/proc`, `/dev`, and selected pseudo-files |
+| `src/runtime/usb-sysfs.c` | synthetic `/dev/bus/usb` and `/sys/bus/usb` trees from the IOKit registry |
 | `src/runtime/proctitle.c` | argv / comm rewriting for `prctl PR_SET_NAME` |
 | `src/debug/gdbstub.c`, `gdbstub-rsp.c`, `gdbstub-reg.c` | GDB RSP stub |
 
@@ -543,6 +544,7 @@ waiter enqueue, so the compare-and-wait is a single critical section.
 | Futex wait queues | `pthread_mutex` (per bucket) | `src/runtime/futex.c` |
 | FUSE (sessions, file/dir state) | global `fuse_lock` + per-session `session->lock` | `src/syscall/fuse.c` |
 | Sysroot snapshot | `pthread_mutex` | `src/syscall/proc-state.c` |
+| Synthetic USB tree (scratch dirs + device model) | `usb_lock` (leaf) | `src/runtime/usb-sysfs.c` |
 
 Lock ordering is documented inline in those files
 (`mmap_lock` is order 1, `fd_lock` is order 3, `sfd_lock` is order 5a)
@@ -892,8 +894,49 @@ listings refresh only when a new directory is opened. The synthetic
 cpumask files, and `cpuN` directories are captured on first access and then
 remain fixed.
 
+### Synthetic USB Device Tree
+
+`src/runtime/usb-sysfs.c` materializes two more scratch-directory trees,
+built from an IOKit enumeration of the USB registry that opens no device:
+`/sys/bus/usb/devices` and `/dev/bus/usb`. Device directories are named
+`<bus>-<ports>` (for example `2-1.4`), interface directories
+`<bus>-<ports>:<config>.<interface>`, following the Linux sysfs layout that
+libusb and nusb walk. `busnum` comes from the IOKit locationID's top byte
+plus one (macOS numbers controllers from 0, Linux busses from 1), `devnum`
+from the device's USB address, and the port path from the locationID
+nibbles; root hubs are skipped. Each device directory carries the attribute
+files those enumerators read (`busnum`, `devnum`, `idVendor`, `idProduct`,
+`speed`, the `manufacturer` / `product` / `serial` strings when the device
+supplies them, the `dev` major:minor, and the rest of the descriptor
+fields), a `uevent` file, a `subsystem` symlink, and the binary
+`descriptors` blob.
+
+Two invariants matter to consumers. The `descriptors` attribute and the
+matching `/dev/bus/usb/BBB/DDD` node read byte-identically, because both
+serve one stored blob per device -- the rule Linux keeps between sysfs and
+the usbfs `read()` view. And `statfs` / `fstatfs` on `/sys` paths report
+`SYSFS_MAGIC`, without which libudev refuses to trust the tree and libusb
+falls back to a usbfs directory scan.
+
+The `/dev/bus/usb/BBB/DDD` nodes are 0444 placeholder files on disk (the
+`/dev/pts` placeholder pattern); the stat intercept reports them as
+character devices, major 189, minor `(bus - 1) * 128 + (dev - 1)`, and the
+open intercept diverts an open away from the placeholder. Opening a node
+serves the shared descriptors blob read-only; a writable open reports
+`EACCES`.
+
+One layout deviation is deliberate: the `/sys/bus/usb/devices` entries are
+real directories, not symlinks into `/sys/devices/...`, so `realpath()` of
+an entry canonicalizes to itself. libusb opens attributes relative to the
+entry and nusb canonicalizes the entry path; both tolerate this.
+
+The tree follows the `/sys/devices/system/cpu` one-shot rule: it is built
+lazily under `usb_lock` on first access and then stays fixed for the
+process. `usb_sysfs_refresh` discards it so that the next access
+re-enumerates, which is the hook hotplug support will use.
+
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
-`src/syscall/fs.c`, `src/syscall/proc-state.c`.
+`src/syscall/fs.c`, `src/syscall/proc-state.c`, `src/runtime/usb-sysfs.c`.
 
 ## Path Resolution
 

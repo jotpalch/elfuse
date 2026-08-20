@@ -31,6 +31,9 @@ linker resolved against an external sysroot via `--sysroot`.
   case-colliding names on the default case-folding APFS (see
   [docs/filenames.md](docs/filenames.md))
 - Synthetic `/proc` and selected `/dev` emulation for user-space probes
+- Synthetic USB device tree: `/dev/bus/usb` plus `/sys/bus/usb/devices`
+  built from the IOKit registry, enough for `lsusb` and libusb-style
+  enumeration
 - Guest-internal FUSE: `/dev/fuse` and `mount("fuse")` work without
   macFUSE / FUSE-T / FSKit
 - Built-in GDB Remote Serial Protocol stub usable from `gdb` or `lldb`

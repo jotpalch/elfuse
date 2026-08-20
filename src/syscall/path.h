@@ -192,6 +192,18 @@ int path_translate_dirent_name(bool dir_holds_escapes,
                                const char *host_name,
                                char *guest_name,
                                size_t guest_name_sz);
+
+/* Rebase a relative path against a host directory fd into the guest-visible
+ * absolute spelling (F_GETPATH + sysroot strip + dot-folding).
+ *
+ * Returns 1 with out filled, 0 when no mapping exists. See path.c for the
+ * chase() rationale.
+ */
+int path_rebase_hostdirfd(int host_dirfd,
+                          const char *rel,
+                          char *out,
+                          size_t outsz);
+
 int resolve_proc_at_path(guest_fd_t dirfd,
                          const char *path,
                          char *out,
