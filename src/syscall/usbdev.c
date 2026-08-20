@@ -24,6 +24,44 @@
  *     kIOUSBTransactionTimeout, stall -> -EPIPE, and the kernel's implicit
  *     claim of the recipient interface (check_ctrlrecip/checkintf).
  *
+ * Stage 3 adds async URBs and poll semantics:
+ *
+ *   - SUBMITURB/DISCARDURB/REAPURB/REAPURBNDELAY (doc A §A3): URB buffers
+ *     bounce through host memory (copy-in at submit on the vCPU thread,
+ *     copy-out at reap on the vCPU thread); IOKit completions run on ONE
+ *     lazily-started host thread driving a CFRunLoop (the libusb darwin
+ *     model, doc D §c) fed by CreateDeviceAsyncEventSource /
+ *     CreateInterfaceAsyncEventSource. That thread touches only
+ *     usbdev-owned host memory (static fd slots + malloc'd URB records),
+ *     never guest memory, so it is safe across guest_destroy/exec
+ *     (netlink.c:853-857 precedent).
+ *   - DISCARDURB must kill exactly one URB, but IOKit's AbortPipe aborts
+ *     every outstanding transfer on the pipe (doc D mismatch #1). So at most
+ *     ONE URB per endpoint is in flight at IOKit at a time; later submissions
+ *     queue inside elfuse and are started from the completion callback
+ *     (throughput tradeoff, ep0 serialized the same way).
+ *   - URBs get no IOKit timeout (0 = infinite): usbfs URBs never time out,
+ *     guests cancel with DISCARDURB (kIOReturnAborted -> -ENOENT when
+ *     discarding, -ECONNRESET otherwise, mirroring usb_kill_urb vs async
+ *     unlink).
+ *   - ZERO_PACKET on a maxpacket-multiple OUT issues a synchronous
+ *     WritePipe(pipeRef, buf, 0) from the completion callback
+ *     (darwin_usb.c:3193-3204). SHORT_NOT_OK is emulated at completion
+ *     (-EREMOTEIO on a short IN). Both flags are honoured only for their
+ *     Linux-defined direction (devio.c:1710-1737). BULK_CONTINUATION is
+ *     accepted but its error-cascade unlink has no IOKit counterpart.
+ *   - poll()/select()/epoll on the fd: the backing pipe's read end raises
+ *     host POLLIN when a completion (one byte per completed URB) arrives;
+ *     poll.c remaps that to the guest-visible POLLOUT|POLLWRNORM
+ *     (devio.c:2832-2846) via the usbdev_poll_* helpers below.
+ *   - Disconnect: IOServiceAddInterestNotification (terminate message) or
+ *     kIOReturnNoDevice/NotAttached on any op marks the fd disconnected:
+ *     poll -> POLLERR|POLLHUP, REAPURB drains completed then -ENODEV, every
+ *     other ioctl -ENODEV.
+ *   - DISCSIGNAL stores signr/context but never delivers the signal (no
+ *     async guest-signal injection from the event thread); URB signr is
+ *     ignored the same way. ISO URBs are -EINVAL (doc A §A7.4, skipped).
+ *
  * Documented stage-2 deviations from Linux:
  *   - USBDEVFS_RESET does not re-enumerate: USBDeviceReEnumerate(0) would
  *     tear down every open plugin handle (doc D "reset" row), so RESET clears
@@ -44,18 +82,23 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <stddef.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IOMessage.h>
 #include <IOKit/usb/IOUSBLib.h>
 #include <IOKit/usb/USB.h>
 
@@ -63,7 +106,9 @@
 #include "debug/log.h"
 #include "runtime/usb-sysfs.h"
 #include "syscall/internal.h"
+#include "syscall/io.h"
 #include "syscall/linux-wire.h"
+#include "syscall/proc.h"
 #include "syscall/usbdev.h"
 #include "utils.h"
 
@@ -160,10 +205,65 @@ typedef struct {
     char driver[256];
 } linux_usbdevfs_disconnect_claim_t; /* sizeof == 264 */
 
+/* struct usbdevfs_urb, LP64 (buffer at 16, usercontext at 48, sizeof 56). */
+typedef struct {
+    uint8_t type;
+    uint8_t endpoint;
+    uint16_t pad0;
+    int32_t status;
+    uint32_t flags;
+    uint32_t pad1; /* natural hole before the pointer */
+    uint64_t buffer;
+    int32_t buffer_length;
+    int32_t actual_length;
+    int32_t start_frame;
+    int32_t number_of_packets; /* union with stream_id */
+    int32_t error_count;
+    uint32_t signr;
+    uint64_t usercontext;
+} linux_usbdevfs_urb_t;
+
+typedef struct {
+    uint32_t signr;
+    uint32_t pad;
+    uint64_t context;
+} linux_usbdevfs_disconnectsignal_t; /* sizeof == 16 */
+
+#define LINUX_URB_TYPE_ISO 0u
+#define LINUX_URB_TYPE_INTERRUPT 1u
+#define LINUX_URB_TYPE_CONTROL 2u
+#define LINUX_URB_TYPE_BULK 3u
+
+/* URB flags (uapi/linux/usbdevice_fs.h). devio.c:1635-1645 rejects anything
+ * outside this set for non-ISO URBs.
+ */
+#define LINUX_URB_SHORT_NOT_OK 0x01u
+#define LINUX_URB_ISO_ASAP 0x02u
+#define LINUX_URB_BULK_CONTINUATION 0x04u
+#define LINUX_URB_NO_FSBR 0x20u
+#define LINUX_URB_ZERO_PACKET 0x40u
+#define LINUX_URB_NO_INTERRUPT 0x80u
+#define LINUX_URB_FLAGS_ALLOWED                             \
+    (LINUX_URB_SHORT_NOT_OK | LINUX_URB_BULK_CONTINUATION | \
+     LINUX_URB_NO_FSBR | LINUX_URB_ZERO_PACKET | LINUX_URB_NO_INTERRUPT)
+
+/* Linux poll bits (asm-generic/poll.h). POLLWRNORM differs from macOS
+ * (0x100 vs 0x004), so the guest-facing remap must use these, never the
+ * host's <poll.h> values.
+ */
+#define LINUX_POLLIN 0x0001
+#define LINUX_POLLOUT 0x0004
+#define LINUX_POLLERR 0x0008
+#define LINUX_POLLHUP 0x0010
+#define LINUX_POLLNVAL 0x0020
+#define LINUX_POLLWRNORM 0x0100
+
 /* do_proc_control caps wLength at PAGE_SIZE (devio.c:1185). */
 #define USBDEV_CTRL_MAX 4096
 /* usbfs_memory_mb default: 16 MB of in-flight buffer (devio.c:134). */
 #define USBDEV_BULK_MAX (16u * 1024 * 1024)
+/* Backstop on live URB records per fd (pending + unreaped completed). */
+#define USBDEV_MAX_URBS 256
 
 /* ---------- side table ---------- */
 
@@ -174,12 +274,47 @@ typedef struct {
 typedef struct {
     bool claimed;
     IOUSBInterfaceInterface800 **intf;
+    CFRunLoopSourceRef src; /* async event source, on the event runloop */
     int npipes;
     uint8_t pipe_ep[USBDEV_MAX_PIPES];   /* pipeRef-1 -> bEndpointAddress */
     uint8_t pipe_type[USBDEV_MAX_PIPES]; /* kUSBControl..kUSBInterrupt */
+    uint16_t pipe_mps[USBDEV_MAX_PIPES]; /* wMaxPacketSize (ZLP check) */
 } usbdev_iface_t;
 
-typedef struct {
+typedef enum { URB_QUEUED, URB_INFLIGHT, URB_COMPLETED } urb_state_t;
+
+struct usbdev; /* fwd */
+
+/* One SUBMITURB. Guest data bounces through buf: copy-in at submit and
+ * copy-out at reap both happen on the vCPU thread; the completion callback
+ * (event thread) touches only this record and its owning static fd slot.
+ */
+typedef struct usbdev_urb {
+    struct usbdev_urb *next;
+    struct usbdev *u;  /* owning slot (static array, never freed) */
+    uint64_t userurb;  /* guest pointer to struct usbdevfs_urb (reap key) */
+    uint64_t data_gva; /* where IN data lands (urb buffer, +8 for control) */
+    uint8_t type;      /* LINUX_URB_TYPE_* */
+    uint8_t ep;        /* bEndpointAddress from the urb */
+    uint8_t ep_key;    /* per-endpoint FIFO key; 0 = default control pipe */
+    uint8_t pipe;      /* pipeRef; 0 = device ep0 */
+    bool is_in;
+    bool discarding;     /* DISCARDURB issued: abort reports -ENOENT */
+    bool orphaned;       /* teardown timed out: callback frees the record */
+    bool zero_packet;    /* OUT + URB_ZERO_PACKET */
+    bool short_not_ok;   /* IN + URB_SHORT_NOT_OK */
+    bool pipe_interrupt; /* pipe is interrupt-type (no *TO entry points) */
+    urb_state_t state;
+    int32_t status; /* linux URB status, valid once COMPLETED */
+    uint32_t actual;
+    uint32_t data_len; /* bounce buffer length (excludes control setup) */
+    uint16_t mps;      /* endpoint wMaxPacketSize for the ZLP check */
+    IOUSBInterfaceInterface800 **intf; /* pinned at submit; NULL for ep0 */
+    uint8_t *buf;                      /* host bounce buffer */
+    IOUSBDevRequestTO req;             /* control only */
+} usbdev_urb_t;
+
+typedef struct usbdev {
     bool used; /* slot allocated (table lock) */
     bool dead; /* torn down, awaiting slot release (entry lock) */
     int guest_fd;
@@ -191,11 +326,13 @@ typedef struct {
     uint8_t *blob;       /* usbfs descriptors blob (read() source) */
     size_t blob_len;
     off_t pos;   /* read()/lseek() file position */
-    int pipe_wr; /* write end of the readiness pipe (stage-3 completions) */
+    int pipe_wr; /* write end of the readiness pipe (one byte/completion) */
     io_service_t service;          /* retained IOUSBDevice service */
     IOUSBDeviceInterface650 **dev; /* lazily created device plugin */
     bool dev_open;                 /* USBDeviceOpen succeeded */
     bool dev_open_tried;
+    CFRunLoopSourceRef dev_src; /* ep0 async event source (lazy) */
+    io_object_t notif;          /* interest notification (disconnect) */
     usbdev_iface_t ifaces[USBDEV_MAX_IFACES];
     /* Guards every field above except used/guest_fd/generation, which the
      * table lock guards. Held across blocking IOKit transfer calls, which
@@ -203,6 +340,26 @@ typedef struct {
      * per-device lock (dropped-during-transfer refinement is a TODO).
      */
     pthread_mutex_t lock;
+
+    /* --- async URB state, guarded by async_lock (never held across a
+     * blocking IOKit call other than the callback-side ZLP WritePipe). The
+     * completion callback and the disconnect notification run on the event
+     * thread and take ONLY this lock, so a vCPU thread parked in a sync
+     * transfer under `lock` cannot stall completions on other endpoints.
+     * Lock order: lock -> async_lock. pipe_wr may additionally be written
+     * under async_lock (teardown sets it to -1 under both locks before
+     * closing).
+     */
+    pthread_mutex_t async_lock;
+    pthread_cond_t async_cv; /* completion / in-flight drain */
+    usbdev_urb_t *pending_head, *pending_tail;     /* QUEUED + INFLIGHT */
+    usbdev_urb_t *completed_head, *completed_tail; /* reapable, FIFO */
+    int inflight;                                  /* URB_INFLIGHT count */
+    int nurbs;              /* live records (pending + completed) */
+    size_t inflight_bytes;  /* usbfs_memory_mb-style cap accounting */
+    bool disconnected;      /* device gone; mirrored in usbdev_disc_map */
+    uint32_t discsig_signr; /* DISCSIGNAL, stored but never delivered */
+    uint64_t discsig_context;
 } usbdev_t;
 
 /* Lock order: usbdev_table_lock -> entry lock. The table lock is a leaf with
@@ -211,6 +368,15 @@ typedef struct {
 static pthread_mutex_t usbdev_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static usbdev_t usbdev_fds[USBDEV_MAX_FDS];
 static bool usbdev_ready;
+
+/* Lock-free "this guest fd's usbdev device is gone" map for the poll/epoll
+ * remap helpers: they run on hot poll paths and must not queue behind an
+ * entry lock held across a blocking sync transfer. Set by the event thread
+ * at disconnect, cleared when the guest fd is bound or torn down. A stale
+ * bit on a reused fd number is harmless: the helpers check the fd type
+ * first, and binding a new usbdev fd clears it.
+ */
+static _Atomic uint8_t usbdev_disc_map[FD_TABLE_SIZE];
 
 /* ---------- IOReturn -> -LINUX_E* (doc D table (b)) ---------- */
 
@@ -416,9 +582,479 @@ static int usbdev_build_pipe_map(usbdev_iface_t *fi)
             continue;
         fi->pipe_ep[p - 1] = (uint8_t) (num | (dir == kUSBIn ? 0x80 : 0));
         fi->pipe_type[p - 1] = type;
+        fi->pipe_mps[p - 1] = mps;
         fi->npipes = p;
     }
     return 0;
+}
+
+/* ---------- async engine: event thread, URB lists, completions ----------
+ *
+ * One host thread per elfuse process runs a CFRunLoop; per-open-device
+ * (CreateDeviceAsyncEventSource) and per-claimed-interface
+ * (CreateInterfaceAsyncEventSource) sources are added to it from vCPU
+ * threads, exactly libusb's darwin model (darwin_usb.c:1894-1911,
+ * 2261-2272). Chosen over the CreateDeviceAsyncPort + mach_msg alternative
+ * because the runloop also carries the IONotificationPort for disconnect
+ * interest messages with no extra plumbing.
+ *
+ * The thread is started lazily on the first async submit and never joined:
+ * exec keeps the host process (side tables survive), and after
+ * guest_destroy the callbacks only touch usbdev-owned host memory (static
+ * fd slots, malloc'd URB records, the completion pipe), never guest
+ * memory -- the copy-in/copy-out happens on vCPU threads (netlink.c:853-857
+ * warning).
+ */
+
+#ifndef kIOUSBTransactionReturned
+#define kIOUSBTransactionReturned 0xe0004050u
+#endif
+
+static pthread_mutex_t usbdev_loop_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t usbdev_loop_cv = PTHREAD_COND_INITIALIZER;
+static CFRunLoopRef usbdev_loop; /* set once by the event thread */
+static bool usbdev_loop_started;
+static IONotificationPortRef usbdev_notify_port; /* loop lock */
+
+static void usbdev_loop_keepalive(void *info)
+{
+    (void) info;
+}
+
+static void *usbdev_loop_main(void *arg)
+{
+    (void) arg;
+    /* A permanent dummy source keeps CFRunLoopRun from returning while no
+     * device/interface source is attached.
+     */
+    CFRunLoopSourceContext ctx = {.perform = usbdev_loop_keepalive};
+    CFRunLoopSourceRef keep =
+        CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &ctx);
+    if (keep)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), keep, kCFRunLoopDefaultMode);
+    pthread_mutex_lock(&usbdev_loop_lock);
+    usbdev_loop = CFRunLoopGetCurrent();
+    pthread_cond_broadcast(&usbdev_loop_cv);
+    pthread_mutex_unlock(&usbdev_loop_lock);
+    CFRunLoopRun();
+    /* Unreached in practice: the keepalive source pins the loop until the
+     * process exits.
+     */
+    if (keep)
+        CFRelease(keep);
+    return NULL;
+}
+
+/* Start (once) and return the event runloop; NULL only if thread creation
+ * failed.
+ */
+static CFRunLoopRef usbdev_loop_get(void)
+{
+    pthread_mutex_lock(&usbdev_loop_lock);
+    if (!usbdev_loop_started) {
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &at, usbdev_loop_main, NULL) == 0)
+            usbdev_loop_started = true;
+        else
+            log_warn("usbdev: event thread creation failed");
+        pthread_attr_destroy(&at);
+    }
+    while (usbdev_loop_started && !usbdev_loop)
+        pthread_cond_wait(&usbdev_loop_cv, &usbdev_loop_lock);
+    CFRunLoopRef l = usbdev_loop;
+    pthread_mutex_unlock(&usbdev_loop_lock);
+    return l;
+}
+
+/* The runloop if the event thread already exists; never starts it. */
+static CFRunLoopRef usbdev_loop_current(void)
+{
+    pthread_mutex_lock(&usbdev_loop_lock);
+    CFRunLoopRef l = usbdev_loop;
+    pthread_mutex_unlock(&usbdev_loop_lock);
+    return l;
+}
+
+static IONotificationPortRef usbdev_notify_get(void)
+{
+    CFRunLoopRef loop = usbdev_loop_get();
+    if (!loop)
+        return NULL;
+    pthread_mutex_lock(&usbdev_loop_lock);
+    if (!usbdev_notify_port) {
+        usbdev_notify_port = IONotificationPortCreate(kIOMainPortDefault);
+        if (usbdev_notify_port)
+            CFRunLoopAddSource(
+                loop, IONotificationPortGetRunLoopSource(usbdev_notify_port),
+                kCFRunLoopDefaultMode);
+    }
+    IONotificationPortRef p = usbdev_notify_port;
+    pthread_mutex_unlock(&usbdev_loop_lock);
+    return p;
+}
+
+/* Event-thread-safe disconnect stamp: async_lock only, no guest memory.
+ * Wakes pollers with one extra pipe byte (the remap turns it into
+ * POLLERR|POLLHUP) and REAPURB waiters via the cv.
+ */
+static void usbdev_mark_disconnected(usbdev_t *u)
+{
+    pthread_mutex_lock(&u->async_lock);
+    if (!u->disconnected) {
+        u->disconnected = true;
+        /* guest_fd is table-lock-guarded; this unlocked read races only
+         * with teardown, which clears the map bit again afterwards.
+         */
+        int gfd = u->guest_fd;
+        if (RANGE_CHECK(gfd, 0, FD_TABLE_SIZE))
+            atomic_store(&usbdev_disc_map[gfd], 1);
+        if (u->pipe_wr >= 0) {
+            char b = 0;
+            (void) !write(u->pipe_wr, &b, 1);
+        }
+        pthread_cond_broadcast(&u->async_cv);
+    }
+    pthread_mutex_unlock(&u->async_lock);
+}
+
+static void usbdev_interest_cb(void *refcon,
+                               io_service_t service,
+                               natural_t msg,
+                               void *arg)
+{
+    (void) service;
+    (void) arg;
+    if (msg == kIOMessageServiceIsTerminated)
+        usbdev_mark_disconnected((usbdev_t *) refcon);
+}
+
+/* Register the terminate-interest notification (entry lock held). Best
+ * effort: kIOReturnNoDevice detection on ops is the fallback.
+ */
+static void usbdev_arm_disconnect_watch(usbdev_t *u)
+{
+    if (u->notif != IO_OBJECT_NULL || u->service == IO_OBJECT_NULL)
+        return;
+    IONotificationPortRef port = usbdev_notify_get();
+    if (!port)
+        return;
+    if (IOServiceAddInterestNotification(port, u->service, kIOGeneralInterest,
+                                         usbdev_interest_cb, u,
+                                         &u->notif) != kIOReturnSuccess)
+        u->notif = IO_OBJECT_NULL;
+}
+
+/* Create + attach the ep0 async event source (entry lock held). */
+static int64_t usbdev_ensure_dev_async(usbdev_t *u)
+{
+    int64_t rc = usbdev_ensure_dev_plugin(u);
+    if (rc < 0)
+        return rc;
+    usbdev_lazy_device_open(u);
+    if (u->dev_src)
+        return 0;
+    CFRunLoopRef loop = usbdev_loop_get();
+    if (!loop)
+        return -LINUX_ENOMEM;
+    CFRunLoopSourceRef src = NULL;
+    IOReturn r = (*u->dev)->CreateDeviceAsyncEventSource(u->dev, &src);
+    if (r != kIOReturnSuccess || !src)
+        return r == kIOReturnSuccess ? -LINUX_ENOMEM : ioret_neg_errno(r);
+    CFRunLoopAddSource(loop, src, kCFRunLoopDefaultMode);
+    u->dev_src = src;
+    usbdev_arm_disconnect_watch(u);
+    return 0;
+}
+
+/* Create + attach the interface async event source (entry lock held; fi is
+ * claimed).
+ */
+static int64_t usbdev_ensure_iface_async(usbdev_t *u, usbdev_iface_t *fi)
+{
+    if (fi->src)
+        return 0;
+    CFRunLoopRef loop = usbdev_loop_get();
+    if (!loop)
+        return -LINUX_ENOMEM;
+    CFRunLoopSourceRef src = NULL;
+    IOReturn r = (*fi->intf)->CreateInterfaceAsyncEventSource(fi->intf, &src);
+    if (r != kIOReturnSuccess || !src)
+        return r == kIOReturnSuccess ? -LINUX_ENOMEM : ioret_neg_errno(r);
+    CFRunLoopAddSource(loop, src, kCFRunLoopDefaultMode);
+    fi->src = src;
+    usbdev_arm_disconnect_watch(u);
+    return 0;
+}
+
+/* ---- URB lists (async_lock held) ---- */
+
+static void urb_list_append(usbdev_urb_t **head,
+                            usbdev_urb_t **tail,
+                            usbdev_urb_t *rec)
+{
+    rec->next = NULL;
+    if (*tail)
+        (*tail)->next = rec;
+    else
+        *head = rec;
+    *tail = rec;
+}
+
+static void urb_pending_unlink(usbdev_t *u, usbdev_urb_t *rec)
+{
+    usbdev_urb_t **pp = &u->pending_head, *prev = NULL;
+    while (*pp && *pp != rec) {
+        prev = *pp;
+        pp = &(*pp)->next;
+    }
+    if (!*pp)
+        return;
+    *pp = rec->next;
+    if (u->pending_tail == rec)
+        u->pending_tail = prev;
+    rec->next = NULL;
+}
+
+static void urb_free_locked(usbdev_t *u, usbdev_urb_t *rec)
+{
+    u->nurbs--;
+    u->inflight_bytes -= rec->data_len;
+    free(rec->buf);
+    free(rec);
+}
+
+/* Move rec to the completed list and signal readiness: one pipe byte per
+ * completed URB is the poll()/REAPURB contract (async_lock held).
+ */
+static void urb_complete_locked(usbdev_t *u, usbdev_urb_t *rec, int32_t status)
+{
+    rec->status = status;
+    rec->state = URB_COMPLETED;
+    if (rec->orphaned) {
+        urb_free_locked(u, rec);
+        return;
+    }
+    urb_list_append(&u->completed_head, &u->completed_tail, rec);
+    if (u->pipe_wr >= 0) {
+        char b = 0;
+        (void) !write(u->pipe_wr, &b, 1);
+    }
+}
+
+/* kIOReturn -> linux URB status (doc D table (b); differs from the sync
+ * ioctl map in the Aborted row: DISCARDURB = usb_kill_urb = -ENOENT, any
+ * other abort = async unlink = -ECONNRESET).
+ */
+static int32_t usbdev_urb_status(const usbdev_urb_t *rec, IOReturn r)
+{
+    switch ((uint32_t) r) {
+    case kIOReturnSuccess:
+    case kIOReturnUnderrun: /* short transfer == success */
+        return 0;
+    case kIOReturnAborted:
+    case kIOUSBTransactionReturned:
+        return rec->discarding ? -LINUX_ENOENT : -LINUX_ECONNRESET;
+    case kIOReturnNoDevice:
+    case kIOReturnNotOpen:
+    case kIOReturnNotAttached:
+        return -LINUX_ENODEV;
+    default:
+        return (int32_t) ioret_neg_errno(r);
+    }
+}
+
+static void usbdev_async_cb(void *refcon, IOReturn result, void *arg0);
+
+/* Hand rec to IOKit. Called with async_lock held: the async entry points do
+ * not block, and their callbacks arrive later on the event thread.
+ */
+static IOReturn usbdev_urb_start(usbdev_urb_t *rec)
+{
+    usbdev_t *u = rec->u;
+    if (rec->type == LINUX_URB_TYPE_CONTROL) {
+        rec->req.pData = rec->buf;
+        if (rec->pipe == 0)
+            return (*u->dev)->DeviceRequestAsyncTO(u->dev, &rec->req,
+                                                   usbdev_async_cb, rec);
+        return (*rec->intf)
+            ->ControlRequestAsyncTO(rec->intf, rec->pipe, &rec->req,
+                                    usbdev_async_cb, rec);
+    }
+    /* Interrupt pipes reject the *TO entry points (IOUSBLib.h: BadArgument);
+     * bulk gets the TO variants with 0 = infinite, matching usbfs URBs that
+     * never time out. A BULK URB on an interrupt endpoint lands here with
+     * pipe_interrupt set, i.e. the kernel's silent bulk->interrupt
+     * conversion (devio.c:1718-1721).
+     */
+    if (rec->pipe_interrupt) {
+        if (rec->is_in)
+            return (*rec->intf)
+                ->ReadPipeAsync(rec->intf, rec->pipe, rec->buf, rec->data_len,
+                                usbdev_async_cb, rec);
+        return (*rec->intf)
+            ->WritePipeAsync(rec->intf, rec->pipe, rec->buf, rec->data_len,
+                             usbdev_async_cb, rec);
+    }
+    if (rec->is_in)
+        return (*rec->intf)
+            ->ReadPipeAsyncTO(rec->intf, rec->pipe, rec->buf, rec->data_len, 0,
+                              0, usbdev_async_cb, rec);
+    return (*rec->intf)
+        ->WritePipeAsyncTO(rec->intf, rec->pipe, rec->buf, rec->data_len, 0, 0,
+                           usbdev_async_cb, rec);
+}
+
+/* Restart the FIFO on one endpoint key: submit the oldest QUEUED record if
+ * nothing is in flight there; locally fail records IOKit refuses
+ * (async_lock held).
+ */
+static void usbdev_kick_ep_locked(usbdev_t *u, uint8_t key)
+{
+    for (;;) {
+        usbdev_urb_t *next = NULL;
+        for (usbdev_urb_t *r = u->pending_head; r; r = r->next) {
+            if (r->ep_key != key)
+                continue;
+            if (r->state == URB_INFLIGHT)
+                return; /* endpoint busy */
+            next = r;
+            break;
+        }
+        if (!next)
+            return;
+        IOReturn ir = usbdev_urb_start(next);
+        if (ir == kIOReturnSuccess) {
+            next->state = URB_INFLIGHT;
+            u->inflight++;
+            return;
+        }
+        int32_t st = (int32_t) ioret_neg_errno(ir);
+        urb_pending_unlink(u, next);
+        urb_complete_locked(u, next, st ? st : -LINUX_EPROTO);
+    }
+}
+
+/* IOKit completion (event thread). arg0 carries the transferred byte count
+ * for pipe reads/writes and wLenDone for device requests.
+ */
+static void usbdev_async_cb(void *refcon, IOReturn result, void *arg0)
+{
+    usbdev_urb_t *rec = refcon;
+    usbdev_t *u = rec->u;
+    if ((uint32_t) result == (uint32_t) kIOReturnNoDevice ||
+        (uint32_t) result == (uint32_t) kIOReturnNotAttached)
+        usbdev_mark_disconnected(u); /* takes async_lock; call first */
+    pthread_mutex_lock(&u->async_lock);
+    rec->actual = (uint32_t) (uintptr_t) arg0;
+    int32_t st = usbdev_urb_status(rec, result);
+    if (st == 0 && rec->short_not_ok && rec->actual < rec->data_len)
+        st = -LINUX_EREMOTEIO; /* URB_SHORT_NOT_OK, devio.c error-codes */
+    /* ZLP: a maxpacket-multiple OUT gets its terminating zero-length packet
+     * as a separate synchronous WritePipe from the callback
+     * (darwin_usb.c:3193-3204). Blocks the event thread for one packet
+     * time, same as libusb.
+     */
+    if (st == 0 && rec->zero_packet && rec->intf && rec->pipe > 0 &&
+        rec->data_len > 0 && rec->mps != 0 && rec->data_len % rec->mps == 0)
+        (void) (*rec->intf)->WritePipe(rec->intf, rec->pipe, rec->buf, 0);
+    urb_pending_unlink(u, rec);
+    u->inflight--;
+    uint8_t key = rec->ep_key;
+    urb_complete_locked(u, rec, st);
+    usbdev_kick_ep_locked(u, key);
+    pthread_cond_broadcast(&u->async_cv);
+    pthread_mutex_unlock(&u->async_lock);
+}
+
+/* Abort and drain every URB whose interface matches intf (NULL = all,
+ * including ep0). QUEUED records complete as killed (-ENOENT, usb_kill_urb)
+ * and stay reapable; INFLIGHT ones are aborted and drained through the
+ * callback. Returns false when the drain timed out: survivors were orphaned
+ * (the late callback frees them) and the caller must NOT release the IOKit
+ * handles they still reference. Entry lock held.
+ */
+static bool usbdev_kill_urbs_locked(usbdev_t *u,
+                                    IOUSBInterfaceInterface800 **intf)
+{
+    pthread_mutex_lock(&u->async_lock);
+    usbdev_urb_t *r = u->pending_head;
+    bool any_inflight = false;
+    while (r) {
+        usbdev_urb_t *nx = r->next;
+        bool match = intf == NULL || r->intf == intf;
+        if (match && r->state == URB_QUEUED) {
+            urb_pending_unlink(u, r);
+            urb_complete_locked(u, r, -LINUX_ENOENT);
+        } else if (match && r->state == URB_INFLIGHT) {
+            r->discarding = true;
+            any_inflight = true;
+        }
+        r = nx;
+    }
+    pthread_mutex_unlock(&u->async_lock);
+
+    if (any_inflight) {
+        if (intf == NULL && u->dev && u->dev_src)
+            (void) (*u->dev)->USBDeviceAbortPipeZero(u->dev);
+        for (int i = 0; i < USBDEV_MAX_IFACES; i++) {
+            usbdev_iface_t *fi = &u->ifaces[i];
+            if (!fi->claimed || (intf != NULL && fi->intf != intf))
+                continue;
+            for (int p = 1; p <= fi->npipes; p++)
+                (void) (*fi->intf)->AbortPipe(fi->intf, (UInt8) p);
+        }
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    pthread_mutex_lock(&u->async_lock);
+    for (;;) {
+        bool busy = false;
+        for (r = u->pending_head; r; r = r->next) {
+            if ((intf == NULL || r->intf == intf) && r->state == URB_INFLIGHT) {
+                busy = true;
+                break;
+            }
+        }
+        if (!busy)
+            break;
+        if (pthread_cond_timedwait(&u->async_cv, &u->async_lock, &deadline) ==
+            ETIMEDOUT) {
+            int n = 0;
+            for (r = u->pending_head; r; r = r->next) {
+                if ((intf == NULL || r->intf == intf) &&
+                    r->state == URB_INFLIGHT) {
+                    r->orphaned = true;
+                    n++;
+                }
+            }
+            log_warn("usbdev: %d in-flight URB(s) did not drain; orphaned", n);
+            pthread_mutex_unlock(&u->async_lock);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&u->async_lock);
+    return true;
+}
+
+/* Free every reapable completion (fd close: the kernel frees unreaped
+ * completed URBs too). Entry lock held.
+ */
+static void usbdev_free_completed(usbdev_t *u)
+{
+    pthread_mutex_lock(&u->async_lock);
+    while (u->completed_head) {
+        usbdev_urb_t *rec = u->completed_head;
+        u->completed_head = rec->next;
+        if (!u->completed_head)
+            u->completed_tail = NULL;
+        urb_free_locked(u, rec);
+    }
+    pthread_mutex_unlock(&u->async_lock);
 }
 
 /* ---------- claim / release (entry lock held) ---------- */
@@ -487,8 +1123,28 @@ static int64_t usbdev_release_locked(usbdev_t *u, unsigned ifnum)
     usbdev_iface_t *fi = &u->ifaces[ifnum];
     if (!fi->claimed)
         return -LINUX_EINVAL; /* releaseintf: not claimed */
-    (*fi->intf)->USBInterfaceClose(fi->intf);
-    (*fi->intf)->Release(fi->intf);
+    /* releaseintf kills the interface's URBs (devio.c:2304-2316); they stay
+     * reapable with -ENOENT.
+     */
+    bool drained = usbdev_kill_urbs_locked(u, fi->intf);
+    if (fi->src) {
+        CFRunLoopRef loop = usbdev_loop_current();
+        if (loop && drained)
+            CFRunLoopRemoveSource(loop, fi->src, kCFRunLoopDefaultMode);
+        if (drained)
+            CFRelease(fi->src);
+        fi->src = NULL;
+    }
+    if (drained) {
+        (*fi->intf)->USBInterfaceClose(fi->intf);
+        (*fi->intf)->Release(fi->intf);
+    } else {
+        /* Orphaned in-flight URBs still reference the handle and its event
+         * source; leak both rather than hand the late callback a freed
+         * plugin.
+         */
+        log_warn("usbdev: leaking interface %u handle (undrained URBs)", ifnum);
+    }
     fi->intf = NULL;
     fi->claimed = false;
     fi->npipes = 0;
@@ -603,13 +1259,36 @@ static usbdev_t *usbdev_acquire(int fd)
 
 static void usbdev_teardown_locked(usbdev_t *u)
 {
+    /* Async teardown first: kill/drain every URB (release close: kernel
+     * kills pending and frees completed, devio.c:1092-1128), then the
+     * notification and the ep0 event source, so no callback can arrive for
+     * this slot after the handles go away.
+     */
+    bool drained = usbdev_kill_urbs_locked(u, NULL);
+    usbdev_free_completed(u);
+    if (u->notif != IO_OBJECT_NULL) {
+        IOObjectRelease(u->notif);
+        u->notif = IO_OBJECT_NULL;
+    }
+    if (u->dev_src) {
+        CFRunLoopRef loop = usbdev_loop_current();
+        if (loop && drained)
+            CFRunLoopRemoveSource(loop, u->dev_src, kCFRunLoopDefaultMode);
+        if (drained)
+            CFRelease(u->dev_src);
+        u->dev_src = NULL;
+    }
     for (int i = 0; i < USBDEV_MAX_IFACES; i++)
         if (u->ifaces[i].claimed)
             (void) usbdev_release_locked(u, (unsigned) i);
     if (u->dev) {
-        if (u->dev_open)
-            (*u->dev)->USBDeviceClose(u->dev);
-        (*u->dev)->Release(u->dev);
+        if (drained) {
+            if (u->dev_open)
+                (*u->dev)->USBDeviceClose(u->dev);
+            (*u->dev)->Release(u->dev);
+        } else {
+            log_warn("usbdev: leaking device handle (undrained URBs)");
+        }
         u->dev = NULL;
     }
     u->dev_open = false;
@@ -618,10 +1297,17 @@ static void usbdev_teardown_locked(usbdev_t *u)
         IOObjectRelease(u->service);
         u->service = IO_OBJECT_NULL;
     }
-    if (u->pipe_wr >= 0) {
-        close(u->pipe_wr);
-        u->pipe_wr = -1;
-    }
+    /* Orphaned callbacks skip the pipe write, so closing it here is safe
+     * even on the timeout path; -1 under async_lock keeps the callback's
+     * check and this close ordered.
+     */
+    pthread_mutex_lock(&u->async_lock);
+    int pw = u->pipe_wr;
+    u->pipe_wr = -1;
+    u->disconnected = false;
+    pthread_mutex_unlock(&u->async_lock);
+    if (pw >= 0)
+        close(pw);
     free(u->blob);
     u->blob = NULL;
 }
@@ -652,6 +1338,8 @@ static void usbdev_fd_cleanup(int guest_fd)
     u->guest_fd = -1;
     pthread_mutex_unlock(&u->lock);
     pthread_mutex_unlock(&usbdev_table_lock);
+    if (RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        atomic_store(&usbdev_disc_map[guest_fd], 0);
 }
 
 void usbdev_init(void)
@@ -662,7 +1350,10 @@ void usbdev_init(void)
             memset(&usbdev_fds[i], 0, sizeof(usbdev_fds[i]));
             usbdev_fds[i].guest_fd = -1;
             usbdev_fds[i].pipe_wr = -1;
+            usbdev_fds[i].notif = IO_OBJECT_NULL;
             pthread_mutex_init(&usbdev_fds[i].lock, NULL);
+            pthread_mutex_init(&usbdev_fds[i].async_lock, NULL);
+            pthread_cond_init(&usbdev_fds[i].async_cv, NULL);
         }
         usbdev_ready = true;
     }
@@ -766,7 +1457,17 @@ int64_t usbdev_open_path(const char *path, int linux_flags)
     u->dev = NULL;
     u->dev_open = false;
     u->dev_open_tried = false;
+    u->dev_src = NULL;
+    u->notif = IO_OBJECT_NULL;
     memset(u->ifaces, 0, sizeof(u->ifaces));
+    u->pending_head = u->pending_tail = NULL;
+    u->completed_head = u->completed_tail = NULL;
+    u->inflight = 0;
+    u->nurbs = 0;
+    u->inflight_bytes = 0;
+    u->disconnected = false;
+    u->discsig_signr = 0;
+    u->discsig_context = 0;
     pthread_mutex_unlock(&u->lock);
 
     /* fd_alloc publishes the slot before the side table binds the guest fd;
@@ -801,6 +1502,8 @@ int64_t usbdev_open_path(const char *path, int linux_flags)
     u->guest_fd = guest_fd;
     u->generation = fd_current_generation(guest_fd);
     pthread_mutex_unlock(&usbdev_table_lock);
+    if (RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        atomic_store(&usbdev_disc_map[guest_fd], 0);
     return guest_fd;
 }
 
@@ -1055,6 +1758,10 @@ static int64_t usbdev_do_setinterface(usbdev_t *u, guest_t *g, uint64_t arg)
     if (rc < 0)
         return rc;
     usbdev_iface_t *fi = &u->ifaces[si.interface];
+    /* proc_setintf kills the interface's URBs before switching altsettings
+     * (devio.c:1529-1544); in-flight pipeRefs die with the old pipe table.
+     */
+    (void) usbdev_kill_urbs_locked(u, fi->intf);
     IOReturn r =
         (*fi->intf)->SetAlternateInterface(fi->intf, (UInt8) si.altsetting);
     if (r != kIOReturnSuccess) {
@@ -1191,6 +1898,376 @@ static int64_t usbdev_do_driver_ioctl(usbdev_t *u, guest_t *g, uint64_t arg)
     }
 }
 
+/* ---------- async URB ioctls ---------- */
+
+/* SUBMITURB (proc_do_submiturb, doc A §A3). Entry lock held. */
+static int64_t usbdev_do_submiturb(usbdev_t *u, guest_t *g, uint64_t arg)
+{
+    linux_usbdevfs_urb_t uu;
+    if (guest_read_small(g, arg, &uu, sizeof(uu)) < 0)
+        return -LINUX_EFAULT;
+    if (uu.buffer_length < 0)
+        return -LINUX_EINVAL;
+
+    switch (uu.type) {
+    case LINUX_URB_TYPE_CONTROL:
+    case LINUX_URB_TYPE_BULK:
+    case LINUX_URB_TYPE_INTERRUPT:
+        if (uu.flags & ~LINUX_URB_FLAGS_ALLOWED)
+            return -LINUX_EINVAL; /* devio.c:1635-1645 */
+        break;
+    case LINUX_URB_TYPE_ISO:
+        log_warn("usbdev: ISO URBs unsupported (doc A §A7.4)");
+        return -LINUX_EINVAL;
+    default:
+        return -LINUX_EINVAL;
+    }
+    if (uu.signr)
+        log_debug("usbdev: URB completion signal %u ignored", uu.signr);
+
+    bool is_in;
+    uint32_t data_len;
+    uint64_t data_gva;
+    usbdev_iface_t *fi = NULL;
+    uint8_t pipe = 0;
+    bool pipe_interrupt = false;
+    uint16_t mps = 0;
+    IOUSBDevRequestTO req;
+    memset(&req, 0, sizeof(req));
+
+    if (uu.type == LINUX_URB_TYPE_CONTROL) {
+        /* Buffer = 8-byte setup + wLength data (devio.c:1671-1683). */
+        uint8_t setup[8];
+        if (uu.buffer_length < 8)
+            return -LINUX_EINVAL;
+        if (guest_read_small(g, uu.buffer, setup, sizeof(setup)) < 0)
+            return -LINUX_EFAULT;
+        uint16_t wLength = (uint16_t) (setup[6] | (setup[7] << 8));
+        if ((uint32_t) uu.buffer_length - 8 < wLength)
+            return -LINUX_EINVAL;
+        /* check_ctrlrecip: vendor requests bypass; IF/EP recipients claim
+         * the owning interface implicitly (devio.c:881-938).
+         */
+        if ((setup[0] & 0x60) != 0x40) {
+            unsigned recip = setup[0] & 0x1f;
+            uint16_t wIndex = (uint16_t) (setup[4] | (setup[5] << 8));
+            if (recip == 1) {
+                int64_t rc = usbdev_claim_locked(u, wIndex & 0xff);
+                if (rc < 0)
+                    return rc;
+            } else if (recip == 2) {
+                usbdev_iface_t *efi = NULL;
+                uint8_t epipe = 0;
+                int64_t rc = usbdev_pipe_for_ep(u, (uint8_t) (wIndex & 0x8f),
+                                                &efi, &epipe);
+                if (rc < 0)
+                    return rc;
+            }
+        }
+        is_in = (setup[0] & 0x80) != 0;
+        data_len = wLength;
+        data_gva = uu.buffer + 8;
+        req.bmRequestType = setup[0];
+        req.bRequest = setup[1];
+        req.wValue = (UInt16) (setup[2] | (setup[3] << 8));
+        req.wIndex = (UInt16) (setup[4] | (setup[5] << 8));
+        req.wLength = wLength;
+        req.noDataTimeout = 0; /* usbfs URBs never time out */
+        req.completionTimeout = 0;
+        if ((uu.endpoint & 0x7f) != 0) {
+            int64_t rc = usbdev_pipe_for_ep(u, uu.endpoint, &fi, &pipe);
+            if (rc < 0)
+                return rc;
+            if (fi->pipe_type[pipe - 1] != kUSBControl)
+                return -LINUX_EINVAL;
+            rc = usbdev_ensure_iface_async(u, fi);
+            if (rc < 0)
+                return rc;
+        } else {
+            int64_t rc = usbdev_ensure_dev_async(u);
+            if (rc < 0)
+                return rc;
+        }
+    } else {
+        is_in = (uu.endpoint & 0x80) != 0;
+        int64_t rc = usbdev_pipe_for_ep(u, uu.endpoint, &fi, &pipe);
+        if (rc < 0)
+            return rc;
+        uint8_t ptype = fi->pipe_type[pipe - 1];
+        if (uu.type == LINUX_URB_TYPE_BULK) {
+            if (ptype != kUSBBulk && ptype != kUSBInterrupt)
+                return -LINUX_EINVAL; /* control/iso ep (devio.c:1718) */
+        } else {
+            if (ptype != kUSBInterrupt)
+                return -LINUX_EINVAL;
+        }
+        pipe_interrupt = ptype == kUSBInterrupt;
+        rc = usbdev_ensure_iface_async(u, fi);
+        if (rc < 0)
+            return rc;
+        data_len = (uint32_t) uu.buffer_length;
+        data_gva = uu.buffer;
+        mps = fi->pipe_mps[pipe - 1];
+    }
+
+    /* Caps: 16 MB of in-flight buffer (usbfs_memory_mb, devio.c:134) and a
+     * record-count backstop.
+     */
+    pthread_mutex_lock(&u->async_lock);
+    if (u->nurbs >= USBDEV_MAX_URBS ||
+        u->inflight_bytes + data_len > USBDEV_BULK_MAX) {
+        pthread_mutex_unlock(&u->async_lock);
+        return -LINUX_ENOMEM;
+    }
+    u->nurbs++;
+    u->inflight_bytes += data_len;
+    pthread_mutex_unlock(&u->async_lock);
+
+    usbdev_urb_t *rec = calloc(1, sizeof(*rec));
+    uint8_t *buf = NULL;
+    if (rec && data_len > 0)
+        buf = malloc(data_len);
+    if (!rec || (data_len > 0 && !buf)) {
+        free(buf);
+        free(rec);
+        pthread_mutex_lock(&u->async_lock);
+        u->nurbs--;
+        u->inflight_bytes -= data_len;
+        pthread_mutex_unlock(&u->async_lock);
+        return -LINUX_ENOMEM;
+    }
+    if (!is_in && data_len > 0 && guest_read(g, data_gva, buf, data_len) < 0) {
+        free(buf);
+        free(rec);
+        pthread_mutex_lock(&u->async_lock);
+        u->nurbs--;
+        u->inflight_bytes -= data_len;
+        pthread_mutex_unlock(&u->async_lock);
+        return -LINUX_EFAULT;
+    }
+
+    rec->u = u;
+    rec->userurb = arg;
+    rec->data_gva = data_gva;
+    rec->type = uu.type;
+    rec->ep = uu.endpoint;
+    /* Both ep0 directions share the default control pipe: one FIFO key. */
+    rec->ep_key =
+        (uu.type == LINUX_URB_TYPE_CONTROL && (uu.endpoint & 0x7f) == 0)
+            ? 0
+            : uu.endpoint;
+    rec->pipe = pipe;
+    rec->intf = fi ? fi->intf : NULL;
+    rec->is_in = is_in;
+    /* Direction-mismatched flags are ignored, not rejected (devio.c
+     * honours SHORT_NOT_OK for IN and ZERO_PACKET for OUT only,
+     * 1710-1737).
+     */
+    rec->short_not_ok = is_in && (uu.flags & LINUX_URB_SHORT_NOT_OK) != 0;
+    rec->zero_packet = !is_in && (uu.flags & LINUX_URB_ZERO_PACKET) != 0;
+    rec->pipe_interrupt = pipe_interrupt;
+    rec->state = URB_QUEUED;
+    rec->data_len = data_len;
+    rec->mps = mps;
+    rec->buf = buf;
+    rec->req = req;
+
+    pthread_mutex_lock(&u->async_lock);
+    bool busy = false;
+    for (usbdev_urb_t *r = u->pending_head; r; r = r->next) {
+        if (r->ep_key == rec->ep_key) {
+            busy = true;
+            break;
+        }
+    }
+    urb_list_append(&u->pending_head, &u->pending_tail, rec);
+    if (!busy) {
+        /* Endpoint idle: hand it to IOKit now. Queued follow-ups start from
+         * the completion callback (one in-flight URB per endpoint keeps
+         * DISCARDURB per-URB, see file header).
+         */
+        IOReturn ir = usbdev_urb_start(rec);
+        if (ir != kIOReturnSuccess) {
+            urb_pending_unlink(u, rec);
+            urb_free_locked(u, rec);
+            pthread_mutex_unlock(&u->async_lock);
+            if ((uint32_t) ir == (uint32_t) kIOReturnNoDevice ||
+                (uint32_t) ir == (uint32_t) kIOReturnNotAttached)
+                usbdev_mark_disconnected(u);
+            int64_t e = ioret_neg_errno(ir);
+            return e < 0 ? e : -LINUX_EPROTO;
+        }
+        rec->state = URB_INFLIGHT;
+        u->inflight++;
+    }
+    pthread_mutex_unlock(&u->async_lock);
+    return 0;
+}
+
+/* DISCARDURB (proc_unlinkurb): arg is the user URB pointer. Entry lock
+ * held. A QUEUED record completes locally as killed (-ENOENT); an INFLIGHT
+ * one is flagged and aborted -- with one in-flight URB per endpoint the
+ * AbortPipe cannot cancel bystanders. Kernel usb_kill_urb is synchronous;
+ * here the -ENOENT completion arrives via the callback, which REAPURB then
+ * observes (deviation noted in the file header).
+ */
+static int64_t usbdev_do_discardurb(usbdev_t *u, uint64_t arg)
+{
+    pthread_mutex_lock(&u->async_lock);
+    usbdev_urb_t *rec = u->pending_head;
+    while (rec && (rec->userurb != arg || rec->discarding))
+        rec = rec->next;
+    if (!rec) {
+        pthread_mutex_unlock(&u->async_lock);
+        return -LINUX_EINVAL; /* not pending (completed counts as gone) */
+    }
+    if (rec->state == URB_QUEUED) {
+        urb_pending_unlink(u, rec);
+        urb_complete_locked(u, rec, -LINUX_ENOENT);
+        pthread_mutex_unlock(&u->async_lock);
+        return 0;
+    }
+    rec->discarding = true;
+    uint8_t pipe = rec->pipe;
+    IOUSBInterfaceInterface800 **intf = rec->intf;
+    pthread_mutex_unlock(&u->async_lock);
+    /* The interface handle cannot be released concurrently: release paths
+     * need the entry lock this thread holds.
+     */
+    if (pipe == 0)
+        (void) (*u->dev)->USBDeviceAbortPipeZero(u->dev);
+    else
+        (void) (*intf)->AbortPipe(intf, pipe);
+    return 0;
+}
+
+/* Copy one completion back to the guest (vCPU thread): IN data into the
+ * urb's buffer, then status/actual_length/error_count into the guest urb,
+ * then the userurb pointer into *arg (processcompl, devio.c:2042-2078).
+ */
+static int64_t usbdev_reap_copyout(guest_t *g, usbdev_urb_t *rec, uint64_t arg)
+{
+    if (rec->is_in && rec->actual > 0 &&
+        guest_write(g, rec->data_gva, rec->buf,
+                    rec->actual < rec->data_len ? rec->actual : rec->data_len) <
+            0)
+        return -LINUX_EFAULT;
+    int32_t st = rec->status;
+    int32_t act = (int32_t) rec->actual;
+    int32_t ec = 0;
+    if (guest_write_small(g,
+                          rec->userurb + offsetof(linux_usbdevfs_urb_t, status),
+                          &st, sizeof(st)) < 0 ||
+        guest_write_small(
+            g, rec->userurb + offsetof(linux_usbdevfs_urb_t, actual_length),
+            &act, sizeof(act)) < 0 ||
+        guest_write_small(
+            g, rec->userurb + offsetof(linux_usbdevfs_urb_t, error_count), &ec,
+            sizeof(ec)) < 0)
+        return -LINUX_EFAULT;
+    if (guest_write_small(g, arg, &rec->userurb, sizeof(rec->userurb)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
+/* REAPURB / REAPURBNDELAY. Called WITHOUT the entry lock held so a blocked
+ * reap never stalls submits or discards; each pass revalidates the fd.
+ * Blocking follows reap_as (devio.c:2080-2118): wake on completion or
+ * disconnect, -EINTR without restart on a signal, -ENODEV once
+ * disconnected and drained (REAP_AFTER_DISCONNECT).
+ */
+static int64_t usbdev_do_reap(guest_t *g, int fd, uint64_t arg, bool block)
+{
+    for (;;) {
+        fd_entry_t snap;
+        if (!fd_snapshot(fd, &snap) || snap.type != FD_USBDEV)
+            return -LINUX_EBADF;
+        usbdev_t *u = usbdev_acquire(fd);
+        if (!u)
+            return -LINUX_EBADF;
+        pthread_mutex_lock(&u->async_lock);
+        usbdev_urb_t *rec = u->completed_head;
+        if (rec) {
+            u->completed_head = rec->next;
+            if (!u->completed_head)
+                u->completed_tail = NULL;
+        }
+        bool disc = u->disconnected;
+        pthread_mutex_unlock(&u->async_lock);
+        if (rec) {
+            /* Drain this completion's readiness byte and copy out while the
+             * entry lock still pins the pipe's host fd open (cleanup waits
+             * on it).
+             */
+            char b;
+            (void) !read(snap.host_fd, &b, 1);
+            int64_t ret = usbdev_reap_copyout(g, rec, arg);
+            pthread_mutex_lock(&u->async_lock);
+            urb_free_locked(u, rec);
+            pthread_mutex_unlock(&u->async_lock);
+            pthread_mutex_unlock(&u->lock);
+            return ret;
+        }
+        pthread_mutex_unlock(&u->lock);
+        if (disc)
+            return -LINUX_ENODEV;
+        if (!block)
+            return -LINUX_EAGAIN;
+        int64_t rc = io_wait_fd_or_interrupted(snap.host_fd, POLLIN);
+        if (rc < 0) {
+            /* reap_as returns -EINTR with no restart (devio.c:2115). */
+            syscall_restart_forbid();
+            return rc;
+        }
+    }
+}
+
+/* ---------- poll/select/epoll remap helpers (see poll.c call sites) ---- */
+
+bool usbdev_fd_disconnected(int guest_fd)
+{
+    return RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE) &&
+           atomic_load(&usbdev_disc_map[guest_fd]) != 0;
+}
+
+bool usbdev_poll_host_events(int guest_fd,
+                             short guest_events,
+                             short *host_events)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap) || snap.type != FD_USBDEV)
+        return false;
+    /* POLLOUT needs FMODE_WRITE (devio.c:2833); a disconnected fd must
+     * still wake the host poll (the disconnect byte) to surface
+     * POLLERR|POLLHUP.
+     */
+    bool writable = (snap.linux_flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY;
+    short ev = 0;
+    if ((writable &&
+         (guest_events & (LINUX_POLLOUT | LINUX_POLLWRNORM)) != 0) ||
+        usbdev_fd_disconnected(guest_fd))
+        ev = POLLIN;
+    *host_events = ev;
+    return true;
+}
+
+short usbdev_poll_guest_revents(int guest_fd,
+                                short guest_events,
+                                short host_revents)
+{
+    fd_entry_t snap;
+    bool writable = fd_snapshot(guest_fd, &snap) && snap.type == FD_USBDEV &&
+                    (snap.linux_flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY;
+    short out = 0;
+    if (usbdev_fd_disconnected(guest_fd))
+        out |= LINUX_POLLERR | LINUX_POLLHUP; /* devio.c:2842-2845 */
+    if (writable && (host_revents & POLLIN))
+        out |= LINUX_POLLOUT | LINUX_POLLWRNORM; /* completions reapable */
+    /* do_pollfd masks by demanded events plus the unmaskable bits. */
+    return (short) (out & (guest_events | LINUX_POLLERR | LINUX_POLLHUP |
+                           LINUX_POLLNVAL));
+}
+
 /* Registry 'Device Speed' -> USB_SPEED_* enum (ch9.h:1217-1222): the ioctl's
  * return value, not an out parameter.
  */
@@ -1222,9 +2299,30 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     if ((snap.linux_flags & LINUX_O_ACCMODE) == LINUX_O_RDONLY)
         return -LINUX_EPERM;
 
+    /* The reaps manage their own locking: a blocked REAPURB must not hold
+     * the entry lock against concurrent SUBMITURB/DISCARDURB, and they stay
+     * usable after disconnect (devio.c:2612-2635).
+     */
+    if ((uint32_t) request == USBDEVFS_REAPURB ||
+        (uint32_t) request == USBDEVFS_REAPURBNDELAY)
+        return usbdev_do_reap(g, fd, arg,
+                              (uint32_t) request == USBDEVFS_REAPURB);
+
     usbdev_t *u = usbdev_acquire(fd);
     if (!u)
         return -LINUX_EBADF;
+
+    /* usbdev_ioctl's connected() gate: everything except the reaps above is
+     * -ENODEV once the device is gone.
+     */
+    bool disc;
+    pthread_mutex_lock(&u->async_lock);
+    disc = u->disconnected;
+    pthread_mutex_unlock(&u->async_lock);
+    if (disc) {
+        pthread_mutex_unlock(&u->lock);
+        return -LINUX_ENODEV;
+    }
 
     int64_t ret;
     switch ((uint32_t) request) {
@@ -1305,17 +2403,30 @@ int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         ret = usbdev_do_driver_ioctl(u, g, arg);
         break;
     case USBDEVFS_SUBMITURB:
-        log_warn("usbdev: SUBMITURB not implemented (stage 3)");
-        ret = -LINUX_ENOTTY;
+        ret = usbdev_do_submiturb(u, g, arg);
         break;
     case USBDEVFS_DISCARDURB:
-    case USBDEVFS_REAPURB:
-    case USBDEVFS_REAPURBNDELAY:
-    case USBDEVFS_DISCSIGNAL:
-        log_debug("usbdev: async URB ioctl 0x%llx not implemented (stage 3)",
-                  (unsigned long long) request);
-        ret = -LINUX_ENOTTY;
+        ret = usbdev_do_discardurb(u, arg);
         break;
+    case USBDEVFS_DISCSIGNAL: {
+        /* Stored for fidelity but never delivered (file header): elfuse has
+         * no async guest-signal injection from the event thread.
+         */
+        linux_usbdevfs_disconnectsignal_t ds;
+        if (guest_read_small(g, arg, &ds, sizeof(ds)) < 0) {
+            ret = -LINUX_EFAULT;
+        } else {
+            u->discsig_signr = ds.signr;
+            u->discsig_context = ds.context;
+            if (ds.signr)
+                log_warn(
+                    "usbdev: DISCSIGNAL %u accepted but will not be "
+                    "delivered",
+                    ds.signr);
+            ret = 0;
+        }
+        break;
+    }
     default:
         ret = -LINUX_ENOTTY;
         break;

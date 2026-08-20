@@ -37,6 +37,7 @@
 #include "syscall/proc.h" /* proc_exit_group_requested */
 #include "syscall/signal.h"
 #include "syscall/time.h" /* linux_timespec_valid */
+#include "syscall/usbdev.h"
 #include "syscall/wakeup-pipe.h"
 
 /* The proof in proved/fdset.h bounds nfds by FDSET_MAX_FDS and sizes the
@@ -55,6 +56,7 @@ typedef struct {
     int host_fd;
     uint16_t word;
     uint8_t bit_index;
+    bool usbdev; /* usbfs fd: writability is remapped pipe readability */
     short events;
     short revents;
     host_fd_ref_t ref;
@@ -117,6 +119,11 @@ int64_t sys_ppoll(guest_t *g,
     struct pollfd host_fds[256];
     host_fd_ref_t host_refs[256];
     bool need_pollnval[256] = {false};
+    /* usbfs fds poll a completion pipe whose host readiness (POLLIN) means
+     * guest POLLOUT ("URBs reapable"); both directions are remapped through
+     * the usbdev helpers.
+     */
+    bool usbdev_remap[256] = {false};
 
     /* Generation pinned per entry in the same fd_lock window as its host fd.
      * The pty hangup checks below re-resolve the guest fd, so each needs a
@@ -141,6 +148,14 @@ int64_t sys_ppoll(guest_t *g,
         host_fds[i].fd = host_fd;
         host_fds[i].events = guest_fds[i].events;
         host_fds[i].revents = 0;
+        if (host_fd >= 0) {
+            short mapped;
+            if (usbdev_poll_host_events(guest_fd, guest_fds[i].events,
+                                        &mapped)) {
+                usbdev_remap[i] = true;
+                host_fds[i].events = mapped;
+            }
+        }
     }
 
     /* Log fd types for shutdown diagnostics (verbose only) */
@@ -333,6 +348,23 @@ ppoll_retry:
         return linux_errno();
     }
 
+    /* Rewrite usbfs entries into guest-visible Linux bits (POLLIN on the
+     * completion pipe -> POLLOUT|POLLWRNORM; disconnect -> POLLERR|POLLHUP)
+     * and keep the ready count consistent with the rewritten revents.
+     */
+    for (uint32_t i = 0; i < nfds; i++) {
+        if (!usbdev_remap[i] || need_pollnval[i])
+            continue;
+        short before = host_fds[i].revents;
+        short after = usbdev_poll_guest_revents(guest_fds[i].fd,
+                                                guest_fds[i].events, before);
+        host_fds[i].revents = after;
+        if (before != 0 && after == 0 && ret > 0)
+            ret--;
+        else if (before == 0 && after != 0)
+            ret++;
+    }
+
     /* Write back revents to guest only when the guest-visible array changes.
      * Tight ppoll(..., timeout=0) loops often come back with all-zero revents,
      * in which case rewriting the whole pollfd array is wasted work.
@@ -478,23 +510,45 @@ int64_t sys_pselect6(guest_t *g,
                 reqs[req_count].bit_index = (uint8_t) bit_index;
                 reqs[req_count].events = 0;
                 reqs[req_count].revents = 0;
-                if (rbits && (rbits[word] & bit))
-                    reqs[req_count].events |= POLLIN;
-                if (wbits && (wbits[word] & bit))
-                    reqs[req_count].events |= POLLOUT;
-                if (ebits && (ebits[word] & bit))
-                    reqs[req_count].events |= POLLPRI;
+                /* usbfs fd: select writability == completions reapable ==
+                 * the completion pipe's read end is readable, so its
+                 * host-side interest goes into the READ set only.
+                 */
+                short usb_ev = 0;
+                bool usb = usbdev_poll_host_events(
+                    i,
+                    (wbits && (wbits[word] & bit)) ? 0x0004 /* POLLOUT */
+                                                   : 0,
+                    &usb_ev);
+                reqs[req_count].usbdev = usb;
+                if (usb) {
+                    reqs[req_count].events = usb_ev; /* POLLIN or 0 */
+                } else {
+                    if (rbits && (rbits[word] & bit))
+                        reqs[req_count].events |= POLLIN;
+                    if (wbits && (wbits[word] & bit))
+                        reqs[req_count].events |= POLLOUT;
+                    if (ebits && (ebits[word] & bit))
+                        reqs[req_count].events |= POLLPRI;
+                }
                 reqs[req_count].ref = ref;
                 req_count++;
                 if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
                     if (host_fd > max_host_fd)
                         max_host_fd = host_fd;
-                    if (rbits && (rbits[word] & bit))
-                        FD_SET(host_fd, read_setp);
-                    if (wbits && (wbits[word] & bit))
-                        FD_SET(host_fd, write_setp);
-                    if (ebits && (ebits[word] & bit))
-                        FD_SET(host_fd, except_setp);
+                    if (usb) {
+                        if (usb_ev & POLLIN) {
+                            FD_SET(host_fd, &read_set);
+                            read_setp = &read_set;
+                        }
+                    } else {
+                        if (rbits && (rbits[word] & bit))
+                            FD_SET(host_fd, read_setp);
+                        if (wbits && (wbits[word] & bit))
+                            FD_SET(host_fd, write_setp);
+                        if (ebits && (ebits[word] & bit))
+                            FD_SET(host_fd, except_setp);
+                    }
                 }
                 requested &= requested - 1;
             }
@@ -706,6 +760,24 @@ pselect_retry:
         for (int i = 0; i < req_count; i++) {
             int host_fd = reqs[i].host_fd, word = reqs[i].word;
             uint64_t bit = BIT64(reqs[i].bit_index);
+            if (reqs[i].usbdev) {
+                /* Completion-pipe readability -> guest writability;
+                 * disconnect -> readable+writable, matching how Linux
+                 * select folds POLLERR into both sets.
+                 */
+                int gfd = (int) reqs[i].word * 64 + reqs[i].bit_index;
+                bool ready =
+                    use_poll_fallback
+                        ? (reqs[i].revents & (POLLIN | POLLHUP | POLLERR)) != 0
+                        : (RANGE_CHECK(host_fd, 0, FD_SETSIZE) &&
+                           FD_ISSET(host_fd, &read_set));
+                bool disc = usbdev_fd_disconnected(gfd);
+                if (wbits && (ready || disc))
+                    wbits[word] |= bit;
+                if (rbits && disc)
+                    rbits[word] |= bit;
+                continue;
+            }
             if (use_poll_fallback) {
                 short revents = reqs[i].revents;
                 if (rbits && (revents & (POLLIN | POLLHUP | POLLERR)))
@@ -804,6 +876,9 @@ typedef struct {
                          * reporting but allow MOD.
                          */
     bool pty_master;    /* Registration is for a tracked pty master. */
+    bool usbdev;        /* usbfs fd: EVFILT_READ on the completion pipe is
+                         * reported as EPOLLOUT ("URBs reapable"), never
+                         * EPOLLIN (devio.c:2832-2846). */
 } epoll_reg_t;
 
 /* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance has its
@@ -843,6 +918,7 @@ static void epoll_reg_deactivate_locked(epoll_instance_t *inst,
     reg->active = false;
     reg->oneshot_armed = false;
     reg->pty_master = false;
+    reg->usbdev = false;
     reg->generation = 0;
     reg->ofd_id = 0;
 }
@@ -1033,6 +1109,18 @@ static inline void epoll_merge_event(linux_epoll_event_t *out,
                                      const struct kevent *kev,
                                      const epoll_reg_t *reg)
 {
+    if (reg->usbdev) {
+        /* Completion-pipe readability means "URBs reapable" = EPOLLOUT;
+         * the usbfs fd never signals EPOLLIN. EOF/errors on the pipe only
+         * happen while the fd is being torn down -- report the hangup pair
+         * Linux uses for a removed device.
+         */
+        if (kev->filter == EVFILT_READ && (reg->events & LINUX_EPOLLOUT))
+            out->events |= LINUX_EPOLLOUT;
+        if (kev->flags & (EV_EOF | EV_ERROR))
+            out->events |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
+        return;
+    }
     if (kev->filter == EVFILT_READ)
         out->events |= LINUX_EPOLLIN;
     if (kev->filter == EVFILT_WRITE)
@@ -1143,6 +1231,11 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     int target_host_fd = target_snap.host_fd;
     bool target_pty_master =
         proc_pty_master_pts_num(target_host_fd) != UINT32_MAX;
+    /* usbfs fds register EVFILT_READ on the completion pipe when the guest
+     * asks for EPOLLOUT, and nothing for EPOLLIN (never signaled). The
+     * matching report-side remap is in epoll_merge_event.
+     */
+    bool target_usbdev = target_snap.type == FD_USBDEV;
 
     /* Serialize all regs[] access and the paired kqueue mutation against a
      * concurrent close hook or a sibling epoll_ctl on the same instance. The
@@ -1178,12 +1271,14 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         struct kevent changes[2];
         int nchanges = 0;
         {
-            if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+            if (reg->usbdev
+                    ? (reg->events & LINUX_EPOLLOUT) != 0
+                    : (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) != 0) {
                 EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ,
                        EV_DELETE, 0, 0, NULL);
                 nchanges++;
             }
-            if (reg->events & LINUX_EPOLLOUT) {
+            if (!reg->usbdev && (reg->events & LINUX_EPOLLOUT)) {
                 EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE,
                        EV_DELETE, 0, 0, NULL);
                 nchanges++;
@@ -1228,11 +1323,13 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      */
     if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
         struct kevent del;
-        if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+        if (reg->usbdev
+                ? (reg->events & LINUX_EPOLLOUT) != 0
+                : (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) != 0) {
             EV_SET(&del, target_host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
             kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
         }
-        if (reg->events & LINUX_EPOLLOUT) {
+        if (!reg->usbdev && (reg->events & LINUX_EPOLLOUT)) {
             EV_SET(&del, target_host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
             kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
         }
@@ -1262,15 +1359,26 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     /* Use (void*)(uintptr_t)fd as udata to identify the guest fd */
     void *udata = (void *) (uintptr_t) fd;
 
-    if (ev.events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-        EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags, 0, 0,
-               udata);
-        nchanges++;
-    }
-    if (ev.events & LINUX_EPOLLOUT) {
-        EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE, kflags, 0, 0,
-               udata);
-        nchanges++;
+    if (target_usbdev) {
+        /* Only EPOLLOUT can ever fire (completions reapable); it watches
+         * the pipe's read side. EPOLLIN/EPOLLRDHUP register nothing.
+         */
+        if (ev.events & LINUX_EPOLLOUT) {
+            EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags, 0,
+                   0, udata);
+            nchanges++;
+        }
+    } else {
+        if (ev.events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+            EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags, 0,
+                   0, udata);
+            nchanges++;
+        }
+        if (ev.events & LINUX_EPOLLOUT) {
+            EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE, kflags, 0,
+                   0, udata);
+            nchanges++;
+        }
     }
 
     if (nchanges > 0) {
@@ -1287,6 +1395,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      */
     reg->events = ev.events;
     reg->data = ev.data;
+    reg->usbdev = target_usbdev;
     reg->generation = target_snap.generation;
     reg->ofd_id = target_snap.ofd_id;
     if (!reg->active)
@@ -1576,18 +1685,21 @@ int64_t sys_epoll_pwait(guest_t *g,
         epoll_reg_t *reg = &inst->regs[gfd];
 
         int idx = out_index[gfd];
-        if (idx >= 0) {
-            epoll_merge_event(&out[idx], &kevents[i], reg);
-            continue;
+        if (idx < 0) {
+            idx = nout++;
+            out_index[gfd] = idx;
+            out_gfds[idx] = gfd;
+            out[idx].events = 0;
+            out[idx]._pad = 0;
+            out[idx].data = reg->data;
         }
-
-        idx = nout++;
-        out_index[gfd] = idx;
-        out_gfds[idx] = gfd;
-        out[idx].events = 0;
-        out[idx]._pad = 0;
-        out[idx].data = reg->data;
         epoll_merge_event(&out[idx], &kevents[i], reg);
+        /* A disconnected usbfs device reports the hangup pair alongside any
+         * remaining reapable completions (devio.c:2842-2845; EPOLLHUP and
+         * EPOLLERR are unmaskable).
+         */
+        if (reg->usbdev && usbdev_fd_disconnected(gfd))
+            out[idx].events |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
     }
 
     /* Stamp EPOLLHUP for the masters the host cannot report on. Linux delivers
