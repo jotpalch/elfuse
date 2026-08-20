@@ -106,6 +106,7 @@ Key files:
 | `src/syscall/time.c` | clocks, timers, `setitimer`, clock-ID translation |
 | `src/syscall/sys.c` | `uname`, `sysinfo`, `getrandom`, `prlimit64` |
 | `src/syscall/net.c`, `net-abi.c`, `net-absock.c`, `net-msg.c`, `net-sockopt.c`, `netlink.c` | sockets, SCM_RIGHTS, abstract Unix sockets, netlink |
+| `src/syscall/usbdev.c` | usbdevfs fds over IOKit (see [USB Device Passthrough](#usb-device-passthrough)) |
 | `src/syscall/translate.c` | errno and shared `AT_*` flag translation |
 | `src/syscall/proc.c` | vCPU run loop, `wait4`, ptrace coordination, HVC #6 routing |
 | `src/syscall/exec.c` | `execve`: ELF reload, interpreter resolve, vCPU restart |
@@ -545,6 +546,7 @@ waiter enqueue, so the compare-and-wait is a single critical section.
 | FUSE (sessions, file/dir state) | global `fuse_lock` + per-session `session->lock` | `src/syscall/fuse.c` |
 | Sysroot snapshot | `pthread_mutex` | `src/syscall/proc-state.c` |
 | Synthetic USB tree (scratch dirs + device model) | `usb_lock` (leaf) | `src/runtime/usb-sysfs.c` |
+| usbdevfs fd side table | `usbdev_table_lock` + per-entry lock | `src/syscall/usbdev.c` |
 
 Lock ordering is documented inline in those files
 (`mmap_lock` is order 1, `fd_lock` is order 3, `sfd_lock` is order 5a)
@@ -793,6 +795,52 @@ Validation lives in `make test-fuse-alpine`, which exercises
 `/dev/fuse` plus `mount("fuse")` against the staged Alpine musl
 sysroot fixture.
 
+## USB Device Passthrough
+
+`src/syscall/usbdev.c` implements the usbdevfs character device
+(`/dev/bus/usb/BBB/DDD`) on top of IOKit's `IOUSBDeviceInterface650` and
+`IOUSBInterfaceInterface800` plugin interfaces, so Linux USB tools drive
+real devices attached to the Mac. macOS grants that access unprivileged for
+vendor-class interfaces (the debug-probe and DFU population); an interface
+bound to an Apple class driver cannot be opened, which is surfaced with
+Linux's own errno for the situation (below).
+
+The fd model: opening a node constructs a typed `FD_USBDEV` fd. Per-fd
+state (the IOKit device handle, claimed interfaces, and the endpoint-to-pipe
+map) lives in a side table keyed by the guest fd, guarded by
+`usbdev_table_lock` with a per-entry lock beneath it so a slot cannot be
+torn down and reused between lookup and use; entries are additionally pinned
+by the fd generation, so a concurrently closed and reallocated guest fd
+cannot reach another open's state. The entry's host fd is a pipe read end
+reserved for readiness signaling. `read()` serves the descriptors blob at a
+per-open file position, byte-identical to the sysfs `descriptors`
+attribute; `SEEK_END` is `EINVAL`, as on Linux usbfs; `fstat` reports a
+character device, major 189. `write()` is `EINVAL` and `dup` of the fd is
+refused with `EBADF` (the side table is keyed by the guest fd and IOKit
+plugin handles are process-local).
+
+The ioctl surface at this layer: `CLAIMINTERFACE` / `RELEASEINTERFACE`,
+`SETINTERFACE`, `SETCONFIGURATION`, `CLEAR_HALT` / `RESETEP`, `GETDRIVER`,
+`GET_CAPABILITIES`, `GET_SPEED`, `CONNECTINFO`, `DISCONNECT_CLAIM`,
+`USBDEVFS_IOCTL` `DISCONNECT` / `CONNECT`, and the synchronous `CONTROL`
+and `BULK` transfers, which bounce guest data through host buffers around
+`DeviceRequestTO` and `ReadPipeTO` / `WritePipeTO`. The transfers here are
+synchronous: the guest thread blocks in the ioctl for the duration of the
+request.
+
+errno fidelity is the design rule, because libusb and friends branch on
+exact values. Every ioctl on an `O_RDONLY` fd is `EPERM` (Linux's
+`FMODE_WRITE` gate in `devio.c`). Claiming an interface a macOS kernel
+driver is bound to reports `EBUSY` -- what Linux reports for an interface
+held by a Linux kernel driver -- with the binding detected as a registry child of
+the interface service, and `kIOReturnExclusiveAccess` from the claim itself
+mapped the same way. `GETDRIVER` names the bound Apple driver, or `usbfs`
+after a claim, or reports `ENODATA`. Transfer errors map per `devio.c`: a
+stall is `EPIPE`, a timeout `ETIMEDOUT`, a vanished device `ENODEV`.
+`kIOReturnAborted` maps to `EINTR` with `syscall_restart_forbid()`, because
+the transfer was already on the wire and a dispatcher restart would send it
+twice.
+
 ## procfs And Device Emulation
 
 `src/runtime/procemu.c` intercepts a focused set of guest-visible paths
@@ -921,9 +969,8 @@ falls back to a usbfs directory scan.
 The `/dev/bus/usb/BBB/DDD` nodes are 0444 placeholder files on disk (the
 `/dev/pts` placeholder pattern); the stat intercept reports them as
 character devices, major 189, minor `(bus - 1) * 128 + (dev - 1)`, and the
-open intercept diverts an open away from the placeholder. Opening a node
-serves the shared descriptors blob read-only; a writable open reports
-`EACCES`.
+open intercept diverts an open away from the placeholder into the usbdevfs
+fd constructor (see [USB Device Passthrough](#usb-device-passthrough)).
 
 One layout deviation is deliberate: the `/sys/bus/usb/devices` entries are
 real directories, not symlinks into `/sys/devices/...`, so `realpath()` of

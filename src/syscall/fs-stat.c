@@ -19,6 +19,7 @@
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
+#include "syscall/usbdev.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "utils.h"
@@ -302,8 +303,8 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
         return frc;
 
     fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH &&
-        snap.proc_path[0] != '\0') {
+    bool have_snap = fd_snapshot(fd, &snap);
+    if (have_snap && snap.type == FD_PATH && snap.proc_path[0] != '\0') {
         int intercepted = proc_intercept_stat(snap.proc_path, &mac_st);
         if (intercepted == 0) {
             if (write_linux_stat(g, stat_gva, &mac_st) < 0)
@@ -312,6 +313,18 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
         }
         if (intercepted == -1)
             return linux_errno();
+    }
+
+    /* usbdevfs fds are char device 189:minor; the host fd behind them is a
+     * pipe, whose fstat must not leak through.
+     */
+    if (have_snap && snap.type == FD_USBDEV) {
+        int64_t urc = usbdev_fstat(fd, &mac_st);
+        if (urc < 0)
+            return urc;
+        if (write_linux_stat(g, stat_gva, &mac_st) < 0)
+            return -LINUX_EFAULT;
+        return 0;
     }
 
     host_fd_ref_t host_ref;

@@ -72,6 +72,7 @@ SRCS := \
     syscall/net-absock.c \
     syscall/net-sockopt.c \
     syscall/netlink.c \
+    syscall/usbdev.c \
     syscall/sysvipc.c \
     debug/crashreport.c \
     debug/gdbstub.c \
