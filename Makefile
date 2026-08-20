@@ -72,6 +72,7 @@ SRCS := \
     syscall/net-sockopt.c \
     syscall/netlink.c \
     syscall/usbdev.c \
+    syscall/usbdev-fixture.c \
     syscall/sysvipc.c \
     debug/crashreport.c \
     debug/gdbstub.c \
@@ -286,6 +287,14 @@ $(BUILD_DIR)/test-dynamic-array-host: \
 # I/O), so the test links the code under test and nothing else.
 $(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
 		$(BUILD_DIR)/runtime/usb-desc.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the usbdevfs URB bookkeeping host unit test (native macOS binary)
+# usbdev-urb.h is header-only arithmetic with no IOKit and no I/O, so the test
+# needs no object but its own.
+$(BUILD_DIR)/test-usbdev-urb-host: \
+		$(BUILD_DIR)/test-usbdev-urb-host.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

@@ -124,10 +124,13 @@
  *                                     it. What keeps the slot from being torn
  *                                     down and reused in between is the refs
  *                                     and dead pair the lookup sets under the
- *                                     table lock, not a nesting. Never held
- *                                     together with any other file-scope lock
- *                                     in this list either, in either direction,
- *                                     so its position here is nominal
+ *                                     table lock, not a nesting. The per-entry
+ *                                     lock does hold the per-entry async_lock
+ *                                     beneath it (usbdev_teardown_locked).
+ *                                     Never held together with any other
+ *                                     file-scope lock in this list either, in
+ *                                     either direction, so its position here is
+ *                                     nominal
  *
  * Leaves. Each of these is the innermost lock on every path that takes it, so
  * it has no position in the order above and cannot be half of an inversion:
@@ -141,6 +144,8 @@
  *                                    sysinfo_lock (sys.c)
  *                                    sysroot_lock (proc-state.c)
  *                                    usb_lock (runtime/usb-sysfs.c)
+ *                                    usbdev_loop_lock (usbdev.c)
+ *                                    usbdev_fixture_lock (usbdev-fixture.c)
  *
  * log_mutex is the one leaf every other entry may hold: a lock anywhere in
  * either list can log while held. It sits below the whole order rather than

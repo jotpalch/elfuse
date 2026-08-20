@@ -4,13 +4,16 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Stage 2 of the usbdevfs emulation: a real FD_USBDEV fd type whose synchronous
- * ioctls (CLAIMINTERFACE, CONTROL, BULK, ...) are served by
- * IOUSBDeviceInterface/IOUSBInterfaceInterface plugins. Async URBs
- * (SUBMITURB/REAPURB) are stage 3.
+ * Stages 2+3 of the usbdevfs emulation: a real FD_USBDEV fd type whose
+ * synchronous ioctls (CLAIMINTERFACE, CONTROL, BULK, ...) and async URBs
+ * (SUBMITURB/DISCARDURB/REAPURB*) are served by
+ * IOUSBDeviceInterface/IOUSBInterfaceInterface plugins plus one CFRunLoop
+ * completion thread.
  */
 
 #pragma once
+
+#include <stdbool.h>
 
 #include <stdint.h>
 #include <sys/stat.h>
@@ -72,3 +75,28 @@ int64_t usbdev_fstat(int fd, struct stat *st);
  * Returns -LINUX_* or the (possibly positive) ioctl result.
  */
 int64_t usbdev_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg);
+
+/* poll/select/epoll remap: the usbfs fd signals guest POLLOUT|POLLWRNORM
+ * ("completed URBs reapable", devio.c:2830-2843) while its backing pipe's read
+ * end raises host POLLIN, and disconnect must surface as POLLERR|POLLHUP.
+ * usbdev_poll_host_events returns false when guest_fd is not FD_USBDEV;
+ * otherwise it yields the host-side events to poll the pipe with, and
+ * usbdev_poll_guest_revents converts the host result back into Linux poll bits
+ * (already masked by the demanded events).
+ */
+bool usbdev_poll_host_events(int guest_fd,
+                             short guest_events,
+                             short *host_events);
+short usbdev_poll_guest_revents(int guest_fd,
+                                short guest_events,
+                                short host_revents);
+
+/* Lock-free "device gone" test for the epoll merge path. */
+bool usbdev_fd_disconnected(int guest_fd);
+
+/* Lock-free "a completion is reapable" test: guest-visible writability
+ * (POLLOUT/EPOLLOUT/select write set) exists only while the completed list is
+ * non-empty, so every readiness remap must pair the pipe's readability with
+ * this check (the pipe also carries the disconnect wake byte).
+ */
+bool usbdev_fd_reapable(int guest_fd);

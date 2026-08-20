@@ -250,6 +250,39 @@ Practical notes:
   time; `elfuse` creates a case-sensitive APFS sparsebundle, mounts it
   at `PATH`, and uses it as the sysroot for this run.
 
+## USB Devices
+
+Linux USB tools see the Mac's attached devices. `/dev/bus/usb` and
+`/sys/bus/usb/devices` are synthesized from the IOKit registry, and opening
+a device node yields a usbfs-compatible fd driven over IOKit (see
+[internals.md](internals.md), section "USB Device Passthrough").
+
+What works unprivileged is what macOS itself leaves unclaimed: vendor-class
+and bulk interfaces, which is the debug-probe and DFU population. `lsusb`,
+libusb programs, and nusb-based tools such as the probe-rs family
+enumerate, claim, and transfer against those directly, including async
+URBs.
+
+What does not: an interface bound to an Apple class driver (CDC serial,
+HID, FTDI, mass storage) cannot be claimed, and `CLAIMINTERFACE` reports
+`EBUSY` -- exactly what Linux reports for an interface a kernel driver
+holds. For a CDC serial device, open the host's `/dev/cu.*` node from the
+guest instead; the termios layer drives the real line.
+
+A stock distribution `lsusb` does not run yet, and the reason is not the
+USB layer. usbutils reaches libusb through libudev, whose monitor socket
+wants `SO_ATTACH_FILTER`; elfuse's netlink layer answers that
+`ENOPROTOOPT`, libudev's monitor never starts, and `libusb_init` gives up
+with `-99`:
+
+```console
+$ build/elfuse --sysroot ./debian-sysroot /usr/bin/lsusb
+unable to initialize libusb: -99
+```
+
+Programs that open the device nodes themselves, or that build libusb
+without the udev backend, are unaffected.
+
 ## Debugging With GDB Or LLDB
 
 `elfuse` includes a built-in GDB Remote Serial Protocol stub.
