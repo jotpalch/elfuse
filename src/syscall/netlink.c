@@ -17,9 +17,21 @@
  *   sendmsg(RTM_GETADDR) -> builds address list from host getifaddrs
  *   recvmsg() / read() -> returns buffered response data
  *
- * Non-NETLINK_ROUTE protocols return -EAFNOSUPPORT at socket() time.
+ * NETLINK_KOBJECT_UEVENT sockets are also accepted, as a silent socket: no
+ * uevent is ever synthesized, so the fd never becomes readable, a non-blocking
+ * receive reports EAGAIN, and poll() times out. That is exactly the kernel's
+ * behavior on a machine with no hotplug activity, and it is enough for
+ * libusb_init()'s netlink hotplug monitor (socket + bind(nl_groups=1) +
+ * setsockopt(SO_PASSCRED) + a poll loop) to come up. Sends on a uevent socket
+ * report -EPERM, matching uevent_net_rcv() for a sender without
+ * CAP_NET_ADMIN (elfuse guests are not privileged over the host's device
+ * model). SOL_SOCKET options on any netlink fd are emulated per-fd in
+ * netlink_setsockopt/netlink_getsockopt below.
+ *
+ * Other protocols return -EAFNOSUPPORT at socket() time.
  */
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -129,7 +141,26 @@ typedef struct {
     uint32_t pid;                  /* Bound PID (from bind or auto-assigned) */
     int pipe_wr;                   /* Host pipe write descriptor */
     int pipe_rd;                   /* Host pipe read descriptor */
+    int proto;                     /* NETLINK_ROUTE or NETLINK_KOBJECT_UEVENT */
+    int sock_type;                 /* SOCK_RAW or SOCK_DGRAM (SO_TYPE) */
+    /* Emulated SOL_SOCKET option state. There is no host socket behind a
+     * netlink fd, so these are pure per-fd caches for getsockopt round-trips.
+     * rcvbuf/sndbuf hold the kernel-doubled value getsockopt reports.
+     */
+    int opt_passcred;
+    int opt_rcvbuf;
+    int opt_sndbuf;
 } netlink_state_t;
+
+/* Linux net.core.rmem_default/wmem_default on a stock kernel: what
+ * getsockopt(SO_RCVBUF/SO_SNDBUF) reports before the guest ever sets one.
+ */
+#define NETLINK_DEFAULT_BUFSIZE 212992
+
+/* Floor for a doubled SO_RCVBUF/SO_SNDBUF, standing in for the kernel's
+ * SOCK_MIN_RCVBUF/SOCK_MIN_SNDBUF (truesize-derived, ~2.2KB).
+ */
+#define NETLINK_MIN_BUFSIZE 2048
 
 static netlink_state_t nl_state[MAX_NETLINK_FDS];
 static pthread_mutex_t nl_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -442,10 +473,11 @@ void netlink_init(void)
 
 int64_t netlink_socket(int protocol, int type)
 {
-    (void) type;
-
-    /* Only NETLINK_ROUTE is supported */
-    if (protocol != NETLINK_ROUTE)
+    /* NETLINK_ROUTE gets the rtnetlink dump emulation; NETLINK_KOBJECT_UEVENT
+     * gets a silent socket (see the file header). Everything else is refused
+     * the way a kernel without that netlink family would refuse it.
+     */
+    if (protocol != NETLINK_ROUTE && protocol != NETLINK_KOBJECT_UEVENT)
         return -LINUX_EAFNOSUPPORT;
 
     /* Allocate a pipe fd pair: the read end serves as the "socket" that
@@ -479,6 +511,18 @@ int64_t netlink_socket(int protocol, int type)
 
     ns->pipe_wr = pipefd[1];
     ns->pipe_rd = pipefd[0];
+    ns->proto = protocol;
+    ns->sock_type = type & 0xF; /* strip SOCK_NONBLOCK/SOCK_CLOEXEC */
+
+    /* Linux opens a netlink socket O_RDWR; carry SOCK_NONBLOCK into
+     * linux_flags so a non-blocking receive on an empty socket reports EAGAIN
+     * instead of parking the caller. libusb's uevent monitor opens with
+     * SOCK_RAW|SOCK_NONBLOCK|SOCK_CLOEXEC and relies on exactly that.
+     */
+    fd_publish_linux_flags(
+        gfd, LINUX_O_RDWR |
+                 ((type & LINUX_SOCK_NONBLOCK) ? LINUX_O_NONBLOCK : 0) |
+                 ((type & LINUX_SOCK_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
 
     return gfd;
 }
@@ -501,6 +545,139 @@ int64_t netlink_bind(int guest_fd,
         }
     }
 
+    return 0;
+}
+
+/* Double a requested SO_RCVBUF/SO_SNDBUF the way __sock_set_rcvbuf() does, so
+ * a getsockopt round-trip reports what a kernel would.
+ */
+static int nl_bufsize_store(int value)
+{
+    if (value < 0)
+        value = 0;
+    int doubled = (value > INT_MAX / 2) ? INT_MAX : value * 2;
+    return (doubled < NETLINK_MIN_BUFSIZE) ? NETLINK_MIN_BUFSIZE : doubled;
+}
+
+int64_t netlink_setsockopt(guest_t *g,
+                           int guest_fd,
+                           int level,
+                           int optname,
+                           uint64_t optval_gva,
+                           uint32_t optlen)
+{
+    /* SOL_NETLINK (NETLINK_ADD_MEMBERSHIP and friends) is out of scope: no
+     * emulated protocol delivers multicast events, so there is no membership
+     * to track. No consumer in scope sets them (libusb/nusb join groups via
+     * bind()); refuse the level the way sock_setsockopt refuses an unknown
+     * one rather than pretending a membership took effect.
+     */
+    if (level != LINUX_SOL_SOCKET)
+        return -LINUX_ENOPROTOOPT;
+
+    pthread_mutex_lock(&nl_lock);
+    netlink_state_t *ns = nl_find(guest_fd);
+    if (!ns) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EBADF;
+    }
+
+    /* Every option cached below carries an int; sock_setsockopt refuses a
+     * shorter buffer with EINVAL before looking at the option.
+     */
+    if (optlen < sizeof(int)) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EINVAL;
+    }
+    int value = 0;
+    if (guest_read_small(g, optval_gva, &value, sizeof(value)) < 0) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EFAULT;
+    }
+
+    switch (optname) {
+    case LINUX_SO_PASSCRED:
+        ns->opt_passcred = !!value;
+        break;
+    case LINUX_SO_RCVBUF:
+        ns->opt_rcvbuf = nl_bufsize_store(value);
+        break;
+    case LINUX_SO_SNDBUF:
+        ns->opt_sndbuf = nl_bufsize_store(value);
+        break;
+    default:
+        /* Generic SOL_SOCKET toggles (SO_REUSEADDR, SO_KEEPALIVE, timeouts,
+         * ...) succeed on any Linux socket. None of them can change what a
+         * silent emulated socket observably does, so accept and discard.
+         */
+        break;
+    }
+
+    pthread_mutex_unlock(&nl_lock);
+    return 0;
+}
+
+int64_t netlink_getsockopt(guest_t *g,
+                           int guest_fd,
+                           int level,
+                           int optname,
+                           uint64_t optval_gva,
+                           uint64_t optlen_gva)
+{
+    if (level != LINUX_SOL_SOCKET)
+        return -LINUX_ENOPROTOOPT;
+
+    pthread_mutex_lock(&nl_lock);
+    netlink_state_t *ns = nl_find(guest_fd);
+    if (!ns) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EBADF;
+    }
+
+    int value;
+    switch (optname) {
+    case LINUX_SO_PASSCRED:
+        value = ns->opt_passcred;
+        break;
+    case LINUX_SO_RCVBUF:
+        value = ns->opt_rcvbuf ? ns->opt_rcvbuf : NETLINK_DEFAULT_BUFSIZE;
+        break;
+    case LINUX_SO_SNDBUF:
+        value = ns->opt_sndbuf ? ns->opt_sndbuf : NETLINK_DEFAULT_BUFSIZE;
+        break;
+    case LINUX_SO_TYPE:
+        value = ns->sock_type;
+        break;
+    case LINUX_SO_PROTOCOL:
+        value = ns->proto;
+        break;
+    case LINUX_SO_DOMAIN:
+        value = LINUX_AF_NETLINK;
+        break;
+    case LINUX_SO_ERROR:
+    case LINUX_SO_ACCEPTCONN:
+        value = 0;
+        break;
+    default:
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_ENOPROTOOPT;
+    }
+    pthread_mutex_unlock(&nl_lock);
+
+    uint32_t guest_optlen;
+    if (guest_read_small(g, optlen_gva, &guest_optlen, sizeof(guest_optlen)) <
+        0)
+        return -LINUX_EFAULT;
+
+    uint32_t write_len = sizeof(value);
+    if (write_len > guest_optlen)
+        write_len = guest_optlen;
+    if (write_len > 0 &&
+        guest_write_small(g, optval_gva, &value, write_len) < 0)
+        return -LINUX_EFAULT;
+    uint32_t actual_len = sizeof(value);
+    if (guest_write_small(g, optlen_gva, &actual_len, sizeof(actual_len)) < 0)
+        return -LINUX_EFAULT;
     return 0;
 }
 
@@ -710,6 +887,16 @@ static int64_t netlink_send_iov(int guest_fd,
     }
 
     int64_t result;
+
+    /* A uevent socket is receive-only here. The kernel's uevent_net_rcv()
+     * refuses a sender without CAP_NET_ADMIN with -EPERM, and elfuse guests
+     * have no authority to fabricate uevents, so every send is that refusal.
+     */
+    if (ns->proto == NETLINK_KOBJECT_UEVENT) {
+        result = -LINUX_EPERM;
+        goto out;
+    }
+
     uint64_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
         if (iov[i].iov_len > UINT64_MAX - total) {

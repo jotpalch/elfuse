@@ -1083,6 +1083,15 @@ int64_t sys_setsockopt(guest_t *g,
                        uint64_t optval_gva,
                        uint32_t optlen)
 {
+    /* Netlink sockets are synthetic (no host socket to forward to); their
+     * SOL_SOCKET options are emulated per-fd by the netlink layer. Without
+     * this dispatch the paths below report EBADF (net_socket_fd_is_valid
+     * requires FD_SOCKET), which broke libusb_init()'s setsockopt(SO_PASSCRED)
+     * on its NETLINK_KOBJECT_UEVENT monitor socket.
+     */
+    if (fd_get_type(fd) == FD_NETLINK)
+        return netlink_setsockopt(g, fd, level, optname, optval_gva, optlen);
+
     int small_int_opt = socket_opt_uses_small_int(level, optname);
 
     /* SO_PASSCRED: emulated entirely in elfuse. Cache the flag value so
@@ -1267,6 +1276,11 @@ int64_t sys_getsockopt(guest_t *g,
                        uint64_t optval_gva,
                        uint64_t optlen_gva)
 {
+    /* See sys_setsockopt: netlink fds carry emulated SOL_SOCKET options. */
+    if (fd_get_type(fd) == FD_NETLINK)
+        return netlink_getsockopt(g, fd, level, optname, optval_gva,
+                                  optlen_gva);
+
     uint32_t guest_optlen;
     if (guest_read_small(g, optlen_gva, &guest_optlen, sizeof(guest_optlen)) <
         0)
