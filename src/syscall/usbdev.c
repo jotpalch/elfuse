@@ -402,6 +402,13 @@ static int64_t ioret_neg_errno(IOReturn r)
     case kIOReturnOverrun:
         return -LINUX_EOVERFLOW;
     case kIOReturnAborted:
+        /* A sync transfer that comes back Aborted was already on the wire
+         * (another thread's DISCARDURB/teardown aborted the pipe), so the
+         * dispatcher must not re-execute the ioctl and send it again. The
+         * flag is thread-local; on the event thread (urb status mapping,
+         * never a syscall return) it is dead state and harmless.
+         */
+        syscall_restart_forbid();
         return -LINUX_EINTR;
     case kIOReturnExclusiveAccess:
     case kIOReturnBusy:
@@ -1498,9 +1505,16 @@ int64_t usbdev_open_path(const char *path, int linux_flags)
     pthread_mutex_unlock(&fd_lock);
     fd_publish_linux_flags(guest_fd, linux_flags);
 
+    /* Snapshot the generation before taking the table lock: reading it
+     * inside would nest fd_lock under usbdev_table_lock, and the table lock
+     * is documented as never held together with fd_lock. The value is the
+     * same either way -- it only changes if the guest closes the fd, which
+     * is the same accepted race as the fd_alloc publish window above.
+     */
+    uint64_t gen = fd_current_generation(guest_fd);
     pthread_mutex_lock(&usbdev_table_lock);
     u->guest_fd = guest_fd;
-    u->generation = fd_current_generation(guest_fd);
+    u->generation = gen;
     pthread_mutex_unlock(&usbdev_table_lock);
     if (RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
         atomic_store(&usbdev_disc_map[guest_fd], 0);

@@ -94,6 +94,13 @@ INVENTORY = {
         "FUSE_INTERRUPT is on the wire and the request is detached, so a "
         "restart would re-issue the operation under a fresh unique.",
     ),
+    "syscall/usbdev.c::ioret_neg_errno": (
+        "forbids",
+        "kIOReturnAborted means a sync transfer already handed to IOKit was "
+        "aborted mid-flight; a restart would send the request twice. The "
+        "event thread also maps statuses through here, where the "
+        "thread-local flag is dead state.",
+    ),
     # Waits that report EINTR before doing anything the guest can observe.
     "syscall/io.c::io_retry_backoff": (
         "restartable",

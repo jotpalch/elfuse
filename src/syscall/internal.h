@@ -88,6 +88,18 @@
  *                                     which is what pins a session against
  *                                     daemon exit while a request is in flight
  *   inotify_lock (syscall/inotify.c): inotify watch table
+ *   usbdev_table_lock (syscall/usbdev.c): FD_USBDEV side table; holds the
+ *                                     per-entry usbdev lock beneath it
+ *                                     (usbdev_acquire and usbdev_fd_cleanup
+ *                                     take entry locks under it so a slot
+ *                                     cannot be torn down and reused between
+ *                                     lookup and lock). The per-entry lock in
+ *                                     turn holds the per-entry async_lock
+ *                                     beneath it (usbdev_teardown_locked).
+ *                                     Never held together with any other
+ *                                     file-scope lock in this list, in either
+ *                                     direction, so its position here is
+ *                                     nominal
  *
  * Leaves. Each of these is the innermost lock on every path that takes it, so
  * it has no position in the order above and cannot be half of an inversion:
@@ -101,6 +113,7 @@
  *                                    sysinfo_lock (sys.c)
  *                                    sysroot_lock (proc-state.c)
  *                                    usb_lock (runtime/usb-sysfs.c)
+ *                                    usbdev_loop_lock (usbdev.c)
  *
  * log_mutex is the one leaf every other entry may hold: a lock anywhere in
  * either list can log while held. It sits below the whole order rather than
