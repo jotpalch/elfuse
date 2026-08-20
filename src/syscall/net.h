@@ -26,6 +26,7 @@
 
 /* Linux Netlink protocol families. */
 #define NETLINK_ROUTE 0
+#define NETLINK_KOBJECT_UEVENT 15
 
 /* Linux socket types + flags. */
 #define LINUX_SOCK_STREAM 1
@@ -66,6 +67,8 @@ typedef struct {
 #define LINUX_SO_REUSEPORT 15
 #define LINUX_SO_RCVLOWAT 18
 #define LINUX_SO_SNDLOWAT 19
+#define LINUX_SO_PROTOCOL 38
+#define LINUX_SO_DOMAIN 39
 
 /* Linux TCP level options. */
 #define LINUX_IPPROTO_TCP 6
@@ -204,16 +207,37 @@ void netlink_init(void);
 
 /* Create a synthetic netlink socket fd.
  *
- * Returns guest fd, or negative errno. Only NETLINK_ROUTE is supported; others
- * return -EAFNOSUPPORT.
+ * Returns guest fd, or negative errno. NETLINK_ROUTE (rtnetlink dump emulation)
+ * and NETLINK_KOBJECT_UEVENT (silent socket: no events are ever delivered) are
+ * supported; other protocols return -EAFNOSUPPORT.
  */
 int64_t netlink_socket(int protocol, int type);
 
-/* Netlink bind (always succeeds for NETLINK_ROUTE). */
+/* Netlink bind (always succeeds; nl_groups membership is accepted and ignored
+ * since no multicast event is ever synthesized).
+ */
 int64_t netlink_bind(int guest_fd,
                      guest_t *g,
                      uint64_t addr_gva,
                      uint32_t addrlen);
+
+/* setsockopt/getsockopt on a netlink fd. SOL_SOCKET options are emulated per-fd
+ * (never forwarded to a host socket: there is none); other levels report
+ * -ENOPROTOOPT.
+ */
+int64_t netlink_setsockopt(guest_t *g,
+                           int guest_fd,
+                           int level,
+                           int optname,
+                           uint64_t optval_gva,
+                           uint32_t optlen);
+
+int64_t netlink_getsockopt(guest_t *g,
+                           int guest_fd,
+                           int level,
+                           int optname,
+                           uint64_t optval_gva,
+                           uint64_t optlen_gva);
 
 /* Netlink sendmsg: parse the request and buffer a response. */
 int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags);

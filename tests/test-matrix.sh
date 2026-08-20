@@ -772,6 +772,7 @@ run_unit_tests()
     test_check "$runner" "test-net" "0 failed" "$bindir/test-net"
     test_rc "$runner" "test-netstat" 0 "$bindir/test-netstat"
     test_rc "$runner" "test-netlink" 0 "$bindir/test-netlink"
+    test_rc "$runner" "test-uevent-socket" 0 "$bindir/test-uevent-socket"
 
     printf "\nThreading\n"
     test_check "$runner" "test-thread" "0 failed" "$bindir/test-thread"

@@ -434,6 +434,14 @@ Socket syscalls are translated in `src/syscall/net.c` and friends:
 - `SOL_SOCKET` option numbers (`SO_TYPE`, `SO_SNDBUF`, `SO_RCVBUF`, …)
   differ between platforms and are remapped per option.
 
+Netlink sockets are emulated in `src/syscall/netlink.c`: `NETLINK_ROUTE`
+answers the `RTM_GETLINK` / `RTM_GETADDR` dumps `getifaddrs` issues, and
+`NETLINK_KOBJECT_UEVENT` sockets are accepted as silent sockets -- no uevent
+is ever synthesized, so the fd never becomes readable, which is exactly a
+real Linux kernel with no hotplug activity -- because libusb-style hotplug
+monitors must open, bind, and set `SO_PASSCRED` on one before they will
+initialize at all.
+
 ### Stack Alignment
 
 The Linux initial stack must have `SP` 16-byte aligned and pointing directly
