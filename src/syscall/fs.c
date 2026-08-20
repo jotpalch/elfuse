@@ -94,6 +94,40 @@ static bool same_stat_identity(const struct stat *a, const struct stat *b)
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
+/* Virtual-path stamp for an fd opened through the intercepts. Opening the
+ * /proc/self/fd/N (or /dev/fd/N) magic link reopens the underlying file, so
+ * the new descriptor must inherit the target fd's stamped identity, not the
+ * literal magic-link spelling: fstatfs on a reopened /sys directory has to
+ * keep answering SYSFS_MAGIC (systemd's sd-device reopens every chased
+ * syspath this way and gates on it), and a reopened regular file must not
+ * masquerade as procfs. Returns path unchanged for non-magic-link paths, the
+ * target's stamp copied into buf, or NULL when the target has no virtual
+ * identity (stamp nothing).
+ */
+static const char *intercept_stamp_path(const char *path,
+                                        char *buf,
+                                        size_t bufsz)
+{
+    size_t prefix;
+    if (!strncmp(path, "/proc/self/fd/", 14))
+        prefix = 14;
+    else if (!strncmp(path, "/dev/fd/", 8))
+        prefix = 8;
+    else
+        return path;
+
+    char *end;
+    long n = strtol(path + prefix, &end, 10);
+    if (end == path + prefix || *end != '\0' || n < 0 || n >= FD_TABLE_SIZE)
+        return path;
+
+    fd_entry_t snap;
+    if (!fd_snapshot((int) n, &snap) || snap.proc_path[0] == '\0')
+        return NULL;
+    str_copy_trunc(buf, snap.proc_path, bufsz);
+    return buf;
+}
+
 typedef struct removed_overlay_identity {
     struct removed_overlay_identity *next;
     uint64_t dev;
@@ -202,6 +236,20 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
      */
     if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/")) {
         str_copy_trunc(out, "/dev/pts", out_size);
+        return true;
+    }
+
+    /* The synthetic USB trees (usb-sysfs.c) are scratch-dir backed like
+     * /dev/pts, and their consumers walk them with per-component relative
+     * openat (systemd chase()) and then fstatfs the result expecting
+     * SYSFS_MAGIC. Both need the guest spelling on the descriptor: the former
+     * so resolve_proc_dirfd_path keeps the walk on the intercepts, the latter
+     * so sys_fstatfs can answer synthetically instead of leaking the /tmp
+     * filesystem.
+     */
+    if (path_prefix_match(path, "/sys", 4) ||
+        path_prefix_match(path, "/dev/bus", 8)) {
+        str_copy_trunc(out, path, out_size);
         return true;
     }
 
@@ -651,9 +699,12 @@ int64_t sys_openat_path(guest_t *g,
             }
             int min_guest_fd =
                 (!strncmp(tx.intercept_path, "/dev/", 5)) ? -1 : 128;
+            char stamp_buf[FD_VIRTUAL_PATH_MAX];
+            const char *stamp = intercept_stamp_path(
+                tx.intercept_path, stamp_buf, sizeof(stamp_buf));
             int guest_fd = fd_alloc_opened_host(
                 intercepted, type, linux_flags, min_guest_fd,
-                fd_cleanup_for_type(type), tx.intercept_path);
+                fd_cleanup_for_type(type), stamp);
             if (guest_fd < 0) {
                 proc_pty_forget_host_fd(intercepted);
                 close_keep_errno(intercepted);
@@ -694,6 +745,26 @@ int64_t sys_openat_path(guest_t *g,
 
     int host_fd =
         open_nonblocking_writer(dir_ref.fd, tx.host_path, flags, mode);
+    if (host_fd < 0 && errno == ENOENT) {
+        /* Relative walkers (systemd chase() opens one component per openat)
+         * step from host-backed directories into synthetic subtrees the host
+         * does not carry -- openat(<sysroot>/sys fd, "bus") is ENOENT on the
+         * host while /sys/bus is served by an intercept. Rebase the relative
+         * path to its guest-absolute spelling and, only when that spelling is
+         * gated for interception, retry through the normal absolute-path
+         * flow. Host semantics for everything else are unchanged: the
+         * fallback runs only after a host ENOENT.
+         */
+        char rebased[LINUX_PATH_MAX];
+        if (path_rebase_hostdirfd(dir_ref.fd, tx.host_path, rebased,
+                                  sizeof(rebased)) > 0 &&
+            path_might_use_open_intercept(rebased)) {
+            host_fd_ref_close(&dir_ref);
+            return sys_openat_path(g, LINUX_AT_FDCWD, rebased, linux_flags,
+                                   mode);
+        }
+        errno = ENOENT;
+    }
     host_fd_ref_close(&dir_ref);
     if (host_fd < 0)
         return linux_errno();

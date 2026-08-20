@@ -443,6 +443,28 @@ static void fill_proc_statfs(linux_statfs_t *lin)
     lin->f_frsize = 4096;
 }
 
+/* Boundary-checked "/sys or under it", mirroring statfs_path_is_proc. */
+static bool statfs_path_is_sysfs(const char *path)
+{
+    if (!path || path[0] != '/')
+        return false;
+    return !strncmp(path, "/sys", 4) && (path[4] == '\0' || path[4] == '/');
+}
+
+static void fill_sysfs_statfs(linux_statfs_t *lin)
+{
+    memset(lin, 0, sizeof(*lin));
+    lin->f_type = 0x62656572; /* SYSFS_MAGIC */
+    lin->f_bsize = 4096;
+    lin->f_blocks = 0;
+    lin->f_bfree = 0;
+    lin->f_bavail = 0;
+    lin->f_files = 0;
+    lin->f_ffree = 0;
+    lin->f_namelen = 255;
+    lin->f_frsize = 4096;
+}
+
 static int64_t sys_statfs_impl(guest_t *g,
                                const char *path,
                                uint64_t buf_gva,
@@ -489,6 +511,36 @@ static int64_t sys_statfs_impl(guest_t *g,
                 return -LINUX_EFAULT;
             return 0;
         }
+    }
+
+    /* /sys is sysfs. libusb refuses to enumerate through the synthetic
+     * /sys/bus/usb tree unless statfs("/sys") reports SYSFS_MAGIC
+     * (linux_usbfs.c:398-408), and passing through to the host either fails
+     * (no /sys on macOS) or leaks the sysroot's filesystem magic. The mount
+     * point itself always answers; paths under it answer when the intercept
+     * layer (or the host/sysroot backing, e.g. an empty /sys skeleton) knows
+     * them, and report the same ENOENT a real kernel would for the rest.
+     */
+    if (statfs_path_is_sysfs(tx.intercept_path)) {
+        bool exists = tx.intercept_path[4] == '\0' ||
+                      *(tx.intercept_path + 5) == '\0'; /* "/sys", "/sys/" */
+        if (!exists) {
+            struct stat sys_st;
+            int intercepted = proc_intercept_stat(tx.intercept_path, &sys_st);
+            if (intercepted == 0)
+                exists = true;
+            else if (intercepted == -1)
+                return linux_errno();
+            else
+                exists = stat(tx.host_path, &sys_st) == 0;
+        }
+        if (!exists)
+            return -LINUX_ENOENT;
+        linux_statfs_t lin_st;
+        fill_sysfs_statfs(&lin_st);
+        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
     }
 
     /* glibc's posix_openpt() opens /dev/ptmx and then confirms devpts is
@@ -568,6 +620,19 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
         linux_statfs_t proc_st;
         fill_proc_statfs(&proc_st);
         if (guest_write_small(g, buf_gva, &proc_st, sizeof(proc_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
+    /* Descriptors opened under /sys are scratch-dir backed; the host fstatfs
+     * would leak the /tmp filesystem's magic. systemd's sd-device gates every
+     * enumerated syspath on fstatfs(fd) == SYSFS_MAGIC, so answer as sysfs
+     * exactly like path statfs("/sys") does.
+     */
+    if (snap.proc_path[0] && statfs_path_is_sysfs(snap.proc_path)) {
+        linux_statfs_t sys_st;
+        fill_sysfs_statfs(&sys_st);
+        if (guest_write_small(g, buf_gva, &sys_st, sizeof(sys_st)) < 0)
             return -LINUX_EFAULT;
         return 0;
     }

@@ -36,7 +36,12 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
     return path[plen] == '\0' || path[plen] == '/';
 }
 
-#define SYSFS_CPU_PREFIX "/sys/devices/system/cpu"
+/* The whole sysfs view: the USB layer answers /sys, /sys/bus, /sys/class and
+ * everything under them (usb-sysfs.c), with /sys/devices/system/cpu carved
+ * out for the older CPU-topology stub.
+ */
+#define SYSFS_PREFIX "/sys"
+#define DEV_USB_PREFIX "/dev/bus"
 
 bool path_might_use_open_intercept(const char *path)
 {
@@ -49,7 +54,7 @@ bool path_might_use_open_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
         return true;
     if (!strcmp(path, "/etc/mtab"))
         return true;
@@ -93,7 +98,9 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
+        return true;
+    if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
         return true;
 
     return false;
@@ -1013,8 +1020,15 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
     if (dirfd == LINUX_AT_FDCWD || !path || path[0] == '/')
         return 0;
 
+    /* FD_PATH joins FD_DIR: O_PATH directory descriptors are how systemd's
+     * chase() walks a path one openat per component, and a stamped O_PATH
+     * dirfd must keep resolving through the intercepts or the walk falls off
+     * the synthetic tree onto its host backing (and loses the stamp for every
+     * later component).
+     */
     fd_entry_t snap;
-    if (!fd_snapshot(dirfd, &snap) || snap.type != FD_DIR ||
+    if (!fd_snapshot(dirfd, &snap) ||
+        (snap.type != FD_DIR && snap.type != FD_PATH) ||
         snap.proc_path[0] == '\0')
         return 0;
 
@@ -1077,6 +1091,43 @@ int resolve_proc_at_path(guest_fd_t dirfd,
         return rc;
 
     return resolve_proc_cwd_path(path, out, outsz);
+}
+
+/* Rebase a relative path against the host directory a descriptor points at,
+ * producing the guest-visible absolute spelling: F_GETPATH names where the
+ * directory lives on the host, path_host_to_guest strips the sysroot, and the
+ * component walk folds "." and "..".
+ *
+ * This exists for relative walkers (systemd's chase() opens "/", then "sys",
+ * then "bus", one openat per component) stepping from a host-backed directory
+ * into a synthetic subtree the host does not carry: the host openat fails
+ * ENOENT even though the guest path is served by an intercept. Callers rebase
+ * on that failure and re-offer the absolute path to the intercept gates.
+ *
+ * Returns 1 with out filled, 0 when the descriptor's path cannot be mapped
+ * (not an error: the caller keeps the host result).
+ */
+int path_rebase_hostdirfd(int host_dirfd,
+                          const char *rel,
+                          char *out,
+                          size_t outsz)
+{
+    if (!rel || rel[0] == '/' || rel[0] == '\0')
+        return 0;
+    char host_dir[LINUX_PATH_MAX];
+    if (fcntl(host_dirfd, F_GETPATH, host_dir) < 0)
+        return 0;
+    char guest_dir[LINUX_PATH_MAX];
+    if (path_host_to_guest(host_dir, guest_dir, sizeof(guest_dir)) < 0)
+        return 0;
+    size_t marks[PROC_PATH_COMPONENTS_MAX];
+    size_t depth;
+    if (proc_seed_absolute_path(guest_dir, out, outsz, marks, ARRAY_SIZE(marks),
+                                &depth) < 0 ||
+        proc_apply_components(rel, out, outsz, marks, ARRAY_SIZE(marks),
+                              &depth) < 0)
+        return 0;
+    return 1;
 }
 
 int path_openat2_stays_beneath(const char *path, bool clamp_at_root)

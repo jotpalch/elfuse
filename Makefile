@@ -37,6 +37,7 @@ SRCS := \
     runtime/fork-state.c \
     runtime/procemu.c \
     runtime/procemu-pty.c \
+    runtime/usb-sysfs.c \
     runtime/proctitle.c \
     syscall/syscall.c \
     syscall/fdtable.c \
@@ -85,7 +86,7 @@ OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
-HVF_LDFLAGS := -framework Hypervisor -arch arm64
+HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -arch arm64
 
 # Generated headers under build/ that must exist before compiling sources that
 # include them.

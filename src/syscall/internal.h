@@ -100,6 +100,7 @@
  *   removed_overlay_lock (fs.c)      syscpu_dir_lock (procemu.c)
  *                                    sysinfo_lock (sys.c)
  *                                    sysroot_lock (proc-state.c)
+ *                                    usb_lock (runtime/usb-sysfs.c)
  *
  * log_mutex is the one leaf every other entry may hold: a lock anywhere in
  * either list can log while held. It sits below the whole order rather than
