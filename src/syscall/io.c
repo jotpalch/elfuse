@@ -50,6 +50,7 @@
 #include "syscall/net.h"
 #include "syscall/net-identity.h"
 #include "syscall/net-sockopt.h"
+#include "syscall/usbdev.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
@@ -1082,6 +1083,12 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (type == FD_NETLINK)
         return netlink_send(fd, g, buf_gva, count);
 
+    /* usbdevfs has no write op; vfs_write answers -EINVAL for such files.
+     * Falling through would scribble on the readiness pipe's read end.
+     */
+    if (type == FD_USBDEV)
+        return -LINUX_EINVAL;
+
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
     if (err < 0)
@@ -1162,6 +1169,8 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return netlink_read(fd, g, buf_gva, count);
     case FD_URANDOM:
         return urandom_read(g, fd, buf_gva, count);
+    case FD_USBDEV:
+        return usbdev_read(fd, g, buf_gva, count);
     }
 
     /* Pin the generation in the same fd_lock window as the host fd. The pty
@@ -2128,6 +2137,13 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         pthread_mutex_unlock(&fd_lock);
         return 0;
     }
+
+    /* usbdevfs fds answer their own ioctl set; the host fd behind them is a
+     * readiness pipe, so nothing below applies. usbdev_ioctl re-snapshots the
+     * fd and pins the side-table entry by generation itself.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_ioctl(g, fd, request, arg);
 
     if (request == LINUX_SIOCGIFHWADDR) {
         fd_entry_t snap;

@@ -316,7 +316,7 @@ static inline bool fd_type_is_synthetic(int type)
 {
     return type == FD_EVENTFD || type == FD_SIGNALFD || type == FD_TIMERFD ||
            type == FD_INOTIFY || type == FD_NETLINK || type == FD_PIDFD ||
-           type == FD_EPOLL;
+           type == FD_EPOLL || type == FD_USBDEV;
 }
 
 /* Look up a guest FD and return a dup'd host fd owned by the caller.

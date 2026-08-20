@@ -24,12 +24,11 @@
  * canonicalizes to itself, which libusb (opens attrs relative to the entry)
  * and nusb (canonicalize() of the entry path) both tolerate.
  *
- * Stage-1 open contract for /dev/bus/usb/BBB/DDD: O_RDONLY returns a
- * synthetic host fd holding the descriptors blob (matching the usbfs read()
- * view, devio.c:311-390); O_RDWR/O_WRONLY fails with EACCES. TEMPORARY:
- * stage 2 replaces this constructor with a typed FD_USBDEV fd whose read()
- * serves the same blob via usb_sysfs_descriptors_dup and whose ioctl set
- * talks to IOKit.
+ * /dev/bus/usb/BBB/DDD opens: since stage 2, every non-O_PATH open is served
+ * by the typed FD_USBDEV constructor (syscall/usbdev.c) before this intercept
+ * runs; the node branch here only backs O_PATH opens with a synthetic blob fd
+ * (the FD_PATH + stat-stamp path). The blob it serves and the FD_USBDEV
+ * read() view are the same bytes (usb_sysfs_descriptors_dup).
  */
 
 #include <ctype.h>
@@ -1013,12 +1012,14 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
         }
         int accmode = translate_open_flags(linux_flags) & O_ACCMODE;
         if (accmode != O_RDONLY) {
-            /* TEMPORARY (stage 1): writable opens are what stage 2's
-             * FD_USBDEV constructor will serve; until then they fail.
+            /* Unreachable through sys_openat_path: usbdev_open_path claims
+             * every non-O_PATH open of a node before proc_intercept_open runs
+             * (stage 2, syscall/usbdev.c). Kept as a guard for any other
+             * caller of the intercept.
              */
             log_warn(
-                "usb-sysfs: O_RDWR open of %s not implemented yet "
-                "(stage 2)",
+                "usb-sysfs: writable open of %s bypassed the FD_USBDEV "
+                "constructor",
                 path);
             err = EACCES;
             goto out;
@@ -1204,4 +1205,45 @@ uint8_t *usb_sysfs_descriptors_dup(int busnum, int devnum, size_t *len_out)
     }
     pthread_mutex_unlock(&usb_lock);
     return copy;
+}
+
+int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out)
+{
+    pthread_mutex_lock(&usb_lock);
+    int rc = -1;
+    if (ensure_usb_tree() == 0) {
+        usb_dev_t *d = find_dev(busnum, devnum);
+        if (d) {
+            out->location_id = d->location_id;
+            out->speed_code = d->speed_code;
+            out->cfg_value = d->cfg_value;
+            out->minor = usb_minor(d);
+            out->blob_len = d->blob_len;
+            rc = 0;
+        } else {
+            errno = ENODEV;
+        }
+    }
+    pthread_mutex_unlock(&usb_lock);
+    return rc;
+}
+
+int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st)
+{
+    pthread_mutex_lock(&usb_lock);
+    int rc = -1;
+    if (ensure_usb_tree() == 0) {
+        usb_dev_t *d = find_dev(busnum, devnum);
+        if (d) {
+            char node[64];
+            snprintf(node, sizeof(node), "/dev/bus/usb/%03d/%03d", busnum,
+                     devnum);
+            fill_synth_chardev(st, node, d);
+            rc = 0;
+        } else {
+            errno = ENODEV;
+        }
+    }
+    pthread_mutex_unlock(&usb_lock);
+    return rc;
 }
