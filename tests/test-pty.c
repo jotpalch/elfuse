@@ -1393,6 +1393,9 @@ int main(void)
      * rate in CBAUD and issues plain TCSETS (glibc's cfsetspeed, musl always),
      * so a translation that only reads the termios2 speed fields silently
      * leaves the host line at its old rate and tcgetattr() reports B0 forever.
+     * tcflush/tcdrain/TIOCOUTQ/TIOCEXCL are the calls pyserial and esptool make
+     * on every open; they used to fall through to ENOTTY. TIOCMGET is ENOTTY on
+     * a Linux pty too (no tiocmget op), so only its errno is pinned here.
      */
     {
         int sm = open("/dev/ptmx", O_RDWR | O_NOCTTY);
@@ -1557,6 +1560,41 @@ int main(void)
                             (st2.c_cflag & TEST_CBAUD) == B115200 &&
                             st2.c_ospeed == 115200,
                         "TCGETS2 c_cflag disagrees with TCGETS");
+
+            TEST("tcflush/tcdrain/tcflow on the slave");
+            EXPECT_TRUE(sl >= 0 && tcflush(sl, TCIOFLUSH) == 0 &&
+                            tcdrain(sl) == 0 && tcflow(sl, TCOON) == 0,
+                        "TCFLSH/TCSBRK/TCXONC not translated");
+
+            TEST("TCFLSH rejects an out-of-range selector");
+            EXPECT_ERRNO(sl >= 0 ? ioctl(sl, TCFLSH, 3) : -1, EINVAL,
+                         "TCFLSH(3)");
+
+            TEST("TIOCOUTQ on the slave");
+            int soutq = -1;
+            EXPECT_TRUE(
+                sl >= 0 && ioctl(sl, TIOCOUTQ, &soutq) == 0 && soutq == 0,
+                "TIOCOUTQ not translated");
+
+            TEST("TIOCEXCL/TIOCNXCL on the slave");
+            EXPECT_TRUE(
+                sl >= 0 && ioctl(sl, TIOCEXCL) == 0 && ioctl(sl, TIOCNXCL) == 0,
+                "TIOCEXCL/TIOCNXCL not translated");
+
+            TEST("TIOCMGET on a pty is ENOTTY");
+            int sbits = 0;
+            EXPECT_ERRNO(sl >= 0 ? ioctl(sl, TIOCMGET, &sbits) : -1, ENOTTY,
+                         "TIOCMGET");
+
+            /* The set family masks the guest word to the output lines before
+             * the host call, but a pty must still answer ENOTTY even when the
+             * masked word is empty: Linux rejects on the missing driver op
+             * before looking at the value.
+             */
+            TEST("TIOCMBIS with only status bits is still ENOTTY on a pty");
+            sbits = TIOCM_CTS | TIOCM_DSR;
+            EXPECT_ERRNO(sl >= 0 ? ioctl(sl, TIOCMBIS, &sbits) : -1, ENOTTY,
+                         "TIOCMBIS");
 
             if (sl >= 0)
                 close(sl);

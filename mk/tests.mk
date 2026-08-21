@@ -183,7 +183,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-teardown-live-vcpu-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
-        test-wakeup-pipe-host test-guest-env-host)
+        test-wakeup-pipe-host test-guest-env-host \
+        test-tty-alias-pool-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -202,6 +203,7 @@ $(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
 $(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
+$(call run-host-unit,test-tty-alias-pool-host,sticky tty alias pool unit test)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)

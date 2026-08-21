@@ -51,7 +51,9 @@
 #include "debug/log.h"
 #include "runtime/procemu-internal.h"
 #include "runtime/procemu.h"
+#include "runtime/tty-alias-pool.h"
 #include "runtime/usb-sysfs.h"
+#include "syscall/proc.h"
 #include "syscall/internal.h"
 #include "syscall/linux-wire.h"
 #include "syscall/path.h"
@@ -83,6 +85,42 @@ static char usb_dev_dir[64]; /* scratch root == /dev/bus     */
 static usb_dev_t usb_devs[USB_MAX_DEVICES];
 static int usb_ndevs;
 static pid_t usb_owner_pid;
+
+/* ttyACM/ttyUSB alias layer (piece 3).
+ *
+ * Linux exposes a CDC-ACM function as /dev/ttyACM<n> (char 166:<n>) and a
+ * vendor USB-serial bridge as /dev/ttyUSB<n> (char 188:<n>); macOS exposes both
+ * as /dev/cu.* callout nodes. Each enumerated callout node that has a USB
+ * ancestor in the device model above becomes one alias entry: the /dev open
+ * intercept diverts the alias to the host cu.* node (the /dev/pts placeholder
+ * trick), and the /sys/class/tty section below gives pyserial's
+ * list_ports_linux.py the sysfs walk it expects on Linux.
+ *
+ * The index pools are deliberately NOT reset by model_clear: an attached device
+ * must keep its number across rescans (the sticky guarantee, tty-alias-pool.h),
+ * so only the per-scan tty table is rebuilt.
+ */
+#define TTY_ACM_MAJOR 166 /* Linux ACM_TTY_MAJOR, cdc-acm.h */
+#define TTY_USB_MAJOR 188 /* Linux USB_SERIAL_TTY_MAJOR, usb-serial.c */
+#define USB_TTY_MAX 32
+#define TTY_BYID_MAX 224
+
+typedef struct {
+    char cu_name[TTY_ALIAS_KEY_MAX]; /* "cu.usbmodem1101" (pool key) */
+    char byid[TTY_BYID_MAX];         /* by-id leaf, "" when unbuildable */
+    bool is_acm;
+    int index;      /* sticky per-class minor */
+    int dev;        /* index into usb_devs[] */
+    unsigned ifnum; /* interface the Linux driver would bind */
+} usb_tty_t;
+
+static usb_tty_t usb_ttys[USB_TTY_MAX];
+static int usb_nttys;
+static tty_alias_pool_t tty_pool_acm; /* sticky, survives model rebuilds */
+static tty_alias_pool_t tty_pool_usb; /* sticky, survives model rebuilds */
+static bool tty_pools_ready;
+
+static void tty_model_build(void);
 
 /* IOKit property helpers */
 
@@ -234,6 +272,7 @@ static void model_clear(void)
         usb_devs[i].blob = NULL;
     }
     usb_ndevs = 0;
+    usb_nttys = 0; /* the sticky pools survive on purpose; see above */
 }
 
 /* Enumerate the IOKit registry into usb_devs[]. Devices whose locationID has no
@@ -390,6 +429,263 @@ static void model_build(void)
         }
         usb_devs[best].devnum = devnum;
     }
+
+    tty_model_build();
+}
+
+/* tty alias model */
+
+/* Raw active configuration descriptor inside the blob (Linux exposes the active
+ * config's interfaces in sysfs; fall back to the first config when the
+ * registry's current-configuration value matches none).
+ *
+ * Returns the descriptor start with *len_out set, or NULL.
+ */
+static const uint8_t *active_config_desc(const usb_dev_t *d, size_t *len_out)
+{
+    const uint8_t *p = d->blob + 18;
+    const uint8_t *end = d->blob + d->blob_len;
+    while (p + 9 <= end) {
+        uint16_t total = get_le16(p + 2);
+        if (total < 9 || p + total > end)
+            break;
+        if (p[5] == (uint8_t) d->cfg_value) {
+            *len_out = total;
+            return p;
+        }
+        p += total;
+    }
+    if (d->blob_len >= 18 + 9) { /* fall back to first config */
+        size_t len = get_le16(d->blob + 18 + 2);
+        if (len > d->blob_len - 18)
+            len = d->blob_len - 18;
+        *len_out = len;
+        return d->blob + 18;
+    }
+    return NULL;
+}
+
+/* The 9-byte alternate-setting-0 interface descriptor for `ifnum` in the active
+ * configuration, or NULL when the device has no such interface.
+ */
+static const uint8_t *find_iface_desc(const usb_dev_t *d, unsigned ifnum)
+{
+    size_t cfg_len = 0;
+    const uint8_t *cfg = active_config_desc(d, &cfg_len);
+    if (!cfg)
+        return NULL;
+    const uint8_t *q = cfg;
+    const uint8_t *cend = cfg + cfg_len;
+    while (q + 2 <= cend && q[0] >= 2) {
+        if (q[1] == 4 /* INTERFACE */ && q + 9 <= cend && q[2] == ifnum &&
+            q[3] == 0)
+            return q;
+        q += q[0];
+    }
+    return NULL;
+}
+
+
+static bool tty_name_is_acm(const char *cu)
+{
+    return strncmp(cu, "cu.usbmodem", 11) == 0;
+}
+
+static bool tty_name_is_usb_serial(const char *cu)
+{
+    /* The vendor-bridge callout spellings macOS drivers use: Apple's own
+     * FTDI/generic driver (cu.usbserial*), the WCH CH34x driver
+     * (cu.wchusbserial*), and Silicon Labs' CP210x driver (cu.SLAB_USBtoUART*).
+     * Everything else -- cu.Bluetooth*, cu.debug-console, cu.wlan-debug and the
+     * tty.* dial-in twins -- is not a USB serial bridge and gets no Linux
+     * alias.
+     */
+    return strncmp(cu, "cu.usbserial", 12) == 0 ||
+           strncmp(cu, "cu.wchusbserial", 15) == 0 ||
+           strncmp(cu, "cu.SLAB_USBtoUART", 17) == 0;
+}
+
+/* Interface number the Linux driver would bind the tty to.
+ *
+ * macOS hangs the IOSerialBSDClient for a CDC-ACM function under the DATA
+ * interface (AppleUSBACMData), but Linux cdc-acm registers the tty on the
+ * CONTROL interface, and that is the directory /sys/class/tty/ttyACMn/device
+ * points at on Linux (pyserial then walks one dirname up to the device dir).
+ * Map data to control as the nearest Communications-class (0x02) interface at
+ * or below the data interface in the active configuration; a composite with
+ * several CDC functions keeps each pair together that way. Vendor-class bridges
+ * (ttyUSB) keep the interface they sit on, like Linux usb-serial.
+ */
+static unsigned tty_linux_ifnum(const usb_dev_t *d,
+                                unsigned iokit_ifnum,
+                                unsigned iokit_ifclass,
+                                bool is_acm)
+{
+    if (!is_acm || iokit_ifclass == 2)
+        return iokit_ifnum;
+
+    size_t cfg_len = 0;
+    const uint8_t *cfg = active_config_desc(d, &cfg_len);
+    if (!cfg)
+        return iokit_ifnum;
+    const uint8_t *q = cfg;
+    const uint8_t *cend = cfg + cfg_len;
+    int best = -1;
+    while (q + 2 <= cend && q[0] >= 2) {
+        if (q[1] == 4 /* INTERFACE */ && q + 9 <= cend && q[3] == 0 &&
+            q[5] == 2 /* Communications */ && q[2] <= iokit_ifnum &&
+            (int) q[2] > best)
+            best = q[2];
+        q += q[0];
+    }
+    return best >= 0 ? (unsigned) best : iokit_ifnum;
+}
+
+/* by-id leaf: usb-<manufacturer>_<product>_<serial>-if<NN>, spaces mapped to
+ * underscores and absent strings skipping their segment, the shape udev's
+ * usb_id builds for /dev/serial/by-id on Linux.
+ *
+ * Returns false when the device carries none of the three strings (udev would
+ * have no ID_SERIAL either, so no link is made).
+ */
+static bool tty_byid_leaf(const usb_dev_t *d,
+                          unsigned ifnum,
+                          char *buf,
+                          size_t bufsz)
+{
+    const char *segs[3] = {d->manufacturer, d->product, d->serial};
+    size_t off = (size_t) snprintf(buf, bufsz, "usb");
+    bool any = false;
+    for (int i = 0; i < 3; i++) {
+        if (!segs[i][0])
+            continue;
+        if (off + 1 < bufsz)
+            buf[off++] = any ? '_' : '-';
+        for (const char *c = segs[i]; *c && off + 1 < bufsz; c++)
+            buf[off++] = (*c == ' ' || *c == '/') ? '_' : *c;
+        any = true;
+    }
+    buf[off] = '\0';
+    if (!any)
+        return false;
+    snprintf(buf + off, bufsz - off, "-if%02u", ifnum & 0xff);
+    return true;
+}
+
+static int find_dev_by_location(uint32_t loc)
+{
+    for (int i = 0; i < usb_ndevs; i++)
+        if (usb_devs[i].location_id == loc)
+            return i;
+    return -1;
+}
+
+/* Enumerate IOSerialBSDClient callout nodes into usb_ttys[] and reconcile the
+ * sticky pools. Runs after model_build so every alias can anchor to a device in
+ * usb_devs[] (a callout node with no USB ancestor in the model -- the macOS
+ * Bluetooth and debug consoles, or a device that vanished mid-scan -- gets no
+ * alias).
+ */
+static void tty_model_build(void)
+{
+    usb_nttys = 0;
+    if (!tty_pools_ready) {
+        tty_alias_pool_init(&tty_pool_acm);
+        tty_alias_pool_init(&tty_pool_usb);
+        tty_pools_ready = true;
+    }
+
+    CFMutableDictionaryRef match = IOServiceMatching("IOSerialBSDClient");
+    io_iterator_t it = IO_OBJECT_NULL;
+    if (!match || IOServiceGetMatchingServices(kIOMainPortDefault, match,
+                                               &it) != kIOReturnSuccess)
+        it = IO_OBJECT_NULL;
+
+    io_service_t svc;
+    while (it != IO_OBJECT_NULL && (svc = IOIteratorNext(it))) {
+        if (usb_nttys >= USB_TTY_MAX) {
+            IOObjectRelease(svc);
+            break;
+        }
+        char callout[128];
+        if (!ioreg_str(svc, "IOCalloutDevice", callout, sizeof(callout)) ||
+            strncmp(callout, "/dev/", 5) != 0) {
+            IOObjectRelease(svc);
+            continue;
+        }
+        const char *cu = callout + 5;
+        bool is_acm = tty_name_is_acm(cu);
+        if (!is_acm && !tty_name_is_usb_serial(cu)) {
+            IOObjectRelease(svc);
+            continue;
+        }
+
+        /* Nearest IOUSBHostInterface ancestor carries the locationID that keys
+         * the device model plus the macOS-side interface identity.
+         */
+        long loc = -1, ifnum = -1, ifclass = -1;
+        io_object_t cur = svc;
+        IOObjectRetain(cur);
+        for (int depth = 0; depth < 12 && cur != IO_OBJECT_NULL; depth++) {
+            io_object_t parent = IO_OBJECT_NULL;
+            if (IORegistryEntryGetParentEntry(cur, kIOServicePlane, &parent) !=
+                KERN_SUCCESS)
+                parent = IO_OBJECT_NULL;
+            IOObjectRelease(cur);
+            cur = parent;
+            if (cur != IO_OBJECT_NULL &&
+                IOObjectConformsTo(cur, "IOUSBHostInterface")) {
+                loc = ioreg_num(cur, "locationID");
+                ifnum = ioreg_num(cur, "bInterfaceNumber");
+                ifclass = ioreg_num(cur, "bInterfaceClass");
+                break;
+            }
+        }
+        if (cur != IO_OBJECT_NULL)
+            IOObjectRelease(cur);
+        IOObjectRelease(svc);
+
+        if (loc < 0 || ifnum < 0)
+            continue;
+        int di = find_dev_by_location((uint32_t) loc);
+        if (di < 0)
+            continue;
+
+        usb_tty_t *t = &usb_ttys[usb_nttys];
+        memset(t, 0, sizeof(*t));
+        str_copy_trunc(t->cu_name, cu, sizeof(t->cu_name));
+        t->is_acm = is_acm;
+        t->dev = di;
+        t->index = -1;
+        t->ifnum =
+            tty_linux_ifnum(&usb_devs[di], (unsigned) ifnum,
+                            ifclass < 0 ? 0 : (unsigned) ifclass, is_acm);
+        if (!tty_byid_leaf(&usb_devs[di], t->ifnum, t->byid, sizeof(t->byid)))
+            t->byid[0] = '\0';
+        usb_nttys++;
+    }
+    if (it != IO_OBJECT_NULL)
+        IOObjectRelease(it);
+
+    /* Reconcile each class pool with the callout names seen this scan; attached
+     * devices keep their index, departed ones free it.
+     */
+    const char *acm_keys[USB_TTY_MAX];
+    const char *usbser_keys[USB_TTY_MAX];
+    size_t nacm = 0, nusbser = 0;
+    for (int i = 0; i < usb_nttys; i++) {
+        if (usb_ttys[i].is_acm)
+            acm_keys[nacm++] = usb_ttys[i].cu_name;
+        else
+            usbser_keys[nusbser++] = usb_ttys[i].cu_name;
+    }
+    tty_alias_pool_rescan(&tty_pool_acm, acm_keys, nacm);
+    tty_alias_pool_rescan(&tty_pool_usb, usbser_keys, nusbser);
+    for (int i = 0; i < usb_nttys; i++) {
+        usb_tty_t *t = &usb_ttys[i];
+        t->index = tty_alias_pool_index(
+            t->is_acm ? &tty_pool_acm : &tty_pool_usb, t->cu_name);
+    }
 }
 
 /* scratch tree construction */
@@ -479,28 +775,8 @@ static int usb_minor(const usb_dev_t *d)
  */
 static void emit_interface_dirs(const char *devices_dir, const usb_dev_t *d)
 {
-    /* Find the active config in the blob. */
-    const uint8_t *p = d->blob + 18;
-    const uint8_t *end = d->blob + d->blob_len;
-    const uint8_t *cfg = NULL;
     size_t cfg_len = 0;
-    while (p + 9 <= end) {
-        uint16_t total = get_le16(p + 2);
-        if (total < 9 || p + total > end)
-            break;
-        if (p[5] == (uint8_t) d->cfg_value) {
-            cfg = p;
-            cfg_len = total;
-            break;
-        }
-        p += total;
-    }
-    if (!cfg && d->blob_len >= 18 + 9) { /* fall back to first config */
-        cfg = d->blob + 18;
-        cfg_len = get_le16(cfg + 2);
-        if (cfg_len > d->blob_len - 18)
-            cfg_len = d->blob_len - 18;
-    }
+    const uint8_t *cfg = active_config_desc(d, &cfg_len);
     if (!cfg)
         return;
 
@@ -610,6 +886,255 @@ static void emit_device_dir(const char *devices_dir, const usb_dev_t *d)
     emit_interface_dirs(devices_dir, d);
 }
 
+/* Alias name ("ttyACM0") for one tty entry.
+ *
+ * Returns false when the entry got no index (pool exhausted).
+ */
+static bool tty_alias_name(const usb_tty_t *t, char *buf, size_t bufsz)
+{
+    if (t->index < 0)
+        return false;
+    snprintf(buf, bufsz, "%s%d", t->is_acm ? "ttyACM" : "ttyUSB", t->index);
+    return true;
+}
+
+/* Emit the sysfs pieces pyserial's list_ports_linux.py dereferences for one
+ * alias (read against pyserial 3.5, lines 30-66):
+ *
+ *   /sys/class/tty/<name>/device -> nested interface dir (ttyACM) or the
+ *       usb-serial port dir one level below it (ttyUSB)
+ *   realpath(<device>/subsystem) basename == "usb" / "usb-serial"
+ *   dirname chain from there reaches the PR-B device dir, whose idVendor /
+ *   idProduct / serial / manufacturer / product / bNumInterfaces already
+ *   exist -- nothing is duplicated at that level.
+ *
+ * The nested interface dir <dev>/<dev>:<c>.<i> exists because pyserial takes
+ * os.path.dirname() of the interface path to find the device dir: the flat
+ * sibling layout PR-B emits for libusb would dirname into devices/ itself.
+ * Linux nests interfaces under the device the same way; the flat entries stay
+ * because libusb wants them.
+ */
+static void emit_tty_sysfs(const char *sys_dir, const usb_tty_t *t)
+{
+    char alias[32];
+    if (!tty_alias_name(t, alias, sizeof(alias)))
+        return;
+    const usb_dev_t *d = &usb_devs[t->dev];
+
+    char ifname[64];
+    snprintf(ifname, sizeof(ifname), "%s:%u.%u", d->name, d->cfg_value,
+             t->ifnum);
+
+    /* Nested interface dir inside the PR-B device dir. */
+    char ifdir[300];
+    if (snprintf(ifdir, sizeof(ifdir), "%s/bus/usb/devices/%s/%s", sys_dir,
+                 d->name, ifname) >= (int) sizeof(ifdir))
+        return;
+    if (mkdir(ifdir, 0755) < 0 && errno != EEXIST)
+        return;
+    const uint8_t *idesc = find_iface_desc(d, t->ifnum);
+    usb_write_fmt(ifdir, "bInterfaceNumber", "%02x\n", t->ifnum);
+    if (idesc) {
+        usb_write_fmt(ifdir, "bAlternateSetting", "%2d\n", idesc[3]);
+        usb_write_fmt(ifdir, "bNumEndpoints", "%02x\n", idesc[4]);
+        usb_write_fmt(ifdir, "bInterfaceClass", "%02x\n", idesc[5]);
+        usb_write_fmt(ifdir, "bInterfaceSubClass", "%02x\n", idesc[6]);
+        usb_write_fmt(ifdir, "bInterfaceProtocol", "%02x\n", idesc[7]);
+    }
+    char lnk[360];
+    if (snprintf(lnk, sizeof(lnk), "%s/subsystem", ifdir) < (int) sizeof(lnk))
+        symlink("../../../../../bus/usb", lnk);
+
+    /* ttyUSB gets the intermediate usb-serial port dir: on Linux the tty hangs
+     * off a usb-serial port device below the interface, and pyserial detects
+     * that layout by the port dir's subsystem resolving to .../bus/usb-serial
+     * before it dirnames up to the interface.
+     */
+    char devlink_target[420];
+    if (t->is_acm) {
+        snprintf(devlink_target, sizeof(devlink_target),
+                 "../../../bus/usb/devices/%s/%s", d->name, ifname);
+    } else {
+        char portdir[360];
+        if (snprintf(portdir, sizeof(portdir), "%s/%s", ifdir, alias) >=
+            (int) sizeof(portdir))
+            return;
+        if (mkdir(portdir, 0755) < 0 && errno != EEXIST)
+            return;
+        if (snprintf(lnk, sizeof(lnk), "%s/subsystem", portdir) <
+            (int) sizeof(lnk))
+            symlink("../../../../../../bus/usb-serial", lnk);
+        snprintf(devlink_target, sizeof(devlink_target),
+                 "../../../bus/usb/devices/%s/%s/%s", d->name, ifname, alias);
+    }
+
+    /* /sys/class/tty/<name>: Linux puts the class attributes (dev, uevent) here
+     * and the device symlink into the nested tree built above.
+     */
+    char classdir[300];
+    if (snprintf(classdir, sizeof(classdir), "%s/class/tty/%s", sys_dir,
+                 alias) >= (int) sizeof(classdir))
+        return;
+    if (mkdir(classdir, 0755) < 0 && errno != EEXIST)
+        return;
+    int major = t->is_acm ? TTY_ACM_MAJOR : TTY_USB_MAJOR;
+    usb_write_fmt(classdir, "dev", "%d:%d\n", major, t->index);
+    usb_write_fmt(classdir, "uevent", "MAJOR=%d\nMINOR=%d\nDEVNAME=%s\n", major,
+                  t->index, alias);
+    if (snprintf(lnk, sizeof(lnk), "%s/device", classdir) < (int) sizeof(lnk))
+        symlink(devlink_target, lnk);
+    if (snprintf(lnk, sizeof(lnk), "%s/subsystem", classdir) <
+        (int) sizeof(lnk))
+        symlink("../../../class/tty", lnk);
+}
+
+/* Strict "ttyACM<n>"/"ttyUSB<n>" name parse (Linux devtmpfs spelling: plain
+ * decimal, no leading zero).
+ *
+ * Returns the index or -1, with *acm_out set.
+ */
+static int tty_alias_parse(const char *name, bool *acm_out)
+{
+    bool acm;
+    if (strncmp(name, "ttyACM", 6) == 0)
+        acm = true;
+    else if (strncmp(name, "ttyUSB", 6) == 0)
+        acm = false;
+    else
+        return -1;
+    const char *digits = name + 6;
+    if (!*digits || (digits[0] == '0' && digits[1] != '\0'))
+        return -1;
+    long n = 0;
+    for (const char *c = digits; *c; c++) {
+        if (*c < '0' || *c > '9')
+            return -1;
+        n = n * 10 + (*c - '0');
+        if (n > 4096)
+            return -1;
+    }
+    *acm_out = acm;
+    return (int) n;
+}
+
+/* Materialize the alias placeholders in the sysroot's /dev so a plain
+ * readdir("/dev") -- the glob("/dev/ttyACM*") every Linux serial consumer
+ * starts with -- lists them. The files are empty 0644 regulars on disk (the
+ * /dev/pts placeholder trick): the absolute-path stat and open intercepts
+ * answer before the host filesystem does, so the guest sees char devices.
+ * Without a sysroot /dev is the real macOS /dev, which elfuse must not (and
+ * cannot) write to; direct opens of /dev/ttyACM<n> still work through the
+ * intercepts, only readdir misses them.
+ *
+ * The sweep removes only what a previous run of this function can have created
+ * -- empty regular alias-shaped files and by-id links pointing at ../../tty* --
+ * so a user-planted file under the same name survives.
+ */
+static void tty_alias_sync_dev(void)
+{
+    char sr[1024];
+    if (!proc_sysroot_snapshot(sr, sizeof(sr)))
+        return;
+    char devdir[1100];
+    if (snprintf(devdir, sizeof(devdir), "%s/dev", sr) >= (int) sizeof(devdir))
+        return;
+    struct stat st;
+    if (stat(devdir, &st) < 0 || !S_ISDIR(st.st_mode))
+        return;
+
+    bool have[2][USB_TTY_MAX] = {{false}};
+    for (int i = 0; i < usb_nttys; i++)
+        if (usb_ttys[i].index >= 0 && usb_ttys[i].index < USB_TTY_MAX)
+            have[usb_ttys[i].is_acm ? 1 : 0][usb_ttys[i].index] = true;
+
+    DIR *dp = opendir(devdir);
+    if (dp) {
+        struct dirent *ent;
+        while ((ent = readdir(dp))) {
+            bool acm;
+            int idx = tty_alias_parse(ent->d_name, &acm);
+            if (idx < 0)
+                continue;
+            if (idx < USB_TTY_MAX && have[acm ? 1 : 0][idx])
+                continue;
+            char path[1200];
+            if (snprintf(path, sizeof(path), "%s/%s", devdir, ent->d_name) >=
+                (int) sizeof(path))
+                continue;
+            if (lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 0)
+                unlink(path);
+        }
+        closedir(dp);
+    }
+
+    char byiddir[1160];
+    snprintf(byiddir, sizeof(byiddir), "%s/serial", devdir);
+    mkdir(byiddir, 0755);
+    snprintf(byiddir, sizeof(byiddir), "%s/serial/by-id", devdir);
+    mkdir(byiddir, 0755);
+
+    /* Sweep stale by-id links before (re)creating the live set. */
+    dp = opendir(byiddir);
+    if (dp) {
+        struct dirent *ent;
+        while ((ent = readdir(dp))) {
+            if (strncmp(ent->d_name, "usb-", 4) != 0)
+                continue;
+            bool live = false;
+            char alias[32];
+            for (int i = 0; i < usb_nttys && !live; i++)
+                if (usb_ttys[i].byid[0] &&
+                    tty_alias_name(&usb_ttys[i], alias, sizeof(alias)) &&
+                    strcmp(usb_ttys[i].byid, ent->d_name) == 0)
+                    live = true;
+            if (live)
+                continue;
+            char path[1400];
+            if (snprintf(path, sizeof(path), "%s/%s", byiddir, ent->d_name) >=
+                (int) sizeof(path))
+                continue;
+            char tgt[64];
+            ssize_t n = readlink(path, tgt, sizeof(tgt) - 1);
+            if (n > 0) {
+                tgt[n] = '\0';
+                if (strncmp(tgt, "../../tty", 9) == 0)
+                    unlink(path);
+            }
+        }
+        closedir(dp);
+    }
+
+    for (int i = 0; i < usb_nttys; i++) {
+        const usb_tty_t *t = &usb_ttys[i];
+        char alias[32];
+        if (!tty_alias_name(t, alias, sizeof(alias)))
+            continue;
+        char path[1400];
+        if (snprintf(path, sizeof(path), "%s/%s", devdir, alias) <
+            (int) sizeof(path)) {
+            int fd = open(path, O_WRONLY | O_CREAT, 0644);
+            if (fd >= 0)
+                close(fd);
+        }
+        if (!t->byid[0])
+            continue;
+        char target[64];
+        snprintf(target, sizeof(target), "../../%s", alias);
+        if (snprintf(path, sizeof(path), "%s/%s", byiddir, t->byid) >=
+            (int) sizeof(path))
+            continue;
+        char tgt[64];
+        ssize_t n = readlink(path, tgt, sizeof(tgt) - 1);
+        if (n > 0) {
+            tgt[n] = '\0';
+            if (strcmp(tgt, target) == 0)
+                continue;
+            unlink(path); /* points at a renumbered alias; recreate */
+        }
+        symlink(target, path);
+    }
+}
+
 static void usb_remove_tree(const char *dir, int depth)
 {
     if (depth > 6)
@@ -684,6 +1209,17 @@ static int ensure_usb_tree(void)
         snprintf(sub, sizeof(sub), "%s/class", usb_sys_dir);
         if (mkdir(sub, 0755) < 0)
             goto fail;
+        snprintf(sub, sizeof(sub), "%s/class/tty", usb_sys_dir);
+        if (mkdir(sub, 0755) < 0)
+            goto fail;
+
+        /* Present even with no ttyUSB device, like /sys/bus/usb-serial on a
+         * Linux system with the usb-serial core loaded; an empty-but-valid
+         * structure beats a dangling subsystem link target.
+         */
+        snprintf(sub, sizeof(sub), "%s/bus/usb-serial", usb_sys_dir);
+        if (mkdir(sub, 0755) < 0)
+            goto fail;
     }
     snprintf(devices_dir, sizeof(devices_dir), "%s/bus/usb/devices",
              usb_sys_dir);
@@ -709,6 +1245,10 @@ static int ensure_usb_tree(void)
         /* Placeholder: 0444 empty regular file; open/stat divert it. */
         usb_write_file(busdir, node, "", 0);
     }
+
+    for (int i = 0; i < usb_nttys; i++)
+        emit_tty_sysfs(usb_sys_dir, &usb_ttys[i]);
+    tty_alias_sync_dev();
 
     static bool atexit_armed;
     if (!atexit_armed) {
@@ -746,11 +1286,14 @@ void usb_sysfs_refresh(void)
 
 typedef enum {
     USB_PATH_NONE,
+    USB_PATH_DEV_ROOT,   /* /dev itself (alias materialization hook) */
     USB_PATH_DEV_BUS,    /* /dev/bus            */
     USB_PATH_DEV_USB,    /* /dev/bus/usb        */
     USB_PATH_DEV_BUSNUM, /* /dev/bus/usb/BBB    */
     USB_PATH_DEV_NODE,   /* /dev/bus/usb/BBB/DDD */
     USB_PATH_DEV_ABSENT, /* under /dev/bus but nothing we model */
+    USB_PATH_TTY,        /* /dev/ttyACM<n> or /dev/ttyUSB<n> */
+    USB_PATH_BYID,       /* /dev/serial/by-id/<leaf> */
     USB_PATH_SYS,        /* /sys[/suffix] (whole sysfs view) */
 } usb_path_kind_t;
 
@@ -788,6 +1331,39 @@ static usb_path_kind_t classify_path(const char *path,
         const char *sfx = skip_slashes(path + 4);
         *sys_suffix_out = sfx;
         return USB_PATH_SYS;
+    }
+    if (!strcmp(path, "/dev") || !strcmp(path, "/dev/"))
+        return USB_PATH_DEV_ROOT;
+    if (!strncmp(path, "/dev/tty", 8)) {
+        bool acm;
+        int idx = tty_alias_parse(path + 5, &acm);
+        if (idx < 0)
+            return USB_PATH_NONE; /* /dev/tty itself, ttyS0, ... */
+        *bus_out = acm ? 1 : 0;
+        *dev_out = idx;
+        return USB_PATH_TTY;
+    }
+    if (path_prefix_match(path, "/dev/serial", 11)) {
+        /* Only the by-id leaves are claimed: their host backing is a symlink
+         * onto the empty placeholder file, so a host-side open would hand the
+         * guest a plain file instead of the serial device. The directories
+         * themselves stay host-served (they physically exist in the sysroot
+         * once tty_alias_sync_dev ran).
+         */
+        const char *q = skip_slashes(path + 11);
+        if (strncmp(q, "by-id", 5) != 0 || q[5] != '/')
+            return USB_PATH_NONE;
+        q = skip_slashes(q + 5);
+        if (!*q || strchr(q, '/'))
+            return USB_PATH_NONE;
+
+        /* "." and ".." belong to the host-served directory itself (a Linux
+         * readdir stats them through the dir), not to any link.
+         */
+        if (!strcmp(q, ".") || !strcmp(q, ".."))
+            return USB_PATH_NONE;
+        *sys_suffix_out = q;
+        return USB_PATH_BYID;
     }
     if (!path_prefix_match(path, "/dev/bus", 8))
         return USB_PATH_NONE;
@@ -832,6 +1408,43 @@ static bool bus_exists(int busnum)
         if (usb_devs[i].busnum == busnum)
             return true;
     return false;
+}
+
+static usb_tty_t *find_tty(bool acm, int index)
+{
+    for (int i = 0; i < usb_nttys; i++)
+        if (usb_ttys[i].is_acm == acm && usb_ttys[i].index == index)
+            return &usb_ttys[i];
+    return NULL;
+}
+
+static usb_tty_t *find_tty_byid(const char *leaf)
+{
+    for (int i = 0; i < usb_nttys; i++)
+        if (usb_ttys[i].byid[0] && strcmp(usb_ttys[i].byid, leaf) == 0)
+            return &usb_ttys[i];
+    return NULL;
+}
+
+/* Open the macOS callout node behind one alias. Character-device open: keep the
+ * access mode and the descriptor flags, drop creation/truncation semantics (the
+ * procemu.c /dev/null pattern -- O_CREAT without a mode arg would be a variadic
+ * bug on the host open). Linux O_NOCTTY needs no macOS translation: a cu.*
+ * callout open never becomes a controlling terminal and never blocks waiting
+ * for carrier (that is the tty.* dial-in side), so a blocking guest open cannot
+ * hang here either.
+ */
+static int tty_alias_host_open(const usb_tty_t *t, int linux_flags)
+{
+    char host[128];
+    if (snprintf(host, sizeof(host), "/dev/%s", t->cu_name) >=
+        (int) sizeof(host)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int oflags = translate_open_flags(linux_flags);
+    return open(host,
+                (oflags & O_ACCMODE) | (oflags & (O_NONBLOCK | O_CLOEXEC)));
 }
 
 /* Reject '..' components so a joined host path cannot escape the scratch dir
@@ -909,6 +1522,27 @@ static void fill_synth_chardev(struct stat *st,
     st->st_size = (off_t) d->blob_len;
 }
 
+/* Alias char-dev stat: Linux major 166 (cdc-acm) or 188 (usb-serial), minor is
+ * the sticky index. 0664 for the same single-user-guest reason as the usbfs
+ * nodes above.
+ */
+static void fill_synth_tty_stat(struct stat *st,
+                                const char *path,
+                                const usb_tty_t *t)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode = S_IFCHR | 0664;
+    st->st_nlink = 1;
+    st->st_dev = USB_SYNTH_DEV;
+    st->st_ino = usb_synth_ino(path);
+    st->st_uid = getuid();
+    st->st_gid = getgid();
+    /* macOS dev_t encoding (major<<24 | minor); translate_stat converts. */
+    st->st_rdev = ((dev_t) (t->is_acm ? TTY_ACM_MAJOR : TTY_USB_MAJOR) << 24) |
+                  (dev_t) t->index;
+    st->st_blksize = 4096;
+}
+
 /* Synthetic descriptor-blob fd (the proc_synthetic_fd pattern): unlinked temp
  * file so lseek/pread work.
  */
@@ -948,6 +1582,18 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
     if (kind == USB_PATH_NONE)
         return PROC_NOT_INTERCEPTED;
 
+    /* Opening /dev itself stays a host open of the sysroot's dev directory, but
+     * it is also the moment the ttyACM/ttyUSB placeholders must exist: every
+     * Linux serial consumer starts with a readdir of /dev, so build the tree
+     * (which materializes them) before falling through.
+     */
+    if (kind == USB_PATH_DEV_ROOT) {
+        pthread_mutex_lock(&usb_lock);
+        (void) ensure_usb_tree(); /* best effort; readdir just misses them */
+        pthread_mutex_unlock(&usb_lock);
+        return PROC_NOT_INTERCEPTED;
+    }
+
     pthread_mutex_lock(&usb_lock);
     int rc = -1;
     int err = 0;
@@ -957,6 +1603,34 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
     }
 
     switch (kind) {
+    case USB_PATH_TTY:
+    case USB_PATH_BYID: {
+        usb_tty_t *t =
+            kind == USB_PATH_TTY ? find_tty(bus != 0, dev) : find_tty_byid(sfx);
+        if (!t) {
+            err = ENOENT;
+            goto out;
+        }
+        if (linux_flags & LINUX_O_DIRECTORY) {
+            err = ENOTDIR;
+            goto out;
+        }
+        if (linux_flags & LINUX_O_PATH) {
+            /* Path-only fd: harmless backing fd, the /dev/ptmx O_PATH pattern.
+             * FD_PATH gates I/O and the stamped guest path routes fstat through
+             * the synthetic char-dev stat.
+             */
+            int oflags = O_RDONLY;
+            if (linux_flags & LINUX_O_CLOEXEC)
+                oflags |= O_CLOEXEC;
+            rc = open("/dev/null", oflags);
+        } else {
+            rc = tty_alias_host_open(t, linux_flags);
+        }
+        if (rc < 0)
+            err = errno;
+        goto out;
+    }
     case USB_PATH_SYS: {
         /* Read-only tree, syscpu contract: reject mutating opens. */
         int accmode = translate_open_flags(linux_flags) & O_ACCMODE;
@@ -1044,6 +1718,7 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
     case USB_PATH_DEV_ABSENT:
         err = ENOENT;
         goto out;
+    case USB_PATH_DEV_ROOT: /* handled before the lock */
     case USB_PATH_NONE:
         break;
     }
@@ -1060,7 +1735,7 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st)
     int bus = 0, dev = 0;
     const char *sfx = NULL;
     usb_path_kind_t kind = classify_path(path, &bus, &dev, &sfx);
-    if (kind == USB_PATH_NONE)
+    if (kind == USB_PATH_NONE || kind == USB_PATH_DEV_ROOT)
         return PROC_NOT_INTERCEPTED;
 
     pthread_mutex_lock(&usb_lock);
@@ -1072,6 +1747,35 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st)
     }
 
     switch (kind) {
+    case USB_PATH_TTY: {
+        usb_tty_t *t = find_tty(bus != 0, dev);
+        if (!t) {
+            err = ENOENT;
+            goto out;
+        }
+        fill_synth_tty_stat(st, path, t);
+        rc = 0;
+        goto out;
+    }
+    case USB_PATH_BYID: {
+        /* Reported as S_IFLNK for follow and no-follow alike, the same
+         * one-shape contract as the sysfs subsystem links above: the by-id
+         * consumers (udev-style scripts, esptool's islink probe) lstat and
+         * readlink these, they do not stat-follow them.
+         */
+        usb_tty_t *t = find_tty_byid(sfx);
+        if (!t) {
+            err = ENOENT;
+            goto out;
+        }
+        char alias[32];
+        fill_synth_file(st, path);
+        st->st_mode = S_IFLNK | 0777;
+        if (tty_alias_name(t, alias, sizeof(alias)))
+            st->st_size = (off_t) (strlen(alias) + 6); /* "../../" */
+        rc = 0;
+        goto out;
+    }
     case USB_PATH_SYS: {
         if (!usb_suffix_safe(sfx)) {
             err = EACCES;
@@ -1136,6 +1840,7 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st)
     case USB_PATH_DEV_ABSENT:
         err = ENOENT;
         goto out;
+    case USB_PATH_DEV_ROOT: /* answered before the lock */
     case USB_PATH_NONE:
         break;
     }
@@ -1152,8 +1857,44 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     int bus = 0, dev = 0;
     const char *sfx = NULL;
     usb_path_kind_t kind = classify_path(path, &bus, &dev, &sfx);
-    if (kind == USB_PATH_NONE)
+    if (kind == USB_PATH_NONE || kind == USB_PATH_DEV_ROOT)
         return PROC_NOT_INTERCEPTED;
+
+    if (kind == USB_PATH_BYID) {
+        /* Answer the link content directly instead of trusting the sysroot
+         * backing link: the two agree when tty_alias_sync_dev ran, and a
+         * sysroot-less run (macOS /dev is not writable) has no backing at all
+         * yet must still resolve the Linux-shaped name.
+         */
+        pthread_mutex_lock(&usb_lock);
+        int rc = -1;
+        int err = 0;
+        char target[64];
+        if (ensure_usb_tree() < 0) {
+            err = errno;
+        } else {
+            usb_tty_t *t = find_tty_byid(sfx);
+            char alias[32];
+            if (!t) {
+                err = ENOENT;
+            } else if (!tty_alias_name(t, alias, sizeof(alias))) {
+                err = ENOENT;
+            } else {
+                int n = snprintf(target, sizeof(target), "../../%s", alias);
+                if (n < 0 || (size_t) n >= sizeof(target)) {
+                    err = ENAMETOOLONG;
+                } else {
+                    size_t copy = (size_t) n < bufsiz ? (size_t) n : bufsiz;
+                    memcpy(buf, target, copy);
+                    rc = (int) copy;
+                }
+            }
+        }
+        pthread_mutex_unlock(&usb_lock);
+        if (rc < 0)
+            errno = err ? err : EIO;
+        return rc;
+    }
 
     if (kind == USB_PATH_SYS) {
         /* The scratch tree holds real symlinks for `subsystem` entries;
@@ -1194,7 +1935,9 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
         return PROC_NOT_INTERCEPTED;
     if (rc < 0)
         return -1; /* errno already set (ENOENT etc.) */
-    /* The /dev/bus tree holds real dirs and device nodes, never symlinks. */
+    /* The /dev/bus tree and the tty aliases hold dirs and device nodes, never
+     * symlinks; Linux answers EINVAL for readlink on those.
+     */
     errno = EINVAL;
     return -1;
 }
@@ -1258,4 +2001,12 @@ int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st)
     }
     pthread_mutex_unlock(&usb_lock);
     return rc;
+}
+
+bool usb_tty_alias_path(const char *path)
+{
+    if (strncmp(path, "/dev/tty", 8) != 0)
+        return false;
+    bool acm;
+    return tty_alias_parse(path + 5, &acm) >= 0;
 }

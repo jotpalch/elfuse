@@ -339,6 +339,61 @@ static int64_t io_check_access(int host_fd, short events)
     return 0;
 }
 
+/* Interruptible output drain, mirroring tty_wait_until_sent(): the Linux kernel
+ * waits for pending output before TCSBRK, TCSBRKP and TIOCSBRK, and a pending
+ * signal aborts the wait with a plain -EINTR that reaches the guest without a
+ * restart (tty_io.c "Factor out some common prep work" block). macOS tcdrain()
+ * would park the vCPU thread beyond the reach of guest signals -- a serial port
+ * stalled by flow control would hang the guest unkillably -- so poll TIOCOUTQ
+ * in short slices with the same interruption checks as
+ * io_wait_fd_or_interrupted(). Fds without an output-queue count (macOS returns
+ * ENOTTY for non-ttys; ptys do implement TIOCOUTQ) fall back to a single
+ * tcdrain(), which returns immediately for those.
+ */
+static int64_t tty_drain_interruptible(int host_fd)
+{
+    int wake_fd = wakeup_pipe_read_fd();
+    struct pollfd fds[1] = {
+        {.fd = wake_fd, .events = POLLIN},
+    };
+
+    for (;;) {
+        int outq = 0;
+        if (ioctl(host_fd, TIOCOUTQ, &outq) < 0)
+            return tcdrain(host_fd) < 0 ? linux_errno() : 0;
+        if (outq == 0)
+            return 0;
+
+        signal_check_timer_real();
+        bool leader_only = thread_stop_is_leader_work_only();
+        bool interrupted = (!leader_only && thread_stop_requested()) ||
+                           (!leader_only && futex_interrupt_consume()) ||
+                           signal_pending_interruption(NULL);
+        if (!interrupted) {
+            int ret = poll(fds, 1, leader_only ? 0 : 20);
+            if (ret < 0 && errno != EINTR)
+                return linux_errno();
+
+            /* Consume the wakeup byte like io_wait_fd_or_interrupted() does:
+             * the interruption conditions it announces are re-checked at the
+             * top of every iteration, and a byte left in the pipe would turn
+             * each subsequent poll into an immediate return and this loop into
+             * a busy spin for as long as output stays queued.
+             */
+            if (ret > 0 && wake_fd >= 0 && (fds[0].revents & POLLIN))
+                wakeup_pipe_drain();
+            interrupted = leader_only;
+        }
+        if (interrupted) {
+            /* Linux returns a plain -EINTR here (not ERESTARTSYS), and part of
+             * the interval has already drained: no restart.
+             */
+            syscall_restart_forbid();
+            return -LINUX_EINTR;
+        }
+    }
+}
+
 void urandom_fd_reset_cache(int guest_fd)
 {
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
@@ -2561,6 +2616,186 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         }
         host_fd_ref_close(&host_ref);
         return 0;
+    }
+
+    case LINUX_TCSBRK: {
+        /* Linux overloads TCSBRK: its kernel always waits for pending output
+         * first, then sends a break only for arg 0; a nonzero arg is how glibc
+         * and musl implement tcdrain(3) (they issue TCSBRK with 1). macOS has
+         * no ioctl form of either, so route to the POSIX wrappers in that
+         * order.
+         */
+        int64_t rc = tty_drain_interruptible(host_fd);
+        if (rc == 0 && arg == 0 && tcsendbreak(host_fd, 0) < 0)
+            rc = linux_errno();
+        host_fd_ref_close(&host_ref);
+        return rc;
+    }
+
+    case LINUX_TCSBRKP: {
+        /* POSIX form of tcsendbreak: arg is the duration in deciseconds (0
+         * means 250 ms). The Linux kernel drains pending output before both
+         * TCSBRK and TCSBRKP; macOS tcsendbreak() does not, and ignores the
+         * duration (fixed ~0.4 s), which is close enough for a break.
+         */
+        int64_t rc = tty_drain_interruptible(host_fd);
+        if (rc == 0 && tcsendbreak(host_fd, (int) arg) < 0)
+            rc = linux_errno();
+        host_fd_ref_close(&host_ref);
+        return rc;
+    }
+
+    case LINUX_TIOCSBRK:
+    case LINUX_TIOCCBRK: {
+        /* BSD-style break on/off (pyserial's break_condition). Same request
+         * semantics on macOS; a pty answers ENOTTY on both systems. The Linux
+         * kernel drains pending output before TIOCSBRK (but not TIOCCBRK), same
+         * as TCSBRK.
+         */
+        int64_t rc = 0;
+        if (request == LINUX_TIOCSBRK)
+            rc = tty_drain_interruptible(host_fd);
+        if (rc == 0 &&
+            ioctl(host_fd, request == LINUX_TIOCSBRK ? TIOCSBRK : TIOCCBRK) < 0)
+            rc = linux_errno();
+        host_fd_ref_close(&host_ref);
+        return rc;
+    }
+
+    case LINUX_TCFLSH: {
+        /* tcflush(3): arg is the queue selector. Linux numbers TCIFLUSH,
+         * TCOFLUSH, TCIOFLUSH 0..2 (asm-generic/termbits-common.h); macOS
+         * numbers them 1..3 (sys/termios.h), hence the explicit map.
+         */
+        int queue;
+        switch (arg) {
+        case 0:
+            queue = TCIFLUSH;
+            break;
+        case 1:
+            queue = TCOFLUSH;
+            break;
+        case 2:
+            queue = TCIOFLUSH;
+            break;
+        default:
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EINVAL;
+        }
+        int rc = tcflush(host_fd, queue);
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
+    }
+
+    case LINUX_TCXONC: {
+        /* tcflow(3): arg is the action. Linux numbers TCOOFF, TCOON, TCIOFF,
+         * TCION 0..3 (asm-generic/termbits-common.h); macOS numbers them 1..4
+         * (sys/termios.h), hence the explicit map.
+         */
+        int action;
+        switch (arg) {
+        case 0:
+            action = TCOOFF;
+            break;
+        case 1:
+            action = TCOON;
+            break;
+        case 2:
+            action = TCIOFF;
+            break;
+        case 3:
+            action = TCION;
+            break;
+        default:
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EINVAL;
+        }
+        int rc = tcflow(host_fd, action);
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
+    }
+
+    case LINUX_TIOCOUTQ: {
+        /* Bytes still queued for output; pyserial's out_waiting and the esptool
+         * reset sequence poll this.
+         */
+        int pending = 0;
+        if (ioctl(host_fd, TIOCOUTQ, &pending) < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        int32_t val = (int32_t) pending;
+        if (guest_write_small(g, arg, &val, sizeof(val)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+
+    case LINUX_TIOCEXCL:
+    case LINUX_TIOCNXCL: {
+        /* Exclusive-use flag on the tty; no argument. */
+        int rc =
+            ioctl(host_fd, request == LINUX_TIOCEXCL ? TIOCEXCL : TIOCNXCL);
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
+    }
+
+    case LINUX_TIOCMGET: {
+        /* Modem control lines. TIOCM_* bit values are identical on Linux and
+         * macOS (see linux-wire.h), so the int needs no translation. Only real
+         * serial drivers implement these on Darwin; a pty answers ENOTTY.
+         */
+        int bits = 0;
+        if (ioctl(host_fd, TIOCMGET, &bits) < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        int32_t val = (int32_t) bits;
+        if (guest_write_small(g, arg, &val, sizeof(val)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+
+    case LINUX_TIOCMSET:
+    case LINUX_TIOCMBIS:
+    case LINUX_TIOCMBIC: {
+        /* The Linux kernel masks the set/clear words to the output lines
+         * (DTR|RTS|OUT1|OUT2|LOOP, tty_io.c tty_tiocmset) before they reach
+         * the driver, so read-only status bits (CTS/DSR/CAR/RNG) in the guest's
+         * word are silently dropped. Darwin has no OUT1/OUT2/LOOP, so the
+         * settable intersection is DTR|RTS. TIOCMSET on Linux means "set = val
+         * & mask, clear = ~val & mask" -- bits outside the mask are left alone
+         * -- whereas Darwin's TIOCMSET overwrites the whole word, so emulate
+         * the Linux semantics with a TIOCMBIS/TIOCMBIC pair. The first host
+         * call is issued even when its masked word is empty so a fd whose
+         * driver lacks modem control still reports ENOTTY, as Linux does before
+         * looking at the value.
+         */
+        int32_t val = 0;
+        if (guest_read_small(g, arg, &val, sizeof(val)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        const int settable = TIOCM_DTR | TIOCM_RTS;
+        int rc;
+        if (request == LINUX_TIOCMSET) {
+            int bis = (int) val & settable;
+            int bic = ~(int) val & settable;
+            rc = ioctl(host_fd, TIOCMBIS, &bis);
+            if (rc == 0 && bic != 0)
+                rc = ioctl(host_fd, TIOCMBIC, &bic);
+        } else {
+            int bits = (int) val & settable;
+            rc = ioctl(host_fd, request == LINUX_TIOCMBIS ? TIOCMBIS : TIOCMBIC,
+                       &bits);
+        }
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
     }
 
     case LINUX_TIOCGPGRP: {

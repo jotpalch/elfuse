@@ -101,6 +101,86 @@ static inline void host_fd_refs_close(host_fd_ref_t *refs, uint32_t n)
         host_fd_ref_close(&refs[i]);
 }
 
+/* A guest's events reach the host untranslated, and the two spellings of a
+ * writable descriptor do not share a value: Linux POLLWRNORM is 0x100, which
+ * macOS spells POLLWRBAND, while macOS POLLWRNORM is POLLOUT itself. Testing
+ * the pair answers a guest that asks with either. Linux's default mask stops
+ * there, so Linux POLLWRBAND (0x200) is deliberately absent.
+ */
+#define POLL_WRITE_EVENTS (POLLOUT | POLLWRBAND)
+
+/* Evaluate the entries host poll() refused. macOS poll() answers POLLNVAL for
+ * any descriptor it will not put on a kqueue: /dev/null, /dev/zero,
+ * /dev/random, /dev/urandom, directories, and kqueue descriptors themselves.
+ * Linux polls all of them, the character devices and directories through the
+ * default always-ready mask and an epoll descriptor through its own readiness.
+ * macOS select() accepts every one of them, so the caller drops them from the
+ * poll() set and routes them here.
+ *
+ * A host descriptor at or above FD_SETSIZE has no bit in an fd_set and reports
+ * the requested events ready, which matches Linux for everything except an
+ * epoll descriptor with nothing pending.
+ *
+ * Returns how many entries are ready.
+ */
+static uint32_t poll_eval_unpollable(const struct pollfd *host_fds,
+                                     const host_fd_ref_t *refs,
+                                     const bool *unpollable,
+                                     short *revents,
+                                     uint32_t nfds)
+{
+    fd_set read_set, write_set, except_set;
+    FD_ZERO(&read_set);
+    FD_ZERO(&write_set);
+    FD_ZERO(&except_set);
+
+    int max_fd = -1;
+    for (uint32_t i = 0; i < nfds; i++) {
+        revents[i] = 0;
+        if (!unpollable[i] || !RANGE_CHECK(refs[i].fd, 0, FD_SETSIZE))
+            continue;
+        int fd = refs[i].fd;
+        short events = host_fds[i].events;
+        if (events & (POLLIN | POLLRDNORM))
+            FD_SET(fd, &read_set);
+        if (events & POLL_WRITE_EVENTS)
+            FD_SET(fd, &write_set);
+        if (events & POLLPRI)
+            FD_SET(fd, &except_set);
+        if (fd > max_fd)
+            max_fd = fd;
+    }
+
+    struct timeval zero = {0, 0};
+    bool selected = max_fd < 0 || select(max_fd + 1, &read_set, &write_set,
+                                         &except_set, &zero) >= 0;
+
+    uint32_t ready = 0;
+    for (uint32_t i = 0; i < nfds; i++) {
+        if (!unpollable[i])
+            continue;
+        int fd = refs[i].fd;
+        short events = host_fds[i].events;
+        short got = 0;
+        if (!RANGE_CHECK(fd, 0, FD_SETSIZE)) {
+            got = (short) (events & (POLLIN | POLLRDNORM | POLL_WRITE_EVENTS));
+        } else if (selected) {
+            int mask = 0;
+            if (FD_ISSET(fd, &read_set))
+                mask |= events & (POLLIN | POLLRDNORM);
+            if (FD_ISSET(fd, &write_set))
+                mask |= events & POLL_WRITE_EVENTS;
+            if (FD_ISSET(fd, &except_set))
+                mask |= POLLPRI;
+            got = (short) mask;
+        }
+        revents[i] = got;
+        if (got)
+            ready++;
+    }
+    return ready;
+}
+
 int64_t sys_ppoll(guest_t *g,
                   uint64_t fds_gva,
                   uint32_t nfds,
@@ -136,6 +216,14 @@ int64_t sys_ppoll(guest_t *g,
      */
     uint64_t guest_gen[256] = {0};
     uint32_t invalid_count = 0;
+
+    /* Entries host poll() refuses with POLLNVAL even though their reference
+     * resolved. See poll_eval_unpollable().
+     */
+    bool unpollable[256] = {false};
+    short unpollable_revents[256] = {0};
+    uint32_t unpollable_count = 0;
+    bool unpollable_checked = false;
     for (uint32_t i = 0; i < nfds; i++) {
         host_refs[i] = (host_fd_ref_t) {.fd = -1, .owned = false};
         int guest_fd = guest_fds[i].fd;
@@ -274,10 +362,34 @@ int64_t sys_ppoll(guest_t *g,
     bool usb_disarmed[256] = {false};
 
     int ret;
+    uint32_t unpollable_ready = 0;
 ppoll_retry:
     do {
-        int slice = poll_timeout_ms == 0 ? 0 : poll_slice_ms(deadline_ms);
+        if (unpollable_count > 0)
+            unpollable_ready = poll_eval_unpollable(
+                host_fds, host_refs, unpollable, unpollable_revents, nfds);
+
+        int slice = (poll_timeout_ms == 0 || unpollable_ready > 0)
+                        ? 0
+                        : poll_slice_ms(deadline_ms);
         ret = poll(host_fds, nfds + added_wakeup, slice);
+
+        /* Take the descriptors macOS refuses out of the set once and evaluate
+         * them through select() from here on. A refused entry makes poll()
+         * return at once, so this costs no wait.
+         */
+        if (ret > 0 && !unpollable_checked) {
+            unpollable_checked = true;
+            for (uint32_t i = 0; i < nfds; i++) {
+                if (need_pollnval[i] || !(host_fds[i].revents & POLLNVAL))
+                    continue;
+                unpollable[i] = true;
+                host_fds[i].fd = -1;
+                unpollable_count++;
+            }
+            if (unpollable_count > 0)
+                goto ppoll_retry;
+        }
 
         /* Check for process/thread interrupts after waking. */
         if (thread_stop_requested() || futex_interrupt_consume() ||
@@ -309,7 +421,7 @@ ppoll_retry:
             if (break_pending)
                 break;
         }
-    } while (ret == 0 && poll_timeout_ms != 0 &&
+    } while (ret == 0 && unpollable_ready == 0 && poll_timeout_ms != 0 &&
              (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0));
 
     /* POSIX poll() ignores entries with fd < 0 and resets revents to 0, so
@@ -321,6 +433,13 @@ ppoll_retry:
             if (need_pollnval[i])
                 host_fds[i].revents = POLLNVAL;
         ret += (int) invalid_count;
+    }
+
+    if (ret >= 0 && unpollable_count > 0) {
+        for (uint32_t i = 0; i < nfds; i++)
+            if (unpollable[i])
+                host_fds[i].revents = unpollable_revents[i];
+        ret += (int) unpollable_ready;
     }
 
     /* A pty master whose guest-side slaves have all closed is hung up, but the

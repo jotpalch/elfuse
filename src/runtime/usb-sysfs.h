@@ -71,3 +71,11 @@ int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st);
  * from a fresh IOKit enumeration. Hook point for hotplug (uevent) later.
  */
 void usb_sysfs_refresh(void);
+
+/* True when `path` is a Linux serial alias node this layer owns, i.e. exactly
+ * "/dev/ttyACM<n>" or "/dev/ttyUSB<n>". Pure string check (no lock, no device
+ * lookup): sys_fstat uses it to route an alias fd's stat through
+ * proc_intercept_stat instead of leaking the macOS cu.* identity of the host fd
+ * behind it.
+ */
+bool usb_tty_alias_path(const char *path);

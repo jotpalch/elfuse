@@ -13,6 +13,7 @@
 #include "debug/log.h"
 
 #include "runtime/procemu.h"
+#include "runtime/usb-sysfs.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
@@ -242,11 +243,17 @@ static int64_t stat_at_path(guest_t *g,
                 rc = -LINUX_EBADF;
                 goto done;
             }
-            if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
+
+            /* Same routing as sys_fstat: FD_PATH identity comes from the stamp,
+             * and a serial alias fd must report its Linux char-dev numbers
+             * rather than the macOS cu.* node behind it.
+             */
+            if (snap.proc_path[0] != '\0' &&
+                (snap.type == FD_PATH || usb_tty_alias_path(snap.proc_path))) {
                 int intercepted = proc_intercept_stat(snap.proc_path, mac_st);
                 if (intercepted == 0)
                     goto done;
-                if (intercepted == -1) {
+                if (intercepted == -1 && snap.type == FD_PATH) {
                     rc = linux_errno();
                     goto done;
                 }
@@ -304,15 +311,27 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
 
     fd_entry_t snap;
     bool have_snap = fd_snapshot(fd, &snap);
-    if (have_snap && snap.type == FD_PATH && snap.proc_path[0] != '\0') {
+
+    /* FD_PATH fds carry their guest identity in the stamped path. A serial
+     * alias fd (/dev/ttyACM<n>, /dev/ttyUSB<n>) is an ordinary host fd on the
+     * macOS cu.* callout node, but its fstat must show the Linux char-dev
+     * identity (166/188:<n>) the path stat shows, not the host tty's.
+     */
+    if (have_snap && snap.proc_path[0] != '\0' &&
+        (snap.type == FD_PATH || usb_tty_alias_path(snap.proc_path))) {
         int intercepted = proc_intercept_stat(snap.proc_path, &mac_st);
         if (intercepted == 0) {
             if (write_linux_stat(g, stat_gva, &mac_st) < 0)
                 return -LINUX_EFAULT;
             return 0;
         }
-        if (intercepted == -1)
+        if (intercepted == -1 && snap.type == FD_PATH)
             return linux_errno();
+
+        /* An alias fd whose device vanished mid-run: Linux fstat still answers
+         * on an open fd, so fall through to the host fstat rather than
+         * inventing an ENOENT.
+         */
     }
 
     /* usbdevfs fds are char device 189:minor; the host fd behind them is a

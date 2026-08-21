@@ -103,6 +103,16 @@ bool path_might_use_stat_intercept(const char *path)
     if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
         return true;
 
+    /* Serial alias nodes: the sysroot backing is an empty placeholder file (or
+     * absent without a sysroot), so stat must come from the intercept to show
+     * the Linux char-device identity. Loose prefixes are fine: a non-alias
+     * spelling falls back to the host below the intercept.
+     */
+    if (!strncmp(path, "/dev/ttyACM", 11) || !strncmp(path, "/dev/ttyUSB", 11))
+        return true;
+    if (path_prefix_match(path, "/dev/serial", 11))
+        return true;
+
     return false;
 }
 
