@@ -50,6 +50,7 @@
 #include "syscall/net.h"
 #include "syscall/net-identity.h"
 #include "syscall/net-sockopt.h"
+#include "syscall/usbdev.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
@@ -1149,6 +1150,12 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (type == FD_NETLINK)
         return netlink_send(fd, g, buf_gva, count);
 
+    /* usbdevfs has no write op; vfs_write answers -EINVAL for such files.
+     * Falling through would scribble on the readiness pipe's read end.
+     */
+    if (type == FD_USBDEV)
+        return -LINUX_EINVAL;
+
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
     if (err < 0)
@@ -1229,6 +1236,8 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return netlink_read(fd, g, buf_gva, count);
     case FD_URANDOM:
         return urandom_read(g, fd, buf_gva, count);
+    case FD_USBDEV:
+        return usbdev_read(fd, g, buf_gva, count);
     }
 
     /* Pin the generation in the same fd_lock window as the host fd. The pty
@@ -1303,6 +1312,12 @@ int64_t sys_pread64(guest_t *g,
 {
     if (fuse_is_file_fd(fd))
         return fuse_pread_fd(g, fd, buf_gva, count, offset);
+
+    /* usbdevfs serves its descriptors blob positionally too: every read path on
+     * the fd must agree, and the host fd behind it is a readiness pipe.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_pread(fd, g, buf_gva, count, offset);
 
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
@@ -1551,6 +1566,61 @@ static int64_t vec_zero_iovcnt(int fd, bool op_is_write, bool positional)
     return ret;
 }
 
+
+/* readv()/preadv() on an FD_USBDEV fd. Linux's usbdev file has only a plain
+ * read op, so vectored reads take do_loop_readv_writev: one read per iovec
+ * entry, stopping at the first short transfer. positional keeps the fd position
+ * untouched and reads at offset plus the bytes already copied; otherwise each
+ * usbdev_read advances the fd position like read(2).
+ */
+static int64_t usbdev_vec_read(guest_t *g,
+                               int fd,
+                               uint64_t iov_gva,
+                               int iovcnt,
+                               int64_t offset,
+                               bool positional)
+{
+    if (positional && offset < 0)
+        return -LINUX_EINVAL; /* do_preadv: before the fd lookup */
+    if (!iov_count_ok(iovcnt))
+        return -LINUX_EINVAL;
+
+    linux_iovec_t stack_giov[SYSCALL_IOV_STACK_MAX];
+    linux_iovec_t *giov = stack_giov;
+    linux_iovec_t *heap_giov = NULL;
+    if (iovcnt > SYSCALL_IOV_STACK_MAX) {
+        heap_giov = malloc((size_t) iovcnt * sizeof(*giov));
+        if (!heap_giov)
+            return -LINUX_ENOMEM;
+        giov = heap_giov;
+    }
+    int64_t ret = validate_iov_total(g, iov_gva, iovcnt, giov);
+    if (ret == 0) {
+        for (int i = 0; i < iovcnt; i++) {
+            if (giov[i].iov_len == 0)
+                continue;
+            int64_t got =
+                positional
+                    ? usbdev_pread(fd, g, giov[i].iov_base, giov[i].iov_len,
+                                   offset + ret)
+                    : usbdev_read(fd, g, giov[i].iov_base, giov[i].iov_len);
+            if (got < 0) {
+                ret = ret > 0 ? ret : got;
+                break;
+            }
+            ret += got;
+
+            /* A short entry ends the transfer; POSIX forbids packing the tail
+             * of entry i into entry i+1.
+             */
+            if ((uint64_t) got < giov[i].iov_len)
+                break;
+        }
+    }
+    free(heap_giov);
+    return ret;
+}
+
 int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
     if (iovcnt == 0)
@@ -1648,6 +1718,8 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             return -LINUX_EFAULT;
         return sys_read(g, fd, giov.iov_base, giov.iov_len);
     }
+    if (type == FD_USBDEV)
+        return usbdev_vec_read(g, fd, iov_gva, iovcnt, 0, false);
 
     host_fd_ref_t host_ref;
     uint64_t readv_gen;
@@ -1804,6 +1876,8 @@ int64_t sys_preadv(guest_t *g,
             return err;
         return sys_pread64(g, fd, giov.iov_base, giov.iov_len, offset);
     }
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_vec_read(g, fd, iov_gva, iovcnt, offset, true);
 
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
@@ -2196,6 +2270,13 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         pthread_mutex_unlock(&fd_lock);
         return 0;
     }
+
+    /* usbdevfs fds answer their own ioctl set; the host fd behind them is a
+     * readiness pipe, so nothing below applies. usbdev_ioctl re-snapshots the
+     * fd and pins the side-table entry by generation itself.
+     */
+    if (fd_get_type(fd) == FD_USBDEV)
+        return usbdev_ioctl(g, fd, request, arg);
 
     if (request == LINUX_SIOCGIFHWADDR) {
         fd_entry_t snap;

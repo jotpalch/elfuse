@@ -65,6 +65,7 @@
 #include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 #include "syscall/sys.h"
+#include "syscall/usbdev.h"
 #include "syscall/sysvipc.h"
 #include "proved/timespec.h"
 
@@ -114,6 +115,7 @@ void syscall_init(void)
     inotify_init();
     netlink_init();
     fuse_init();
+    usbdev_init();
     pidfd_init();
     io_init();
     fd_register_cleanup(FD_URANDOM, urandom_fd_cleanup);
