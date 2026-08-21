@@ -408,6 +408,15 @@ Example:
 bash tests/driver.sh -f test-proc
 ```
 
+USB-layer coverage is split by what it needs. `test-uevent-socket` needs no
+hardware and runs in the matrix like any other unit test. The guest probes
+that exercise the usbdevfs surface against a real device (descriptor reads,
+claim/transfer, async URBs) live out of tree today, because IOKit offers no
+loopback device to fake one in CI. A hardware-dependent check that does move
+in must be gated on an environment variable naming the device and must skip
+with a stated reason when it is absent -- a skip is not a pass, and the
+skip lists above are the model: deliberate, explained, and checked.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

@@ -75,6 +75,7 @@ typedef struct {
 #define LINUX_ECHILD 10
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_EOVERFLOW 75
+#define LINUX_EREMOTEIO 121 /* Remote I/O error (usbfs URB_SHORT_NOT_OK) */
 #define LINUX_ECONNREFUSED 111
 #define LINUX_ECONNRESET 104
 #define LINUX_ECONNABORTED 103

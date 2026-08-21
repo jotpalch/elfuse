@@ -250,6 +250,32 @@ Practical notes:
   time; `elfuse` creates a case-sensitive APFS sparsebundle, mounts it
   at `PATH`, and uses it as the sysroot for this run.
 
+## USB Devices
+
+Linux USB tools see the Mac's attached devices. `/dev/bus/usb` and
+`/sys/bus/usb/devices` are synthesized from the IOKit registry, and opening
+a device node yields a usbfs-compatible fd driven over IOKit (see
+[internals.md](internals.md), section "USB Device Passthrough").
+
+What works unprivileged is what macOS itself leaves unclaimed: vendor-class
+and bulk interfaces, which is the debug-probe and DFU population. `lsusb`,
+libusb programs, and nusb-based tools such as the probe-rs family
+enumerate, claim, and transfer against those directly, including async
+URBs.
+
+What does not: an interface bound to an Apple class driver (CDC serial,
+HID, FTDI, mass storage) cannot be claimed, and `CLAIMINTERFACE` reports
+`EBUSY` -- exactly what Linux reports for an interface a kernel driver
+holds. For a CDC serial device, open the host's `/dev/cu.*` node from the
+guest instead; the termios layer drives the real line.
+
+Worked example, running a real `lsusb` from a Debian-style sysroot that
+carries usbutils:
+
+```sh
+build/elfuse --sysroot ./debian-sysroot /usr/bin/lsusb -v
+```
+
 ## Debugging With GDB Or LLDB
 
 `elfuse` includes a built-in GDB Remote Serial Protocol stub.
