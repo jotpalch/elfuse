@@ -48,6 +48,14 @@ static void *restart_read_sender(void *arg)
     return NULL;
 }
 
+static int ppoll_past_eintr(struct pollfd *fds, nfds_t n, struct timespec *ts)
+{
+    int r = ppoll(fds, n, ts, NULL);
+    if (r < 0 && errno == EINTR)
+        r = ppoll(fds, n, ts, NULL);
+    return r;
+}
+
 static int fork_exit_after_us(useconds_t usec)
 {
     int pid = fork();
@@ -402,6 +410,152 @@ int main(void)
                      */
         else
             FAIL("setpgid unexpected result");
+    }
+
+    /* ppoll on descriptors macOS poll() refuses. Linux polls character devices
+     * and directories through the default always-ready mask, and an epoll
+     * descriptor through its own readiness.
+     */
+    TEST("ppoll always-ready devices");
+    {
+        static const char *const paths[] = {"/dev/null", "/dev/zero",
+                                            "/dev/urandom", "/"};
+        struct pollfd pfd[4];
+        int opened = 0;
+        for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            int fd = open(paths[i], O_RDONLY);
+            if (fd < 0)
+                continue;
+            pfd[opened].fd = fd;
+            pfd[opened].events = POLLIN | POLLOUT;
+            pfd[opened].revents = 0;
+            opened++;
+        }
+        struct timespec ts = {0, 0};
+        int r = ppoll_past_eintr(pfd, (nfds_t) opened, &ts);
+        int bad = 0;
+        for (int i = 0; i < opened; i++) {
+            if ((pfd[i].revents & POLLNVAL) || !(pfd[i].revents & POLLIN) ||
+                !(pfd[i].revents & POLLOUT))
+                bad++;
+            close(pfd[i].fd);
+        }
+        if (opened == 4 && r == opened && bad == 0)
+            PASS();
+        else
+            FAIL("device or directory reported unpollable");
+    }
+
+    TEST("ppoll on an epoll fd");
+    {
+        int ep = epoll_create1(0);
+        int pfds[2];
+        if (ep < 0 || pipe(pfds) != 0) {
+            FAIL("epoll_create1 or pipe failed");
+        } else {
+            struct epoll_event ev = {.events = EPOLLIN, .data.fd = pfds[0]};
+            epoll_ctl(ep, EPOLL_CTL_ADD, pfds[0], &ev);
+
+            struct pollfd probe = {.fd = ep, .events = POLLIN, .revents = 0};
+            struct timespec ts = {0, 0};
+            ppoll_past_eintr(&probe, 1, &ts);
+            int idle_ok = probe.revents == 0;
+
+            (void) !write(pfds[1], "x", 1);
+            probe.revents = 0;
+            int r = ppoll_past_eintr(&probe, 1, &ts);
+            int ready_ok = r == 1 && (probe.revents & POLLIN);
+
+            if (idle_ok && ready_ok)
+                PASS();
+            else
+                FAIL("epoll fd readiness misreported");
+            close(ep);
+            close(pfds[0]);
+            close(pfds[1]);
+        }
+    }
+
+    TEST("ppoll keeps POLLNVAL for closed fd");
+    {
+        int live = open("/dev/null", O_RDONLY);
+        int fd = open("/dev/null", O_RDONLY);
+        close(fd);
+        struct pollfd pfd[2];
+        pfd[0].fd = fd;
+        pfd[0].events = POLLIN;
+        pfd[0].revents = 0;
+        pfd[1].fd = live;
+        pfd[1].events = POLLIN;
+        pfd[1].revents = 0;
+        struct timespec ts = {0, 0};
+        int r = ppoll_past_eintr(pfd, 2, &ts);
+        if (r == 2 && (pfd[0].revents & POLLNVAL) &&
+            (pfd[1].revents & POLLIN) && !(pfd[1].revents & POLLNVAL))
+            PASS();
+        else
+            FAIL("closed fd lost its POLLNVAL");
+        close(live);
+    }
+
+    /* An unpollable entry that is not ready must not turn a blocking wait into
+     * a spin, and must not stop a pollable entry from waking the call.
+     */
+    TEST("ppoll waits alongside an epoll fd");
+    {
+        int ep = epoll_create1(0);
+        int pfds[2];
+        if (ep < 0 || pipe(pfds) != 0) {
+            FAIL("epoll_create1 or pipe failed");
+        } else {
+            struct pollfd pfd[2];
+            pfd[0].fd = ep;
+            pfd[0].events = POLLIN;
+            pfd[0].revents = 0;
+            pfd[1].fd = pfds[0];
+            pfd[1].events = POLLIN;
+            pfd[1].revents = 0;
+
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            struct timespec ts = {0, 150 * 1000 * 1000};
+            int r = ppoll_past_eintr(pfd, 2, &ts);
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            long elapsed_ms = (end.tv_sec - start.tv_sec) * 1000 +
+                              (end.tv_nsec - start.tv_nsec) / 1000000;
+            int waited = r == 0 && elapsed_ms >= 100;
+
+            (void) !write(pfds[1], "x", 1);
+            pfd[0].revents = 0;
+            pfd[1].revents = 0;
+            r = ppoll_past_eintr(pfd, 2, &ts);
+            int woke =
+                r == 1 && (pfd[1].revents & POLLIN) && pfd[0].revents == 0;
+
+            if (waited && woke)
+                PASS();
+            else
+                FAIL("blocking wait with an epoll fd misbehaved");
+            close(ep);
+            close(pfds[0]);
+            close(pfds[1]);
+        }
+    }
+
+    /* Linux POLLWRNORM is the bit macOS spells POLLWRBAND, and the guest's
+     * events reach the host untranslated.
+     */
+    TEST("ppoll honors POLLWRNORM");
+    {
+        int fd = open("/dev/null", O_RDWR);
+        struct pollfd pfd = {.fd = fd, .events = POLLWRNORM, .revents = 0};
+        struct timespec ts = {0, 0};
+        int r = ppoll_past_eintr(&pfd, 1, &ts);
+        if (r == 1 && (pfd.revents & POLLWRNORM) && !(pfd.revents & POLLNVAL))
+            PASS();
+        else
+            FAIL("POLLWRNORM on /dev/null not reported ready");
+        close(fd);
     }
 
     SUMMARY("test-poll");
