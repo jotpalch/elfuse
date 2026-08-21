@@ -243,6 +243,41 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
         return true;
     }
 
+    /* Serial alias fds (usb-sysfs.c) are plain host fds on macOS cu.* callout
+     * nodes; the stamp is what lets fstat report the Linux 166/188:<n> char-dev
+     * identity instead of the host tty's. The by-id spelling names the same
+     * object through the same open, so it carries the same stamp: without it
+     * one device fstat'd as 166:0 through one name and as the macOS callout
+     * (9:7 on this host) through the other.
+     */
+    char alias_node[64];
+    if (usb_tty_alias_node(path, alias_node, sizeof(alias_node))) {
+        /* The alias node's own spelling, not the guest's: a stamp is read back
+         * as a name (fstat, getcwd, /proc/self/fd/N), so both
+         * /dev/serial/by-id/../../ttyACM0 and the by-id leaf itself are
+         * recorded as /dev/ttyACM0. Recording the by-id spelling instead lost
+         * the identity twice over -- it is a different name for the same
+         * object, and at up to 242 bytes it does not fit the 63-byte stamp, so
+         * a real device's leaf was truncated and matched nothing.
+         */
+        str_copy_trunc(out, alias_node, out_size);
+        return true;
+    }
+
+    /* The directories the alias names live in, for the /dev/pts reason above
+     * and no other: they stay host-served, but a descriptor on one has to carry
+     * its guest spelling so resolve_proc_dirfd_path can rebuild /dev/ttyACM0
+     * for openat(dirfd, "ttyACM0") and put it back through the intercepts.
+     * Unstamped, the relative call reached the placeholder file directly --
+     * readdir listed the alias, openat opened an empty regular file, and the
+     * absolute spelling of the same name opened the device.
+     */
+    if (!strcmp(path, "/dev") || !strcmp(path, "/dev/serial") ||
+        !strcmp(path, "/dev/serial/by-id")) {
+        str_copy_trunc(out, path, out_size);
+        return true;
+    }
+
     if (strncmp(path, "/proc", 5) != 0)
         return false;
 
@@ -632,6 +667,23 @@ void dir_stream_release(void *ds_ptr)
     }
 }
 
+/* The host-served directories a serial alias name appears in. A descriptor
+ * opened on one has to carry its guest spelling, because the names inside it
+ * are the layer's and not the host directory's: resolve_proc_dirfd_path
+ * rebuilds /dev/ttyACM0 from a stamped dirfd and puts openat(dirfd, "ttyACM0")
+ * back through the intercepts. Unstamped, readdir listed the alias and the
+ * relative open handed back the empty placeholder file behind it while the
+ * absolute spelling of the same name opened the character device.
+ *
+ * Only these three exact directories, and only on the host-open path: every
+ * other name here either goes through an intercept that stamps it already or
+ * has no guest spelling to stamp.
+ */
+static const char *path_alias_dir_stamp(const char *p, char *buf, size_t bufsz)
+{
+    return p && usb_tty_alias_dir(p, buf, bufsz) ? buf : NULL;
+}
+
 /* spec is the description this fd inherits from, or NULL for a fresh one. Only
  * the magic-link open passes one: it implements the open as a dup, so the host
  * flags are shared with the source and must not be probed or changed.
@@ -999,8 +1051,11 @@ int64_t sys_openat_path(guest_t *g,
             close_keep_errno(host_fd);
             return linux_errno();
         }
-        int guest_fd = fd_alloc_opened_host(host_fd, type, linux_flags, -1,
-                                            NULL, NULL, NULL);
+        char dstamp[64];
+        int guest_fd = fd_alloc_opened_host(
+            host_fd, type, linux_flags, -1, NULL,
+            path_alias_dir_stamp(tx.intercept_path, dstamp, sizeof(dstamp)),
+            NULL);
         if (guest_fd < 0)
             return linux_errno();
         return guest_fd;
@@ -1042,8 +1097,10 @@ int64_t sys_openat_path(guest_t *g,
         close_keep_errno(host_fd);
         return linux_errno();
     }
-    int guest_fd =
-        fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL, NULL);
+    char dstamp[64];
+    int guest_fd = fd_alloc_opened_host(
+        host_fd, type, linux_flags, -1, NULL,
+        path_alias_dir_stamp(tx.intercept_path, dstamp, sizeof(dstamp)), NULL);
     if (guest_fd < 0)
         return linux_errno();
     return guest_fd;

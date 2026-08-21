@@ -1147,6 +1147,192 @@ static int check_devices(void)
     return ndev;
 }
 
+/* The ttyACM/ttyUSB aliases, from every end at once.
+ *
+ * /sys/class/tty/<name>/dev and a stat of /dev/<name> are two renderings of one
+ * number, and a reader that trusts either has to get the same answer: pyserial
+ * reads the sysfs attribute, a plain open goes through the node. Composing the
+ * node's rdev is also the only arithmetic in this layer that shifts a major
+ * into a signed 32-bit dev_t, so this is what puts it in front of UBSAN on the
+ * sanitizer lane -- 166 and 188 both land in the sign bit.
+ *
+ * The rest of the checks are the entry points agreeing about one object:
+ * access(2) against open(2) on the write permission (0664 had them disagree for
+ * a node the guest could open read-write), a descriptor's fstat against the
+ * path stat (the host cu.* identity leaked through otherwise), a trailing slash
+ * and O_DIRECTORY against ENOTDIR, and O_CREAT|O_EXCL against EEXIST.
+ *
+ * Returns the number of aliases examined; zero is printed rather than passed
+ * over, since a host with no USB serial function and no fixture reaches none of
+ * it.
+ */
+static void check_alias_node(const char *classdir, const char *name, bool acm)
+{
+    char node[128], val[64], why[256];
+    snprintf(node, sizeof(node), "/dev/%s", name);
+
+    TEST("the tty alias dev attribute matches the node's rdev");
+    struct stat nst;
+    if (attr_str(classdir, "dev", val, sizeof(val)) != 0) {
+        FAIL("dev attribute missing");
+        return;
+    }
+    if (stat(node, &nst) != 0) {
+        printf("      %s: %s\n", node, strerror(errno));
+        FAIL("stat the node");
+        return;
+    }
+    char want[64];
+    snprintf(want, sizeof(want), "%u:%u", (unsigned) major(nst.st_rdev),
+             (unsigned) minor(nst.st_rdev));
+    snprintf(why, sizeof(why), "%s: dev reads \"%s\", node rdev is \"%s\"",
+             name, val, want);
+    EXPECT_VALUE(S_ISCHR(nst.st_mode) && !strcmp(val, want), why);
+
+    TEST("the tty alias carries the major Linux gives its kind");
+    snprintf(why, sizeof(why), "%s has major %u", name,
+             (unsigned) major(nst.st_rdev));
+    EXPECT_VALUE((unsigned) major(nst.st_rdev) == (acm ? 166u : 188u), why);
+
+    /* One permission question, two entry points. The guest's uid need not be
+     * the host uid the node reports, so a mode that denies "other" answered
+     * EACCES here and served the open below -- which is what every "add
+     * yourself to dialout" check in a serial toolchain trips over.
+     */
+    TEST("access() and open() agree on writing the alias node");
+    int acc = access(node, R_OK | W_OK);
+    int aerr = errno;
+    int wfd = open(node, O_RDWR | O_NONBLOCK | O_NOCTTY);
+    int werr = errno;
+    snprintf(why, sizeof(why), "%s: access(R|W)=%s, open(O_RDWR)=%s", name,
+             acc == 0 ? "ok" : strerror(aerr),
+             wfd >= 0 ? "ok" : strerror(werr));
+    EXPECT_VALUE((acc == 0) == (wfd >= 0), why);
+    if (wfd >= 0)
+        close(wfd);
+
+    /* The descriptor an open hands back has to be the object stat described.
+     * The alias is a host fd on a macOS callout node, so without the stamp
+     * fstat reported that node's identity instead of the Linux char device's.
+     */
+    TEST("the alias fd fstats as the node stat described");
+    int fd = open(node, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+    if (fd < 0) {
+        printf("      %s: %s\n", node, strerror(errno));
+        FAIL("open the alias node");
+    } else {
+        struct stat fst;
+        int rc = fstat(fd, &fst);
+        snprintf(why, sizeof(why),
+                 "%s: stat rdev %u:%u ino %llu, fstat rdev %u:%u ino %llu",
+                 name, (unsigned) major(nst.st_rdev),
+                 (unsigned) minor(nst.st_rdev), (unsigned long long) nst.st_ino,
+                 (unsigned) major(fst.st_rdev), (unsigned) minor(fst.st_rdev),
+                 (unsigned long long) fst.st_ino);
+        EXPECT_VALUE(rc == 0 && S_ISCHR(fst.st_mode) &&
+                         fst.st_rdev == nst.st_rdev &&
+                         fst.st_ino == nst.st_ino && fst.st_dev == nst.st_dev,
+                     why);
+        close(fd);
+    }
+
+    TEST("a character device named as a directory is ENOTDIR");
+    char slashed[136];
+    snprintf(slashed, sizeof(slashed), "%s/", node);
+    struct stat sst;
+    int srt = stat(slashed, &sst);
+    int serr = errno;
+    int dfd = open(node, O_RDONLY | O_DIRECTORY);
+    int derr = errno;
+    snprintf(why, sizeof(why), "%s/: stat=%s, O_DIRECTORY=%s", node,
+             srt == 0 ? "ok" : strerror(serr),
+             dfd >= 0 ? "ok" : strerror(derr));
+    EXPECT_VALUE(srt < 0 && serr == ENOTDIR && dfd < 0 && derr == ENOTDIR, why);
+    if (dfd >= 0)
+        close(dfd);
+
+    TEST("O_CREAT|O_EXCL on a node that exists is EEXIST");
+    int cfd = open(node, O_RDWR | O_CREAT | O_EXCL | O_NONBLOCK, 0644);
+    int cerr = errno;
+    snprintf(why, sizeof(why), "%s: %s", node,
+             cfd >= 0 ? "created" : strerror(cerr));
+    EXPECT_VALUE(cfd < 0 && cerr == EEXIST, why);
+    if (cfd >= 0)
+        close(cfd);
+}
+
+/* Divergences from Linux this layer knows about and does not close, printed
+ * with both values rather than asserted, the way the matrix lane prints its
+ * XFAIL cells. Printing them is the point: a fidelity gap that nothing reports
+ * is one nobody re-measures.
+ */
+static void report_alias_divergences(const char *classdir, const char *alias)
+{
+    struct stat st;
+    char p[512];
+
+    /* pyserial reads <tty>/device/interface into ListPortInfo.interface. Linux
+     * has it whenever the interface descriptor carries a non-zero iInterface; a
+     * string descriptor needs an ep0 control transfer on an open device, which
+     * this layer deliberately does not do, so it is absent here and pyserial
+     * reports None.
+     */
+    snprintf(p, sizeof(p), "%s/device/interface", classdir);
+    if (stat(p, &st) != 0)
+        printf(
+            "XFAIL: %s/device/interface: Linux the iInterface string when the "
+            "descriptor carries one, elfuse absent (no ep0 string fetch)\n",
+            alias);
+
+    /* Linux publishes one interface directory and makes the flat
+     * /sys/bus/usb/devices/<if> name a symlink to it. This layer emits two
+     * directories with the same attributes so libusb keeps the flat name it
+     * walks, so the same interface has two inodes.
+     */
+    char target[512];
+    ssize_t n;
+    snprintf(p, sizeof(p), "%s/device", classdir);
+    n = readlink(p, target, sizeof(target) - 1);
+    if (n <= 0)
+        return;
+    target[n] = '\0';
+    const char *leaf = strrchr(target, '/');
+    if (!leaf || !strchr(leaf, ':'))
+        return; /* the ttyUSB port level, not an interface dir */
+    struct stat nested, flat;
+    char flatp[512];
+    snprintf(flatp, sizeof(flatp), "/sys/bus/usb/devices/%s", leaf + 1);
+    if (stat(p, &nested) == 0 && stat(flatp, &flat) == 0 &&
+        nested.st_ino != flat.st_ino)
+        printf(
+            "XFAIL: interface %s: Linux one inode (the flat name is a symlink "
+            "to the nested one), elfuse two directories, ino %llu and %llu\n",
+            leaf + 1, (unsigned long long) nested.st_ino,
+            (unsigned long long) flat.st_ino);
+}
+
+static int check_tty_aliases(void)
+{
+    DIR *dp = opendir("/sys/class/tty");
+    if (!dp)
+        return 0;
+
+    int n = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dp))) {
+        if (strncmp(ent->d_name, "ttyACM", 6) &&
+            strncmp(ent->d_name, "ttyUSB", 6))
+            continue;
+        n++;
+        char classdir[256];
+        snprintf(classdir, sizeof(classdir), "/sys/class/tty/%s", ent->d_name);
+        check_alias_node(classdir, ent->d_name, ent->d_name[3] == 'A');
+        report_alias_divergences(classdir, ent->d_name);
+    }
+    closedir(dp);
+    return n;
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1159,6 +1345,7 @@ int main(void)
      * against, and a zero here means those assertions did not execute.
      */
     printf("  devices examined: %d\n", ndev);
+    printf("  tty aliases examined: %d\n", check_tty_aliases());
 
     SUMMARY("test-usb-sysfs");
     return fails > 0 ? 1 : 0;
