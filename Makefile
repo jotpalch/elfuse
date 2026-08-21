@@ -38,6 +38,7 @@ SRCS := \
     runtime/procemu.c \
     runtime/procemu-pty.c \
     runtime/usb-sysfs.c \
+    runtime/tty-alias-pool.c \
     runtime/proctitle.c \
     syscall/syscall.c \
     syscall/fdtable.c \
@@ -269,6 +270,15 @@ $(BUILD_DIR)/test-string-builder-host: \
 $(BUILD_DIR)/test-dynamic-array-host: \
 		$(BUILD_DIR)/test-dynamic-array-host.o \
 		$(BUILD_DIR)/dynamic-array.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the sticky tty alias pool host unit test (native macOS binary)
+# tty-alias-pool.o is a pure leaf translation unit (string/array bookkeeping
+# only), so the test links the code under test and nothing else.
+$(BUILD_DIR)/test-tty-alias-pool-host: \
+		$(BUILD_DIR)/test-tty-alias-pool-host.o \
+		$(BUILD_DIR)/runtime/tty-alias-pool.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

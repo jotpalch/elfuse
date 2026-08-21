@@ -38,6 +38,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "core/shim-globals.h" /* shim_globals_mark_urandom_fd */
 
 #include "runtime/procemu.h"
+#include "runtime/usb-sysfs.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
@@ -251,6 +252,15 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
      */
     if (path_prefix_match(path, "/sys", 4) ||
         path_prefix_match(path, "/dev/bus", 8)) {
+        str_copy_trunc(out, path, out_size);
+        return true;
+    }
+
+    /* Serial alias fds (usb-sysfs.c) are plain host fds on macOS cu.* callout
+     * nodes; the stamp is what lets fstat report the Linux 166/188:<n> char-dev
+     * identity instead of the host tty's.
+     */
+    if (usb_tty_alias_path(path)) {
         str_copy_trunc(out, path, out_size);
         return true;
     }
