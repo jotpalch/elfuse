@@ -38,6 +38,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
         test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
+        test-tty-alias-pool-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
@@ -254,7 +255,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
         test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
-        test-gdbstub-host)
+        test-gdbstub-host test-tty-alias-pool-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -278,6 +279,7 @@ $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
+$(call run-host-unit,test-tty-alias-pool-host,sticky tty alias pool unit test)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
 $(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point against every path class)
@@ -1650,13 +1652,27 @@ test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 # device on first use rather than at open, so a modeled device with no hardware
 # behind it still opens, reads and stats like one -- which is what keeps this
 # lane's device half running on a machine with no USB device attached.
+# Twice, because the two runs cover different halves and neither subsumes the
+# other. The fixture run is the hardware-free one: modeled devices with no
+# IOKit service behind them, so the device-half assertions execute on a machine
+# with an empty bus. Each run reaches a different alias set rather than one of
+# them reaching none: the fixture's two modeled callouts, ttyACM0 and ttyUSB0,
+# and the host's own IOSerialBSDClient nodes, which are 1 on the machine this
+# was measured on and 0 on a machine with no USB serial device attached. So the
+# bare run is the one that puts a real callout's dev_t arithmetic in front of
+# the sanitizer, and the lane prints the alias count for both runs, which is
+# what keeps a run that examined nothing from reading as cover.
 test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
+	$(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 
 ## The /sys ours/not-ours split and the fchdir/cwd containment need a populated
 ## /sys behind the synthetic USB view, so this lane stages a sysroot skeleton
 ## (a net address, a THP knob, a node list) and runs the guest against it with
 ## the deterministic USB fixture so the /sys/bus/usb assertions have devices.
+## The /dev half of the same question needs names the sysroot owns inside the
+## shape the alias layer claims: two alias-shaped regular files and a by-id
+## symlink that is none of ours, all of which every entry point has to reach.
 test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
@@ -1669,7 +1685,13 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	printf 'always [madvise] never\n' \
 		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
 	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	mkdir -p "$$sysroot/dev/serial/by-id"; \
+	printf 'planted-acm7\n' > "$$sysroot/dev/ttyACM7"; \
+	printf 'planted-usb9\n' > "$$sysroot/dev/ttyUSB9"; \
+	ln -s ../../ttyACM7 "$$sysroot/dev/serial/by-id/usb-Planted_Link-if00"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-sysroot; \
+	ELFUSE_USB_FIXTURE=byidlong $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot
 
 ## Every entry point that can name something under /sys or /dev/bus, against
@@ -1699,6 +1721,7 @@ test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
 	: > "$$sysroot/sys/fs/cgroup/g"; \
 	: > "$$sysroot/dev/bus/other/f"; \
 	: > "$$sysroot/dev/bus/usb/099/001"; \
+	printf 'planted-acm7\n' > "$$sysroot/dev/ttyACM7"; \
 	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-matrix
@@ -1996,6 +2019,10 @@ test-usbdev-urb-host: $(BUILD_DIR)/test-usbdev-urb-host
 ## Run the ELF header validation host unit test
 test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host
 	$(BUILD_DIR)/test-elf-headers-host
+
+## Run the sticky tty alias pool unit test natively on the host
+test-tty-alias-pool-host: $(BUILD_DIR)/test-tty-alias-pool-host
+	$(BUILD_DIR)/test-tty-alias-pool-host
 
 # Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
 # race detector, so check-sanitizer is where this lane has its full weight.
