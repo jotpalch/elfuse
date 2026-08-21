@@ -37,6 +37,7 @@ SRCS := \
     runtime/procemu-pty.c \
     runtime/usb-sysfs.c \
     runtime/usb-desc.c \
+    runtime/tty-alias-pool.c \
     runtime/proctitle.c \
     syscall/syscall.c \
     syscall/fdtable.c \
@@ -295,6 +296,15 @@ $(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
 # needs no object but its own.
 $(BUILD_DIR)/test-usbdev-urb-host: \
 		$(BUILD_DIR)/test-usbdev-urb-host.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the sticky tty alias pool host unit test (native macOS binary)
+# tty-alias-pool.o is a pure leaf translation unit (string/array bookkeeping
+# only), so the test links the code under test and nothing else.
+$(BUILD_DIR)/test-tty-alias-pool-host: \
+		$(BUILD_DIR)/test-tty-alias-pool-host.o \
+		$(BUILD_DIR)/runtime/tty-alias-pool.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

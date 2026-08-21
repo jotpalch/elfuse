@@ -9,18 +9,22 @@
  * src/syscall/fs.c, the access arm of sys_faccessat, and the fd-side sysfs
  * identity in sys_fstatfs (src/syscall/fs-stat.c).
  *
- * The layer synthesizes exactly one subtree on each side, /sys/bus/usb and
- * /dev/bus/usb, on top of a backing /sys and /dev/bus that a sysroot supplies.
- * Its contract is not per-syscall: a name is this layer's or it is not, and
- * every entry point has to answer from that one decision. Four regressions all
- * came from an entry point re-deriving it -- lstat/open(O_NOFOLLOW)/readlink
- * shadowed the backing because their resolve succeeded where stat's failed,
- * getdents64 replaced the backing listing instead of extending it, /dev/bus had
- * no fall-through arm at all while access(2) fell through anyway, and fstatfs
- * never saw the sysfs identity statfs was handing out. Pinning them one
- * assertion at a time is what let them appear, so this is a matrix instead:
- * every entry point against every path class, so a fix that unifies one pair
- * and splits another cannot pass.
+ * The layer synthesizes /sys/bus/usb, /sys/class/tty, /sys/bus/usb-serial and
+ * /dev/bus/usb whole, and plants individual names -- ttyACM<n>, ttyUSB<n> and
+ * the by-id leaves -- into /dev and /dev/serial/by-id, which stay the sysroot's
+ * directories. Everything else on both sides is the sysroot's. Its contract is
+ * not per-syscall: a name is this layer's or it is not, and every entry point
+ * has to answer from that one decision. Four regressions all came from an entry
+ * point re-deriving it -- lstat/open(O_NOFOLLOW)/readlink shadowed the backing
+ * because their resolve succeeded where stat's failed, getdents64 replaced the
+ * backing listing instead of extending it, /dev/bus had no fall-through arm at
+ * all while access(2) fell through anyway, fstatfs never saw the sysfs identity
+ * statfs was handing out, and the alias names were claimed by shape so an
+ * alias-shaped file the sysroot really had answered ENOENT to every lookup
+ * while readdir went on listing it. Pinning them one assertion at a time is
+ * what let them appear, so this is a matrix instead: every entry point against
+ * every path class, so a fix that unifies one pair and splits another cannot
+ * pass.
  *
  * EXPECTED VALUES ARE MEASURED, NOT ASSUMED. Every cell below was recorded by
  * running this same binary natively on Linux (docker gcc:14, aarch64, kernel
@@ -95,15 +99,22 @@ enum {
     COL_SUBSYS_OUT, /* a walk through the subsystem link and back out of usb */
     COL_FOLD_OUT, /* a '..' out of /dev/bus/usb onto a name the backing owns */
     COL_FOLD_IN,  /* a '..' out of a foreign bus and back into /dev/bus/usb */
-    COL_SYS_FOLD_IN, /* a '..' out of a backing /sys name and back into ours */
+    COL_SYS_FOLD_IN,  /* a '..' out of a backing /sys name and back into ours */
+    COL_SYS_FOLD_IN2, /* the same, through a /sys name the scratch tree lacks */
+    COL_TTY,          /* a live ttyACM alias node */
+    COL_TTY_BACK,     /* an alias-shaped name only the backing has */
+    COL_TTY_ABSENT,   /* an alias-shaped name absent on both sides */
+    COL_BYID,         /* a /dev/serial/by-id leaf, discovered */
+    COL_TTY_FOLD,     /* the alias node spelled through a '..' */
     COL_COUNT,
 };
 
 static const char *col_name[COL_COUNT] = {
-    "synth-dir",  "back-sys",     "back-dev",    "subsys",
-    "escape",     "escape-syn",   "usb-node",    "absent",
-    "long-sys",   "sys-root",     "dev-bus",     "shadow",
-    "subsys-out", "dev-fold-out", "dev-fold-in", "sys-fold-in",
+    "synth-dir",   "back-sys",     "back-dev",   "subsys",       "escape",
+    "escape-syn",  "usb-node",     "absent",     "long-sys",     "sys-root",
+    "dev-bus",     "shadow",       "subsys-out", "dev-fold-out", "dev-fold-in",
+    "sys-fold-in", "sys-fold-in2", "tty-alias",  "tty-planted",  "tty-absent",
+    "byid-link",   "tty-fold",
 };
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
@@ -138,6 +149,13 @@ static char subsys_out_path[512];
  */
 static char long_path[512];
 
+/* COL_BYID is discovered for the same reason COL_SUBSYS is: the leaf udev
+ * builds carries the device's own strings, so the recording host's spelling and
+ * the guest fixture's are different names for the same class of object -- a
+ * symlink in /dev/serial/by-id pointing at a ttyACM node.
+ */
+static char byid_path[512];
+
 static const char *col_path(int c)
 {
     switch (c) {
@@ -171,6 +189,18 @@ static const char *col_path(int c)
         return "/dev/bus/other/../usb/001/001";
     case COL_SYS_FOLD_IN:
         return "/sys/class/../bus/usb/devices";
+    case COL_SYS_FOLD_IN2:
+        return "/sys/devices/../bus/usb/devices";
+    case COL_TTY:
+        return "/dev/ttyACM0";
+    case COL_TTY_BACK:
+        return "/dev/ttyACM7";
+    case COL_TTY_ABSENT:
+        return "/dev/ttyACM31";
+    case COL_BYID:
+        return byid_path;
+    case COL_TTY_FOLD:
+        return "/dev/serial/by-id/../../ttyACM0";
     default:
         return "/dev/bus";
     }
@@ -205,15 +235,35 @@ static const char *col_path(int c)
  * applied to only one direction cannot pass.
  */
 
-/* COL_SYS_FOLD_IN is the /sys mirror of COL_FOLD_IN, and the one direction that
- * stays unmet. /sys/class/../bus/usb/devices folds to a name this layer owns
- * and serves, and ownership is decided on that folded name -- but the resolve
- * behind it joins the unfolded suffix onto the scratch tree, which carries no
- * `class`, so the lookup fails and the layer answers its own authoritative
- * ENOENT for a directory it does serve. Recorded as XFAIL rather than repaired:
- * it is not this series\' doing, and the vectors header carries the measurement
- * against the merge base and the reason a fold cannot fix this half the way it
- * fixed the /dev one.
+/* COL_SYS_FOLD_IN and COL_SYS_FOLD_IN2 are the /sys mirror of COL_FOLD_IN, and
+ * they are the same spelling through two different intermediate components:
+ * /sys/class is a directory this layer materializes, /sys/devices is one only
+ * the sysroot has. Both fold to a name this layer owns and serves, so ownership
+ * is decided correctly for both -- but the resolve behind it joins the unfolded
+ * suffix onto the scratch tree, so the first walks and the second answers the
+ * layer's own authoritative ENOENT for a directory it does serve. The second
+ * stays an XFAIL; it is not this series' doing, and the vectors header carries
+ * the reason a fold cannot fix this half the way it fixed the /dev one.
+ *
+ * Two columns rather than one because the first was an XFAIL until the alias
+ * layer put a class directory in the tree, and eighteen of its cells then went
+ * green without the resolver changing at all. A pair holds the distinction the
+ * defect actually turns on.
+ */
+
+/* COL_TTY, COL_TTY_BACK, COL_TTY_ABSENT, COL_BYID and COL_TTY_FOLD are the /dev
+ * half of the ownership question for the names this layer plants in a directory
+ * it does not own. COL_TTY is one it serves; COL_TTY_BACK is an alias-shaped
+ * name the backing carries and this layer must not shadow; COL_TTY_ABSENT is
+ * alias-shaped and on neither side; COL_BYID is the symlink spelling of
+ * COL_TTY, which Linux stats as the device and lstats as the link; COL_TTY_FOLD
+ * is COL_TTY reached through a '..' out of /dev/serial/by-id, the spelling that
+ * used to name the placeholder file instead of the node.
+ *
+ * COL_TTY_BACK is the column that holds the fall-through: claiming every
+ * parseable alias name and answering ENOENT for the ones with no device made a
+ * rootfs image's own /dev/ttyUSB0 unreachable and left readdir listing names
+ * that no lookup resolved.
  */
 
 /* Names that must be listed by the union directories, one comma-free name per
@@ -251,6 +301,30 @@ static void discover_long(void)
         }
         snprintf(long_path, sizeof(long_path), "%s/../%s/bInterfaceNumber", acc,
                  e->d_name);
+        break;
+    }
+    closedir(d);
+}
+
+static void discover_byid(void)
+{
+    strcpy(byid_path, "/dev/serial/by-id/@none@");
+    DIR *d = opendir("/dev/serial/by-id");
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        char cand[512], tgt[128];
+        snprintf(cand, sizeof(cand), "/dev/serial/by-id/%s", e->d_name);
+        ssize_t n = readlink(cand, tgt, sizeof(tgt) - 1);
+        if (n <= 0)
+            continue;
+        tgt[n] = '\0';
+        if (strncmp(tgt, "../../tty", 9))
+            continue;
+        strcpy(byid_path, cand);
         break;
     }
     closedir(d);
@@ -662,6 +736,7 @@ int main(void)
 {
     discover_subsys();
     discover_long();
+    discover_byid();
 
     if (getenv("MATRIX_RECORD")) {
         record();
@@ -722,9 +797,19 @@ int main(void)
                 rows[r].fn(col_path(c), cell);
             }
 
+            /* Both directions are printed. A '?' cell that starts matching is
+             * an XPASS and says so: eighteen of them went green when the
+             * scratch tree gained a /sys/class directory, and the silent
+             * "continue" that used to cover it meant the recorded expectation
+             * and the comment explaining it stayed false with nothing in the
+             * lane's output to say the fact had changed.
+             */
             if (xfail) {
                 if (strcmp(cell, want))
                     printf("XFAIL: %s [%s] %s: Linux %s, elfuse %s\n",
+                           rows[r].name, col_name[c], col_path(c), want, cell);
+                else
+                    printf("XPASS: %s [%s] %s: Linux %s, elfuse %s\n",
                            rows[r].name, col_name[c], col_path(c), want, cell);
                 continue;
             }

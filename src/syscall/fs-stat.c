@@ -18,6 +18,7 @@
 #include "debug/log.h"
 
 #include "runtime/procemu.h"
+#include "runtime/usb-sysfs.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
@@ -155,6 +156,12 @@ static int write_linux_statx(guest_t *g,
 /* Whether a descriptor's identity comes from the stamp rather than from the
  * host object underneath it: O_PATH, /sys and /dev/bus do, /proc does not. See
  * docs/internals.md, "Filesystem Identity Of A Descriptor", for why.
+ *
+ * A serial alias joins them for the reason the /dev/bus nodes do:
+ * /dev/ttyACM<n> is an ordinary host fd on the macOS cu.* callout node, so its
+ * fstat has to show the Linux char-dev identity its path stat shows, not the
+ * host tty's. The stamp is already canonical, so the cheap lexical test is the
+ * right one here; the by-id spelling is stamped as the alias node it names.
  */
 static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
 {
@@ -162,7 +169,8 @@ static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
         return false;
     return snap->type == FD_PATH ||
            path_prefix_match(snap->proc_path, "/sys", 4) ||
-           path_prefix_match(snap->proc_path, "/dev/bus", 8);
+           path_prefix_match(snap->proc_path, "/dev/bus", 8) ||
+           usb_tty_alias_path(snap->proc_path);
 }
 
 static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
@@ -577,10 +585,18 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
  * number no device has -- would otherwise have its file answer statfs while
  * open, stat and access all report ENOENT for the same path. Only
  * PROC_NOT_INTERCEPTED means "ask the backing".
+ *
+ * The serial aliases are the same question about the same /dev: Linux serves
+ * /dev/ttyACM0 from the devtmpfs that carries /dev, and statfs and fstatfs on
+ * it both report TMPFS_MAGIC. Without them here statfs answered the raw macOS
+ * f_type of whatever the placeholder sat on while fstatfs answered a different
+ * one for the descriptor of the same name.
  */
 static int statfs_dev_bus_class(const char *path)
 {
-    if (!path || !path_prefix_match(path, "/dev/bus", 8))
+    char alias_canon[288];
+    if (!path || !(path_prefix_match(path, "/dev/bus", 8) ||
+                   usb_tty_alias_canon(path, alias_canon, sizeof(alias_canon))))
         return PROC_NOT_INTERCEPTED;
     struct stat st;
     return proc_intercept_stat_at(path, &st, true);
