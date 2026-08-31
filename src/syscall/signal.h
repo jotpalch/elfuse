@@ -17,6 +17,7 @@
 #include <Hypervisor/Hypervisor.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/time.h>
@@ -214,13 +215,27 @@ _Static_assert(offsetof(linux_rt_sigframe_t, uc) == 128,
 #define RT_SIGNAL_COUNT \
     (LINUX_NSIG - LINUX_SIGRTMIN + 1) /* 33 signals: 32-64 */
 
+/* The gap before si_ptr is a named member rather than padding the compiler
+ * inserts. Storing a value into a struct leaves its padding unspecified (C11
+ * 6.2.6.1), and these are assigned whole, from signal_default_info's compound
+ * literal among others, so the four bytes there would carry whatever the host
+ * stack held. signal_get_state then memcpy's the array into the fork snapshot
+ * and writes it to the IPC socket, which is 4 KiB of indeterminate host memory
+ * handed to the child across 1056 entries. Named, the field is copied as a
+ * value like any other and starts zero everywhere the struct does.
+ */
 typedef struct {
     int signum;
     int32_t si_code, si_pid;
     uint32_t si_uid;
     int32_t si_int;
+    uint32_t _pad;
     uint64_t si_ptr;
 } signal_rt_info_t;
+
+_Static_assert(sizeof(signal_rt_info_t) ==
+                   sizeof(int32_t) * 6 + sizeof(uint64_t),
+               "signal_rt_info_t has padding the fork snapshot would leak");
 
 /* One pending-signal set. Linux keeps two of these per task: the thread's
  * private set (task->pending, targeted by tgkill/tkill) and the thread-group
@@ -230,7 +245,7 @@ typedef struct {
  * then the shared set.
  */
 typedef struct {
-    uint64_t pending; /* Bitmask of pending signals in this set */
+    _Atomic uint64_t pending; /* Bitmask of pending signals in this set */
     /* Standard signal metadata: Linux coalesces signals 1-31, but preserves one
      * siginfo payload for the pending instance.
      */
@@ -250,12 +265,74 @@ typedef struct {
 typedef struct {
     linux_sigaction_t actions[LINUX_NSIG]; /* Per-signal handler state */
     signal_pending_t shared;               /* Process-directed pending set */
-    uint64_t blocked;                      /* Bitmask of blocked signals */
+    _Atomic uint64_t blocked;              /* Bitmask of blocked signals */
     uint64_t saved_blocked;                /* Original mask before sigsuspend */
     bool saved_blocked_valid;              /* True if saved_blocked is set */
     linux_stack_t altstack; /* Alternate signal stack (sigaltstack) */
     bool on_altstack;       /* True if currently delivering on altstack */
 } signal_state_t;
+
+/* Plain fork-IPC representation of signal state. */
+typedef struct {
+    uint64_t pending;
+    bool std_info_valid[LINUX_SIGRTMIN - 1];
+    signal_rt_info_t std_info[LINUX_SIGRTMIN - 1];
+    int rt_queue[RT_SIGNAL_COUNT];
+    uint8_t rt_head[RT_SIGNAL_COUNT];
+    signal_rt_info_t rt_info[RT_SIGNAL_COUNT][RT_SIGQUEUE_MAX];
+} signal_pending_snapshot_t;
+
+typedef struct {
+    linux_sigaction_t actions[LINUX_NSIG];
+    signal_pending_snapshot_t shared;
+    uint64_t blocked;
+    uint64_t saved_blocked;
+    bool saved_blocked_valid;
+    linux_stack_t altstack;
+    bool on_altstack;
+} signal_state_snapshot_t;
+
+/* The snapshot mirrors signal_state_t with the two atomic members demoted to
+ * plain types, and signal_get_state/signal_set_state copy it field by field.
+ * Nothing in either direction makes the compiler notice a field added to one
+ * and not the other, so tie the two together by size: guest.h already asserts
+ * that _Atomic uint64_t is laid out like uint64_t, which is what makes these
+ * two equal in the first place.
+ */
+_Static_assert(sizeof(signal_state_snapshot_t) == sizeof(signal_state_t),
+               "signal_state_snapshot_t drifted from signal_state_t");
+_Static_assert(sizeof(signal_pending_snapshot_t) == sizeof(signal_pending_t),
+               "signal_pending_snapshot_t drifted from signal_pending_t");
+
+/* The one definition of how a pending bitmask is reached.
+ *
+ * The field is _Atomic only so the lock-free scan in thread_pending_union can
+ * read it without a data race; every mutator runs under sig_lock, which is the
+ * whole ordering requirement, so relaxed is correct. Going through these rather
+ * than the plain compound operators keeps the order stated: `p->pending |= bit`
+ * on an _Atomic object compiles to a seq_cst read-modify-write, which buys
+ * ordering nothing here needs. Declared here rather than in signal.c so
+ * thread.c reaches the per-thread set the same way.
+ */
+static inline uint64_t pending_load(const _Atomic uint64_t *p)
+{
+    return atomic_load_explicit(p, memory_order_relaxed);
+}
+
+static inline void pending_store(_Atomic uint64_t *p, uint64_t v)
+{
+    atomic_store_explicit(p, v, memory_order_relaxed);
+}
+
+static inline void pending_or(_Atomic uint64_t *p, uint64_t bits)
+{
+    pending_store(p, pending_load(p) | bits);
+}
+
+static inline void pending_clear(_Atomic uint64_t *p, uint64_t bits)
+{
+    pending_store(p, pending_load(p) & ~bits);
+}
 
 /* API */
 
@@ -474,8 +551,8 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
  */
 int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva);
 
-/* Get/set signal state (for fork IPC serialization). */
-const signal_state_t *signal_get_state(void);
+/* Snapshot/restore signal state for fork IPC serialization. */
+void signal_get_state(signal_state_snapshot_t *state);
 
 /* True only for the explicit Linux no-zombie dispositions. SIGCHLD's default
  * disposition is ignore but does not imply automatic reaping.
@@ -487,7 +564,9 @@ bool signal_sigchld_autoreap(void);
  * registered its guest cache yet.
  */
 bool signal_refresh_identity_cache(void);
-void signal_set_state(const signal_state_t *state);
+void signal_set_state(const signal_state_snapshot_t *state);
+uint64_t signal_shared_pending_load(void);
+uint64_t signal_blocked_load(void);
 
 /* Snapshot or consume pending signals for signalfd. signal_peek_signalfd()
  * snapshots up to max matching entries without consuming them.

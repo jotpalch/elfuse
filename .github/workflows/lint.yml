@@ -249,25 +249,57 @@ jobs:
           echo "C sources changed: $c; .ci shell changed: $sh; reflow inputs changed: $cf"
 
       # commentflow ships as a release binary rather than an apt package, and
-      # its only tag is a rolling "latest", so the checksum below is what
-      # actually pins the version. A mismatch means upstream republished the
-      # tag: read what changed in the reflow rules before updating the hash,
-      # because a formatter that moves under CI rewrites the tree without a
-      # commit here saying so. This is the same reason clang-format is held at
-      # exactly 22 rather than "22 or newer".
+      # its only tag is a rolling "latest", so the asset moves under a fixed
+      # URL. The bytes are checked against the sha256 GitHub records for the
+      # asset itself, read from the API in the same step that downloads it,
+      # rather than a copy of that hash kept here. A hash written into this
+      # file has to be recomputed by hand on every upstream republish, and it
+      # fails as two hex strings that differ, which says nothing about what
+      # moved.
+      #
+      # What this does and does not buy: it detects a truncated or tampered
+      # transfer, since the digest comes from the API rather than the CDN path
+      # the tarball travels. It does not freeze the version, so a republished
+      # "latest" is picked up silently. Comment reflow is a formatting gate, so
+      # the failure mode is a diff in the reflow check rather than a wrong
+      # binary running against the tree, and that diff is what surfaces the
+      # change.
       - name: Install commentflow
+        id: install_commentflow
         if: ${{ !cancelled() && steps.changed.outputs.cf == 'true' }}
         env:
-          COMMENTFLOW_URL: https://github.com/sysprog21/commentflow/releases/download/latest/commentflow-x86_64-unknown-linux-gnu.tar.gz
-          COMMENTFLOW_SHA256: b9723611440cdfac0b17a4d226d3f36c36dca87f37fc5c95b3f00274830834f5
+          COMMENTFLOW_REPO: sysprog21/commentflow
+          COMMENTFLOW_ASSET: commentflow-x86_64-unknown-linux-gnu.tar.gz
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/commentflow.tar.gz "$COMMENTFLOW_URL"
-          echo "$COMMENTFLOW_SHA256  /tmp/commentflow.tar.gz" | sha256sum -c -
+          meta=$(gh api "repos/$COMMENTFLOW_REPO/releases/tags/latest")
+
+          # An absent digest means the release predates the field. A download
+          # nothing verifies is not worth having, so stop rather than skip the
+          # check.
+          digest=$(jq -r --arg n "$COMMENTFLOW_ASSET" \
+            '.assets[] | select(.name == $n) | .digest // ""' <<< "$meta")
+          url=$(jq -r --arg n "$COMMENTFLOW_ASSET" \
+            '.assets[] | select(.name == $n) | .browser_download_url // ""' \
+            <<< "$meta")
+          if [ -z "$digest" ] || [ -z "$url" ]; then
+            echo "no digest or download URL recorded for $COMMENTFLOW_ASSET" >&2
+            exit 1
+          fi
+
+          curl -fsSL -o /tmp/commentflow.tar.gz "$url"
+          echo "${digest#sha256:}  /tmp/commentflow.tar.gz" | sha256sum -c -
           sudo tar -xzf /tmp/commentflow.tar.gz -C /usr/local/bin commentflow
 
+      # Gated on the install having succeeded, not merely on the job not being
+      # cancelled. Every other check here runs under !cancelled() so one
+      # failure does not hide the rest, but this one has a dependency rather
+      # than a peer: with a bare !cancelled() a failed download or a stale
+      # checksum reaches this step as "commentflow not found", which reads as a
+      # missing tool on the runner instead of the pin that actually broke.
       - name: Comment reflow
-        if: ${{ !cancelled() && steps.changed.outputs.cf == 'true' }}
+        if: ${{ !cancelled() && steps.changed.outputs.cf == 'true' && steps.install_commentflow.outcome == 'success' }}
         run: .ci/check-commentflow.sh
 
       - name: Cache apt packages

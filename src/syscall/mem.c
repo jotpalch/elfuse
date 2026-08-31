@@ -4388,7 +4388,7 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t)
             log_error(
                 "deferred stack munmap for tid=%lld leaked: "
                 "[0x%llx-0x%llx) rc=%d (region tracking inconsistent)",
-                (long long) t->guest_tid, (unsigned long long) starts[i],
+                (long long) thread_tid(t), (unsigned long long) starts[i],
                 (unsigned long long) ends[i], rc);
             continue;
         }

@@ -246,7 +246,13 @@ static int64_t stat_at_path(guest_t *g,
             }
             dir_ref.fd = snap.host_fd;
             if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
-                int intercepted = proc_intercept_stat(snap.proc_path, mac_st);
+                /* The descriptor already names one object: an O_PATH open that
+                 * followed refers to the target, one made with O_NOFOLLOW to
+                 * the link itself, so the open's flag is what selects here.
+                 */
+                bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
+                int intercepted =
+                    proc_intercept_stat_at(snap.proc_path, mac_st, follow);
                 if (intercepted == 0)
                     goto done;
                 if (intercepted == -1) {
@@ -266,7 +272,9 @@ static int64_t stat_at_path(guest_t *g,
 
         int intercepted = PROC_NOT_INTERCEPTED;
         if (path_might_use_stat_intercept(tx.intercept_path)) {
-            intercepted = proc_intercept_stat(tx.intercept_path, mac_st);
+            intercepted =
+                proc_intercept_stat_at(tx.intercept_path, mac_st,
+                                       !(flags & LINUX_AT_SYMLINK_NOFOLLOW));
             if (intercepted == -1) {
                 rc = linux_errno();
                 goto done;
@@ -309,7 +317,12 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
     fd_entry_t snap;
     if (fd_snapshot(fd, &snap) && snap.type == FD_PATH &&
         snap.proc_path[0] != '\0') {
-        int intercepted = proc_intercept_stat(snap.proc_path, &mac_st);
+        /* As in stat_at_path's AT_EMPTY_PATH branch: the open already chose
+         * between the link and its target, so replay that choice here.
+         */
+        bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
+        int intercepted =
+            proc_intercept_stat_at(snap.proc_path, &mac_st, follow);
         if (intercepted == 0) {
             if (write_linux_stat(g, stat_gva, &mac_st) < 0)
                 return -LINUX_EFAULT;
@@ -449,6 +462,66 @@ static void fill_proc_statfs(linux_statfs_t *lin)
     lin->f_frsize = 4096;
 }
 
+/* Boundary-checked "/sys or under it", applied to the folded name, which is
+ * also published so the caller can act on the same spelling it classified.
+ *
+ * Linux resolves the path before deciding which filesystem answers it, so
+ * statfs("/sys/../etc") reports the filesystem behind /etc and not sysfs. The
+ * intercept path arrives here unnormalized, so testing the "/sys" prefix as
+ * spelled would hand SYSFS_MAGIC to every name that merely starts inside /sys
+ * and then climbs back out of it. Fold '.' and '..' first and test what the
+ * name actually resolves to.
+ *
+ * A relative name resolves the same way, against the cwd -- statfs("sys") from
+ * / is statfs("/sys") to the kernel, and sd-device and libusb both reach sysfs
+ * through relative walks. Refusing every name that did not start with '/' left
+ * those on the pass-through, which on a host with no /sys is ENOENT.
+ *
+ * path_openat2_normalize_in_root clamps '..' at the root, which is what the
+ * kernel does with a leading "/..", and yields a root-relative spelling --
+ * "sys/bus" for /sys/bus, "etc" for /sys/../etc, "." for /.
+ */
+static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
+{
+    if (!path || path[0] == '\0')
+        return false;
+
+    char joined[LINUX_PATH_MAX];
+    if (path[0] != '/') {
+        proc_cwd_view_t view;
+        if (proc_acquire_cwd_view(&view) < 0)
+            return false;
+        int jn = snprintf(joined, sizeof(joined), "%s/%s", view.path, path);
+        proc_release_cwd_view(&view);
+        if (jn < 0 || (size_t) jn >= sizeof(joined))
+            return false;
+        path = joined;
+    }
+
+    char folded[LINUX_PATH_MAX];
+    if (path_openat2_normalize_in_root(path, folded, sizeof(folded)) < 0)
+        return false;
+    if (strncmp(folded, "sys", 3) != 0 ||
+        (folded[3] != '\0' && folded[3] != '/'))
+        return false;
+    int n = snprintf(abs, abssz, "/%s", folded);
+    return n > 0 && (size_t) n < abssz;
+}
+
+static void fill_sysfs_statfs(linux_statfs_t *lin)
+{
+    memset(lin, 0, sizeof(*lin));
+    lin->f_type = 0x62656572; /* SYSFS_MAGIC */
+    lin->f_bsize = 4096;
+    lin->f_blocks = 0;
+    lin->f_bfree = 0;
+    lin->f_bavail = 0;
+    lin->f_files = 0;
+    lin->f_ffree = 0;
+    lin->f_namelen = 255;
+    lin->f_frsize = 4096;
+}
+
 static int64_t sys_statfs_impl(guest_t *g,
                                const char *path,
                                uint64_t buf_gva,
@@ -475,7 +548,8 @@ static int64_t sys_statfs_impl(guest_t *g,
         }
 
         struct stat mac_st;
-        int intercepted = proc_intercept_stat(tx.intercept_path, &mac_st);
+        int intercepted =
+            proc_intercept_stat_at(tx.intercept_path, &mac_st, true);
         if (intercepted == 0) {
             linux_statfs_t lin_st;
             fill_proc_statfs(&lin_st);
@@ -495,6 +569,47 @@ static int64_t sys_statfs_impl(guest_t *g,
                 return -LINUX_EFAULT;
             return 0;
         }
+    }
+
+    /* /sys is sysfs. libusb refuses to enumerate through the synthetic
+     * /sys/bus/usb tree unless statfs("/sys") reports SYSFS_MAGIC
+     * (linux_usbfs.c:398-408), and passing through to the host either fails (no
+     * /sys on macOS) or leaks the sysroot's filesystem magic. The mount point
+     * itself always answers; paths under it answer when the intercept layer (or
+     * the host/sysroot backing, e.g. an empty /sys skeleton) knows them, and
+     * report the same ENOENT a real Linux kernel would for the rest.
+     */
+    char sys_abs[LINUX_PATH_MAX];
+    if (statfs_path_is_sysfs(tx.intercept_path, sys_abs, sizeof(sys_abs))) {
+        /* Classifying the folded name and then probing the raw one asked two
+         * different questions of two different spellings: "/sys/../sys" is
+         * sysfs, but no intercept and no host backing carries that literal
+         * name, so the probe answered ENOENT for a directory that exists.
+         * Re-enter on the folded spelling so the existence probe, the host
+         * fallback and the answer all describe the same object. Folding is
+         * idempotent, so this recurses at most once.
+         */
+        if (strcmp(sys_abs, tx.intercept_path) != 0)
+            return sys_statfs_impl(g, sys_abs, buf_gva, depth + 1);
+
+        bool exists = sys_abs[4] == '\0'; /* "/sys" itself */
+        if (!exists) {
+            struct stat sys_st;
+            int intercepted = proc_intercept_stat_at(sys_abs, &sys_st, true);
+            if (intercepted == 0)
+                exists = true;
+            else if (intercepted == -1)
+                return linux_errno();
+            else
+                exists = stat(tx.host_path, &sys_st) == 0;
+        }
+        if (!exists)
+            return -LINUX_ENOENT;
+        linux_statfs_t lin_st;
+        fill_sysfs_statfs(&lin_st);
+        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
     }
 
     /* glibc's posix_openpt() opens /dev/ptmx and then confirms devpts is
@@ -574,6 +689,21 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
         linux_statfs_t proc_st;
         fill_proc_statfs(&proc_st);
         if (guest_write_small(g, buf_gva, &proc_st, sizeof(proc_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
+    /* Descriptors opened under /sys are scratch-dir backed; the host fstatfs
+     * would leak the /tmp filesystem's magic. systemd's sd-device gates every
+     * enumerated syspath on fstatfs(fd) == SYSFS_MAGIC, so answer as sysfs
+     * exactly like path statfs("/sys") does.
+     */
+    char fd_sys_abs[LINUX_PATH_MAX];
+    if (snap.proc_path[0] &&
+        statfs_path_is_sysfs(snap.proc_path, fd_sys_abs, sizeof(fd_sys_abs))) {
+        linux_statfs_t sys_st;
+        fill_sysfs_statfs(&sys_st);
+        if (guest_write_small(g, buf_gva, &sys_st, sizeof(sys_st)) < 0)
             return -LINUX_EFAULT;
         return 0;
     }

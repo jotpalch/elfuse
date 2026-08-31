@@ -31,7 +31,12 @@ BENCH_GUARDRAIL_REQUIRE_STATIC="${BENCH_GUARDRAIL_REQUIRE_STATIC:-1}"
 STATIC_BENCH="${BENCH_GUARDRAIL_DIR}/bench-hot-guard"
 GLIBC_BENCH="${BENCH_GUARDRAIL_DIR}/bench-hot-guard-glibc"
 GLIBC_TOOLCHAIN="${LINUX_TOOLCHAIN:-/opt/toolchain/aarch64-linux-gnu}"
-GLIBC_SYSROOT="${GLIBC_TOOLCHAIN}/aarch64-unknown-linux-gnu/sysroot"
+
+# Honor the makefile's CROSS_GLIBC_SYSROOT when it passes one: the prerequisite
+# guard that decides whether bench-hot-guard-glibc gets built reads that
+# variable, so deriving a different path here would run the benchmark against a
+# sysroot the guard never checked.
+GLIBC_SYSROOT="${GLIBC_SYSROOT:-${GLIBC_TOOLCHAIN}/aarch64-unknown-linux-gnu/sysroot}"
 ITERS="${BENCH_GUARDRAIL_ITERS:-200000}"
 
 # Absolute ceilings for the three shim/vDSO-served lanes. The wide headroom is

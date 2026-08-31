@@ -83,6 +83,44 @@ int main(void)
         }
     }
 
+    /* A bridge to a host *directory* outside the sysroot, walked relatively.
+     *
+     * The host openat fails -- macOS has no /dev/bus and no /dev/shm -- and the
+     * ENOENT fallback that exists for systemd's chase() then rebuilds a
+     * guest-absolute spelling from the descriptor. path_host_to_guest passes a
+     * host path that is not under the sysroot through unchanged, so the
+     * descriptor on the host's /dev rebased to the guest-absolute "/dev" and
+     * the retry handed the walk to the /dev/bus/usb and /dev/shm intercepts: a
+     * name resolved outside the guest namespace came back answered from inside
+     * it. Both names must stay ENOENT, which is what the host already said.
+     */
+    int devfd = openat(dirfd, "dev-bridge", O_RDONLY | O_DIRECTORY);
+    TEST("a bridge to a host directory outside the sysroot opens");
+    if (devfd < 0) {
+        FAIL("openat(dirfd, dev-bridge) failed");
+    } else {
+        PASS();
+        static const char *const names[] = {"bus/usb", "shm", "bus"};
+        for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            TEST(
+                "a relative walk off it is not retargeted into the intercepts");
+            errno = 0;
+            int fd = openat(devfd, names[i], O_RDONLY);
+            if (fd >= 0) {
+                close(fd);
+                printf("      %s answered from the intercept namespace\n",
+                       names[i]);
+                FAIL("openat off the host bridge was retargeted");
+            } else if (errno != ENOENT) {
+                printf("      %s: errno=%d\n", names[i], errno);
+                FAIL("openat off the host bridge answered the wrong errno");
+            } else {
+                PASS();
+            }
+        }
+        close(devfd);
+    }
+
     close(dirfd);
 
     TEST("AT_FDCWD relative escape is blocked after chdir");

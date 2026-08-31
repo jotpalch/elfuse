@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/event.h>
+#include <sys/stat.h>
 #include <poll.h>
 
 #include "utils.h"
@@ -1048,6 +1049,13 @@ typedef struct {
                          * reporting but allow MOD.
                          */
     bool pty_master;    /* Registration is for a tracked pty master. */
+
+    /* The target is pollable on Linux but takes no knote here, so read
+     * readiness can never arrive through kqueue. /dev/random is the only such
+     * target today. Linux reports it readable as soon as the pool is seeded and
+     * from then on always, which is what the wait synthesizes.
+     */
+    bool always_readable;
 } epoll_reg_t;
 
 /* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance has its
@@ -1074,6 +1082,7 @@ typedef struct {
     pthread_mutex_t lock;
     int active_count;
     int pty_master_count;
+    int always_readable_count;
     epoll_reg_t regs[FD_TABLE_SIZE];
 } epoll_instance_t;
 
@@ -1084,9 +1093,12 @@ static void epoll_reg_deactivate_locked(epoll_instance_t *inst,
         inst->active_count--;
     if (reg->pty_master && inst->pty_master_count > 0)
         inst->pty_master_count--;
+    if (reg->always_readable && inst->always_readable_count > 0)
+        inst->always_readable_count--;
     reg->active = false;
     reg->oneshot_armed = false;
     reg->pty_master = false;
+    reg->always_readable = false;
     reg->generation = 0;
     reg->ofd_id = 0;
 }
@@ -1204,7 +1216,7 @@ int epoll_dup_fd(int src_fd,
     fd_alias_spec_t spec = fd_alias_identity(src_ofd_id, 0);
     int new_guest_fd = fd_alloc_alias_dir(
         &spec, fixed_slot ? fixed_guest_fd : -1, min_guest_fd, FD_EPOLL,
-        new_host_fd, NULL, inst, lflags);
+        new_host_fd, NULL, inst, lflags, NULL);
     if (new_guest_fd < 0) {
         /* fd_alloc_dir_at fails only when fixed_guest_fd is out of range or
          * over RLIMIT_NOFILE; dup2/dup3 report that as EBADF, not the EMFILE
@@ -1365,6 +1377,92 @@ int64_t sys_epoll_create1(int flags)
     return gfd;
 }
 
+/* Whether the kqueue accepts any knote on this fd, which tells a refused write
+ * filter apart from a target kqueue rejects outright. The probe knote is added
+ * disabled on purpose: sys_epoll_pwait blocks on this same kqueue without
+ * inst->lock, and an enabled probe on a ready target would hand that wait an
+ * event whose NULL udata reads back as guest fd 0. The target carries no other
+ * registration here, so the paired delete takes nothing else with it.
+ */
+static bool epoll_target_pollable(int kq, int host_fd)
+{
+    struct kevent probe;
+    EV_SET(&probe, host_fd, EVFILT_READ, EV_ADD | EV_DISABLE, 0, 0, NULL);
+    if (kevent(kq, &probe, 1, NULL, 0, NULL) < 0)
+        return false;
+    EV_SET(&probe, host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    kevent(kq, &probe, 1, NULL, 0, NULL);
+    return true;
+}
+
+/* Whether Linux would take this target at all. A plain file has no poll method
+ * and kqueue does not mind, so that refusal originates here; fstat answers it
+ * rather than the fd type, since FD_REGULAR also covers a fifo or a tty opened
+ * by path. An open that resolved a path through an intercept answers from
+ * path_poll_capable instead, because fstat would be describing elfuse's staging
+ * file: /proc/self/mountinfo and /sys/devices/system/cpu/online are ordinary
+ * host files here and pollable on Linux, while /proc/self/stat and /etc/passwd
+ * are the same kind of host file and are not.
+ */
+static bool epoll_target_supported(int kq, const fd_entry_t *snap)
+{
+    /* A settled path answers for itself. The kqueue probe would veto
+     * /dev/random, which Linux polls and macOS refuses a knote on.
+     */
+    if (snap->path_poll_capable)
+        return true;
+    struct stat st;
+    if (fstat(snap->host_fd, &st) == 0 && S_ISREG(st.st_mode))
+        return false;
+    return epoll_target_pollable(kq, snap->host_fd);
+}
+
+/* Remove the filters an aborted registration pass already armed. Each carries
+ * the udata of a registration the caller is about to abandon, and a knote left
+ * on a live target wakes the next sys_epoll_pwait with an event that wait can
+ * only drop, returning 0 ahead of its timeout. Deleting a filter this pass
+ * dropped rather than armed fails with ENOENT and is ignored, the way every
+ * other delete here is.
+ */
+static void epoll_undo_changes(int kq, const struct kevent *changes, int n)
+{
+    for (int i = 0; i < n; i++) {
+        struct kevent del;
+        EV_SET(&del, changes[i].ident, changes[i].filter, EV_DELETE, 0, 0,
+               NULL);
+        kevent(kq, &del, 1, NULL, 0, NULL);
+    }
+}
+
+/* epoll_target_supported for the paths that have no instance to probe on,
+ * because the epoll descriptor is not one or the op never named a registration.
+ * The probe needs any kqueue rather than this instance's, so a call that is
+ * already failing borrows one; the paths that succeed never reach here and
+ * still pay nothing.
+ */
+static bool epoll_target_supported_standalone(const fd_entry_t *snap)
+{
+    if (snap->path_poll_capable)
+        return true;
+    struct stat st;
+    if (fstat(snap->host_fd, &st) == 0 && S_ISREG(st.st_mode))
+        return false;
+    int kq = kqueue();
+    if (kq < 0)
+        return true;
+    bool ok = epoll_target_pollable(kq, snap->host_fd);
+    close(kq);
+    return ok;
+}
+
+/* EINVAL unless the target has no poll method, which the kernel decides first.
+ */
+static int64_t epoll_einval_unless_unsupported(const fd_entry_t *snap)
+{
+    return epoll_target_supported_standalone(snap) ? -LINUX_EINVAL
+                                                   : -LINUX_EPERM;
+}
+
 int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 {
     /* The event is copied before anything else, because that is where the
@@ -1388,15 +1486,6 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     if (ref_err < 0)
         return ref_err;
 
-    /* Pin the instance so a concurrent close(epfd) cannot free it under us. */
-    epoll_instance_t *inst = epoll_instance_acquire(epfd);
-    if (!inst) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_EINVAL;
-    }
-
-    int64_t ret;
-
     /* Validate the target fd and read its persistent host fd in a single
      * fd_lock snapshot, so the kqueue knote ident is taken from the same entry
      * that was validated. A kqueue knote is keyed by the fd number and the
@@ -1406,12 +1495,31 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * under one fd_lock. The snapshot's generation then guards the cross-call
      * ABA below. Result mapping uses udata (the guest fd), so the ident only
      * needs to stay open and refer to the same open file description.
+     *
+     * Ahead of the instance lookup because do_epoll_ctl reaches both fdgets
+     * first, and because the target decides EPERM ahead of every EINVAL below.
      */
     fd_entry_t target_snap;
     if (!fd_snapshot(fd, &target_snap)) {
-        ret = -LINUX_EBADF;
-        goto out;
+        host_fd_ref_close(&epoll_ref);
+        return -LINUX_EBADF;
     }
+
+    /* Pin the instance so a concurrent close(epfd) cannot free it under us.
+     *
+     * A target with no poll method outranks this EINVAL: do_epoll_ctl tests
+     * file_can_poll before is_file_epoll. Measured on Linux 6.12,
+     * epoll_ctl(plain_file, ADD, plain_file, &ev) is EPERM while the same call
+     * on a pipe is EINVAL.
+     */
+    epoll_instance_t *inst = epoll_instance_acquire(epfd);
+    if (!inst) {
+        int64_t err = epoll_einval_unless_unsupported(&target_snap);
+        host_fd_ref_close(&epoll_ref);
+        return err;
+    }
+
+    int64_t ret;
 
     /* The op and the pairing, in that order and here rather than at the top,
      * because the kernel decides both inside do_epoll_ctl after both fdgets:
@@ -1425,7 +1533,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      */
     if (op != LINUX_EPOLL_CTL_ADD && op != LINUX_EPOLL_CTL_DEL &&
         op != LINUX_EPOLL_CTL_MOD) {
-        ret = -LINUX_EINVAL;
+        ret = epoll_einval_unless_unsupported(&target_snap);
         goto out;
     }
     if (fd == epfd) {
@@ -1458,34 +1566,64 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     }
 
     if (op == LINUX_EPOLL_CTL_DEL) {
-        /* Linux returns ENOENT when removing an unregistered fd */
+        /* Linux returns ENOENT when removing an unregistered fd, but it tests
+         * the target's poll support before it looks at the operation, so a
+         * target it would never have accepted answers EPERM here too. Only the
+         * unregistered path pays for the check.
+         */
         if (!reg->active) {
-            ret = -LINUX_ENOENT;
+            ret = epoll_target_supported(epoll_ref.fd, &target_snap)
+                      ? -LINUX_ENOENT
+                      : -LINUX_EPERM;
             goto out_locked;
         }
 
         /* Remove all filters for this fd. EPOLLRDHUP alone registers
          * EVFILT_READ (see ADD path), so check both EPOLLIN and EPOLLRDHUP.
+         * Each delete goes in its own kevent call for the reason the MOD path
+         * below already states: a batched call with a NULL eventlist stops at
+         * the first failed change and leaks the survivor, and events names a
+         * filter that may not be registered -- a dropped write filter, or the
+         * one EPOLLONESHOT already removed. Errors are ignored either way,
+         * since the fd may already be closed.
          */
-        struct kevent changes[2];
-        int nchanges = 0;
         {
+            struct kevent del;
             if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-                EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ,
-                       EV_DELETE, 0, 0, NULL);
-                nchanges++;
+                EV_SET(&del, target_host_fd, EVFILT_READ, EV_DELETE, 0, 0,
+                       NULL);
+                kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
             }
             if (reg->events & LINUX_EPOLLOUT) {
-                EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE,
-                       EV_DELETE, 0, 0, NULL);
-                nchanges++;
+                EV_SET(&del, target_host_fd, EVFILT_WRITE, EV_DELETE, 0, 0,
+                       NULL);
+                kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
             }
-            /* Ignore errors from EV_DELETE (fd might already be closed) */
-            kevent(epoll_ref.fd, changes, nchanges, NULL, 0, NULL);
             epoll_reg_deactivate_locked(inst, reg);
         }
         ret = 0;
         goto out_locked;
+    }
+
+    /* The plain-file half of epoll_target_supported, inline so an ADD does not
+     * pay for the kqueue probe: the registration below already asks kqueue the
+     * rest of the question.
+     *
+     * do_epoll_ctl decides poll support earlier than this position alone
+     * suggests: file_can_poll runs ahead of is_file_epoll and ahead of the op
+     * switch, not merely ahead of the registration lookup. Everything it
+     * outranks that this function answers sooner is answered by
+     * epoll_einval_unless_unsupported at those two sites, so by the time a call
+     * reaches here the only checks left below are the EEXIST and ENOENT this
+     * position covers.
+     */
+    if (!target_snap.path_poll_capable) {
+        struct stat target_st;
+        if (fstat(target_host_fd, &target_st) == 0 &&
+            S_ISREG(target_st.st_mode)) {
+            ret = -LINUX_EPERM;
+            goto out_locked;
+        }
     }
 
     /* Linux semantics: ADD fails with EEXIST if already registered; MOD fails
@@ -1497,7 +1635,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         goto out_locked;
     }
     if (op == LINUX_EPOLL_CTL_MOD && !reg->active && !reg->oneshot_armed) {
-        ret = -LINUX_ENOENT;
+        ret = epoll_target_supported(epoll_ref.fd, &target_snap) ? -LINUX_ENOENT
+                                                                 : -LINUX_EPERM;
         goto out_locked;
     }
 
@@ -1565,9 +1704,63 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         nchanges++;
     }
 
-    if (nchanges > 0) {
-        if (kevent(epoll_ref.fd, changes, nchanges, NULL, 0, NULL) < 0) {
+    /* A mask naming no readiness filter registers nothing, so the loop below
+     * never asks kqueue whether the target takes a knote at all. Linux tests
+     * poll support before it reads the event, and answers EPERM for a directory
+     * or a character device whatever the mask says, so ask here.
+     */
+    if (nchanges == 0 && !epoll_target_pollable(epoll_ref.fd, target_host_fd)) {
+        ret = -LINUX_EPERM;
+        goto out_locked;
+    }
+
+    /* Linux decides EPERM from the target alone, never from the requested
+     * events: epoll_ctl(2) accepts EPOLLOUT on a timerfd or on a nested epoll
+     * fd, neither of which ever reports itself writable. Both are kqueues here,
+     * and kqueue refuses EVFILT_WRITE on a kqueue with EINVAL, so register one
+     * filter per call and drop a refused write filter instead of failing the
+     * whole ADD. A batched call would also stop at the first failed change and
+     * leave the survivor registered. EINVAL on the read filter, or on a write
+     * filter whose target takes no knote at all, is the EPERM case.
+     *
+     * A target the path already settled is never that case: /dev/random is
+     * pollable on Linux and takes no knote here, so its refusal drops the
+     * filter the way a kqueue's write filter does. Read readiness then has no
+     * knote to arrive on, which always_readable carries to the wait.
+     *
+     * An error that is not EINVAL abandons a registration this loop may have
+     * already armed filters for, each carrying the udata of an entry the bail
+     * never activates. Undo them: sys_epoll_pwait does reap such a knote, but
+     * only after it has woken the wait and counted the event, so the call
+     * returns 0 ahead of its timeout. MOD arrives here with its old filters
+     * already deleted, so this is also what keeps a half-failed re-registration
+     * from leaving one behind. The EPERM arm below needs no undo: it is
+     * reachable only while nothing is armed, since a refused read filter is the
+     * first change and a refused write filter without a registered read one
+     * means the mask named no read filter at all.
+     */
+    bool read_registered = false;
+    bool read_refused = false;
+    for (int i = 0; i < nchanges; i++) {
+        if (kevent(epoll_ref.fd, &changes[i], 1, NULL, 0, NULL) == 0) {
+            if (changes[i].filter == EVFILT_READ)
+                read_registered = true;
+            continue;
+        }
+        if (errno != EINVAL) {
             ret = linux_errno();
+            epoll_undo_changes(epoll_ref.fd, changes, i);
+            goto out_locked;
+        }
+        if (target_snap.path_poll_capable) {
+            if (changes[i].filter == EVFILT_READ)
+                read_refused = true;
+            continue;
+        }
+        if (changes[i].filter == EVFILT_READ ||
+            !(read_registered ||
+              epoll_target_pollable(epoll_ref.fd, target_host_fd))) {
+            ret = -LINUX_EPERM;
             goto out_locked;
         }
     }
@@ -1588,9 +1781,15 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     else if (!target_pty_master && reg->pty_master &&
              inst->pty_master_count > 0)
         inst->pty_master_count--;
+    if (read_refused && !reg->always_readable)
+        inst->always_readable_count++;
+    else if (!read_refused && reg->always_readable &&
+             inst->always_readable_count > 0)
+        inst->always_readable_count--;
     reg->active = true;
     reg->oneshot_armed = false;
     reg->pty_master = target_pty_master;
+    reg->always_readable = read_refused;
 
     ret = 0;
 
@@ -1600,6 +1799,18 @@ out:
     host_fd_ref_close(&epoll_ref);
     epoll_instance_release(inst);
     return ret;
+}
+
+/* Whether this instance holds a registration whose read readiness kqueue can
+ * never deliver. Same shape as a pending hangup: the wait must not block to its
+ * deadline waiting for an event that cannot arrive.
+ */
+static bool epoll_has_always_readable(epoll_instance_t *inst)
+{
+    pthread_mutex_lock(&inst->lock);
+    bool any = inst->always_readable_count > 0;
+    pthread_mutex_unlock(&inst->lock);
+    return any;
 }
 
 /* Collect guest fds registered in this instance whose pty master has hung up.
@@ -1734,7 +1945,8 @@ int64_t sys_epoll_pwait(guest_t *g,
     int hup_probe;
     uint64_t hup_probe_gen;
     bool hup_ready =
-        epoll_collect_hung_up(inst, &hup_probe, &hup_probe_gen, 1) > 0;
+        epoll_collect_hung_up(inst, &hup_probe, &hup_probe_gen, 1) > 0 ||
+        epoll_has_always_readable(inst);
     struct timespec zero_ts = {.tv_sec = 0, .tv_nsec = 0};
 
     /* Collect kqueue events. For indefinite waits, use a short timeout and loop
@@ -1881,6 +2093,33 @@ int64_t sys_epoll_pwait(guest_t *g,
         out[idx]._pad = 0;
         out[idx].data = reg->data;
         epoll_merge_event(&out[idx], &kevents[i], reg);
+    }
+
+    /* Stamp EPOLLIN for the registrations whose read readiness kqueue cannot
+     * deliver. /dev/random is the only such target: Linux reports it readable
+     * once the pool is seeded and from then on always, so the answer is a
+     * property of the registration rather than something to sample. Unlike the
+     * hangup scan below this reads regs[] under the lock it already holds, so
+     * there is no unlocked snapshot to re-verify against a generation.
+     */
+    if (inst->always_readable_count > 0) {
+        for (int gfd = 0; gfd < FD_TABLE_SIZE && nout < maxevents; gfd++) {
+            epoll_reg_t *areg = &inst->regs[gfd];
+            if (!areg->always_readable || !areg->active || areg->oneshot_armed)
+                continue;
+            if (!(areg->events & LINUX_EPOLLIN))
+                continue;
+            int idx = out_index[gfd];
+            if (idx < 0) {
+                idx = nout++;
+                out_index[gfd] = (int16_t) idx;
+                out_gfds[idx] = gfd;
+                out[idx].events = 0;
+                out[idx]._pad = 0;
+                out[idx].data = areg->data;
+            }
+            out[idx].events |= LINUX_EPOLLIN;
+        }
     }
 
     /* Stamp EPOLLHUP for the masters the host cannot report on. Linux delivers

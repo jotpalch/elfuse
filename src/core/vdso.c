@@ -34,6 +34,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "core/vdso.h"
 #include "core/elf.h"
@@ -483,8 +484,8 @@ static uint32_t enc_cmp_w_imm12(unsigned rn, uint32_t imm12)
 }
 
 /* LDAR Wt, [Xn] -- acquire load of a 32-bit word. Pairs with the host's
- * __atomic_store_n(initialized, ..., __ATOMIC_RELEASE) so that observing
- * initialized != 0 also makes the prior anchor stores visible.
+ * atomic_store_explicit(initialized, ..., memory_order_release) so that
+ * observing initialized != 0 also makes the prior anchor stores visible.
  */
 static uint32_t enc_ldar_w(unsigned rt, unsigned rn)
 {
@@ -1249,7 +1250,7 @@ void vdso_seed_anchor(guest_t *g,
     uint8_t *page = vdso_host_page(g);
     if (!page)
         return;
-    uint32_t *initialized = (uint32_t *) (page + VDSO_OFF_VVAR);
+    _Atomic uint32_t *initialized = (_Atomic uint32_t *) (page + VDSO_OFF_VVAR);
     uint8_t *vvar = page + VDSO_OFF_VVAR;
 
     /* Seqlock publish. Handles both initial seeding (seq 0 -> 1 -> 2) and
@@ -1269,14 +1270,14 @@ void vdso_seed_anchor(guest_t *g,
      * MONO and REAL anchor pairs are written together under the same generation
      * so a fast-path caller for either clockid sees a consistent pair.
      */
-    uint32_t cur = __atomic_load_n(initialized, __ATOMIC_ACQUIRE);
+    uint32_t cur = atomic_load_explicit(initialized, memory_order_acquire);
     if (cur & 1u)
         return; /* concurrent writer holds the generation */
 
     uint32_t reserve = cur + 1u;
-    if (!__atomic_compare_exchange_n(initialized, &cur, reserve,
-                                     /* weak */ false, __ATOMIC_ACQUIRE,
-                                     __ATOMIC_RELAXED))
+    if (!atomic_compare_exchange_strong_explicit(initialized, &cur, reserve,
+                                                 memory_order_acquire,
+                                                 memory_order_relaxed))
         return; /* lost the race against another publisher */
 
     /* Store-store barrier between the CAS-bump (odd publish) and the RELAXED
@@ -1284,34 +1285,34 @@ void vdso_seed_anchor(guest_t *g,
      * CPU could otherwise observe a field store before the odd seq becomes
      * visible, allowing a reader whose snapshot LDAR still sees the old even to
      * read mid-write fields and then recheck with the same old even (snapshot
-     * == recheck, race undetected). __atomic_thread_fence(__ATOMIC_RELEASE)
+     * == recheck, race undetected). atomic_thread_fence(memory_order_release)
      * lowers to DMB ISH on AArch64 and orders the CAS odd-publish ahead of
      * every subsequent field store from every observer's perspective.
      */
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    atomic_thread_fence(memory_order_release);
 
     /* RELAXED atomic stores: the trailing release-store on seq orders all these
      * field stores before any reader's acquire-load of the next even seq. Using
-     * __atomic_store_n (rather than plain assignment) keeps the accesses
+     * atomic_store_explicit (rather than plain assignment) keeps the accesses
      * well-defined under the C abstract machine even though the compiler will
      * lower them to ordinary aligned 64-bit stores.
      */
-    uint64_t *vvar64 = (uint64_t *) vvar;
-    __atomic_store_n(vvar64 + VVAR_OFF_ANCHOR_CNTVCT / 8, guest_cntvct,
-                     __ATOMIC_RELAXED);
-    __atomic_store_n(vvar64 + VVAR_OFF_ANCHOR_MONO_SEC / 8, (uint64_t) mono_sec,
-                     __ATOMIC_RELAXED);
-    __atomic_store_n(vvar64 + VVAR_OFF_ANCHOR_MONO_NSEC / 8,
-                     (uint64_t) mono_nsec, __ATOMIC_RELAXED);
-    __atomic_store_n(vvar64 + VVAR_OFF_ANCHOR_REAL_SEC / 8, (uint64_t) real_sec,
-                     __ATOMIC_RELAXED);
-    __atomic_store_n(vvar64 + VVAR_OFF_ANCHOR_REAL_NSEC / 8,
-                     (uint64_t) real_nsec, __ATOMIC_RELAXED);
+    _Atomic uint64_t *vvar64 = (_Atomic uint64_t *) vvar;
+    atomic_store_explicit(&vvar64[VVAR_OFF_ANCHOR_CNTVCT / 8], guest_cntvct,
+                          memory_order_relaxed);
+    atomic_store_explicit(&vvar64[VVAR_OFF_ANCHOR_MONO_SEC / 8],
+                          (uint64_t) mono_sec, memory_order_relaxed);
+    atomic_store_explicit(&vvar64[VVAR_OFF_ANCHOR_MONO_NSEC / 8],
+                          (uint64_t) mono_nsec, memory_order_relaxed);
+    atomic_store_explicit(&vvar64[VVAR_OFF_ANCHOR_REAL_SEC / 8],
+                          (uint64_t) real_sec, memory_order_relaxed);
+    atomic_store_explicit(&vvar64[VVAR_OFF_ANCHOR_REAL_NSEC / 8],
+                          (uint64_t) real_nsec, memory_order_relaxed);
 
     /* Release-store the next even generation. Pairs with the trampoline's
      * snapshot LDAR (initial check) and recheck LDAR (race detection).
      */
-    __atomic_store_n(initialized, reserve + 1u, __ATOMIC_RELEASE);
+    atomic_store_explicit(initialized, reserve + 1u, memory_order_release);
 }
 
 uint64_t vdso_clock_gettime_svc_pc(void)
@@ -1329,8 +1330,9 @@ uint64_t vdso_gettimeofday_svc_pc(void)
  */
 static uint32_t vvar_seq_acquire(const uint8_t *page)
 {
-    return __atomic_load_n((const uint32_t *) (page + VDSO_OFF_VVAR),
-                           __ATOMIC_ACQUIRE);
+    return atomic_load_explicit(
+        (const _Atomic uint32_t *) (page + VDSO_OFF_VVAR),
+        memory_order_acquire);
 }
 
 bool vdso_anchor_is_seeded(guest_t *g)
@@ -1352,15 +1354,15 @@ void vdso_attention_or(guest_t *g, uint32_t bits)
     uint8_t *page = vdso_host_page(g);
     if (!page)
         return;
-    uint32_t *attention =
-        (uint32_t *) (page + VDSO_OFF_VVAR + VVAR_OFF_ATTENTION);
+    _Atomic uint32_t *attention =
+        (_Atomic uint32_t *) (page + VDSO_OFF_VVAR + VVAR_OFF_ATTENTION);
 
     /* SEQ_CST mirrors shim_globals_attn_or: the EL0 fast paths read this word
      * without going through HVC, so a reader that LDARs attn=0 must not observe
      * later publish_creds stores. Release-acquire alone only orders the forward
      * direction.
      */
-    __atomic_fetch_or(attention, bits, __ATOMIC_SEQ_CST);
+    atomic_fetch_or_explicit(attention, bits, memory_order_seq_cst);
 }
 
 void vdso_attention_and(guest_t *g, uint32_t mask)
@@ -1368,9 +1370,9 @@ void vdso_attention_and(guest_t *g, uint32_t mask)
     uint8_t *page = vdso_host_page(g);
     if (!page)
         return;
-    uint32_t *attention =
-        (uint32_t *) (page + VDSO_OFF_VVAR + VVAR_OFF_ATTENTION);
-    __atomic_fetch_and(attention, mask, __ATOMIC_RELEASE);
+    _Atomic uint32_t *attention =
+        (_Atomic uint32_t *) (page + VDSO_OFF_VVAR + VVAR_OFF_ATTENTION);
+    atomic_fetch_and_explicit(attention, mask, memory_order_release);
 }
 
 /* Anchor fields read together under one seqlock generation. */
@@ -1402,20 +1404,21 @@ static bool vvar_snapshot_anchor(const uint8_t *page, vvar_anchor_t *out)
     if (snap == 0 || (snap & 1u))
         return false;
 
-    const uint64_t *vvar64 = (const uint64_t *) (page + VDSO_OFF_VVAR);
+    const _Atomic uint64_t *vvar64 =
+        (const _Atomic uint64_t *) (page + VDSO_OFF_VVAR);
     vvar_anchor_t a;
-    a.cntvct =
-        __atomic_load_n(vvar64 + VVAR_OFF_ANCHOR_CNTVCT / 8, __ATOMIC_RELAXED);
-    a.mono_sec = (int64_t) __atomic_load_n(
-        vvar64 + VVAR_OFF_ANCHOR_MONO_SEC / 8, __ATOMIC_RELAXED);
-    a.mono_nsec = (int64_t) __atomic_load_n(
-        vvar64 + VVAR_OFF_ANCHOR_MONO_NSEC / 8, __ATOMIC_RELAXED);
-    a.real_sec = (int64_t) __atomic_load_n(
-        vvar64 + VVAR_OFF_ANCHOR_REAL_SEC / 8, __ATOMIC_RELAXED);
-    a.real_nsec = (int64_t) __atomic_load_n(
-        vvar64 + VVAR_OFF_ANCHOR_REAL_NSEC / 8, __ATOMIC_RELAXED);
+    a.cntvct = atomic_load_explicit(&vvar64[VVAR_OFF_ANCHOR_CNTVCT / 8],
+                                    memory_order_relaxed);
+    a.mono_sec = (int64_t) atomic_load_explicit(
+        &vvar64[VVAR_OFF_ANCHOR_MONO_SEC / 8], memory_order_relaxed);
+    a.mono_nsec = (int64_t) atomic_load_explicit(
+        &vvar64[VVAR_OFF_ANCHOR_MONO_NSEC / 8], memory_order_relaxed);
+    a.real_sec = (int64_t) atomic_load_explicit(
+        &vvar64[VVAR_OFF_ANCHOR_REAL_SEC / 8], memory_order_relaxed);
+    a.real_nsec = (int64_t) atomic_load_explicit(
+        &vvar64[VVAR_OFF_ANCHOR_REAL_NSEC / 8], memory_order_relaxed);
 
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    atomic_thread_fence(memory_order_acquire);
     if (vvar_seq_acquire(page) != snap)
         return false; /* host refresher raced the field reads */
 

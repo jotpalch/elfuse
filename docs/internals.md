@@ -112,6 +112,7 @@ Key files:
 | `src/runtime/forkipc.c`, `fork-state.c` | `fork`/`clone` state transfer over the fork IPC channel |
 | `src/runtime/thread.c`, `futex.c` | guest thread table, futex wait queues |
 | `src/runtime/procemu.c` | `/proc`, `/dev`, and selected pseudo-files |
+| `src/runtime/usb-sysfs.c` | synthetic `/dev/bus/usb` and `/sys/bus/usb` trees from the IOKit registry |
 | `src/runtime/proctitle.c` | argv / comm rewriting for `prctl PR_SET_NAME` |
 | `src/debug/gdbstub.c`, `gdbstub-rsp.c`, `gdbstub-reg.c` | GDB RSP stub |
 
@@ -602,6 +603,7 @@ waiter enqueue, so the compare-and-wait is a single critical section.
 | Futex wait queues | `pthread_mutex` (per bucket) | `src/runtime/futex.c` |
 | FUSE (sessions, file/dir state) | global `fuse_lock` + per-session `session->lock` | `src/syscall/fuse.c` |
 | Sysroot snapshot | `pthread_mutex` | `src/syscall/proc-state.c` |
+| Synthetic USB tree (scratch dirs + device model) | `usb_lock` (leaf) | `src/runtime/usb-sysfs.c` |
 
 Lock ordering is documented inline in those files
 (`mmap_lock` is order 1, `fd_lock` is order 3, `sfd_lock` is order 5a)
@@ -951,8 +953,162 @@ listings refresh only when a new directory is opened. The synthetic
 cpumask files, and `cpuN` directories are captured on first access and then
 remain fixed.
 
+### Synthetic USB Device Tree
+
+`src/runtime/usb-sysfs.c` materializes two more scratch-directory trees,
+built from an IOKit enumeration of the USB registry that opens no device:
+`/sys/bus/usb/devices` and `/dev/bus/usb`. Device directories are named
+`<bus>-<ports>` (for example `2-1.4`), interface directories
+`<bus>-<ports>:<config>.<interface>`, following the Linux sysfs layout that
+libusb and nusb walk. `busnum` comes from the IOKit locationID's top byte
+plus one (macOS numbers controllers from 0, Linux busses from 1), `devnum`
+from the device's USB address, and the port path from the locationID
+nibbles. Each device directory carries the attribute
+files those enumerators read (`busnum`, `devnum`, `idVendor`, `idProduct`,
+`speed`, the `manufacturer` / `product` / `serial` strings when the device
+supplies them, the `dev` major:minor, and the rest of the descriptor
+fields), a `uevent` file, a `subsystem` symlink, and the binary
+`descriptors` blob.
+
+Two invariants matter to consumers. The `descriptors` attribute and the
+matching `/dev/bus/usb/BBB/DDD` node read byte-identically, because both
+serve one stored blob per device -- the rule Linux keeps between sysfs and
+the usbfs `read()` view. And `statfs` / `fstatfs` on `/sys` paths report
+`SYSFS_MAGIC`, without which libudev refuses to trust the tree and libusb
+falls back to a usbfs directory scan.
+
+The `/dev/bus/usb/BBB/DDD` nodes are 0444 placeholder files on disk (the
+`/dev/pts` placeholder pattern); the stat intercept reports them as
+character devices, major 189, minor `(bus - 1) * 128 + (dev - 1)`, and the
+open intercept diverts an open away from the placeholder. Opening a node
+serves the shared descriptors blob read-only; a writable open reports
+`EACCES`.
+
+One layout deviation is deliberate: the `/sys/bus/usb/devices` entries are
+real directories, not symlinks into `/sys/devices/...`, so `realpath()` of
+an entry canonicalizes to itself. libusb opens attributes relative to the
+entry and nusb canonicalizes the entry path; both tolerate this.
+
+The tree follows the `/sys/devices/system/cpu` one-shot rule: it is built
+lazily under `usb_lock` on first access and then stays fixed for the
+process. Hotplug support, once the uevent layer can observe attach and
+detach, would discard the tree so that the next access re-enumerates; until
+then a replugged device is not picked up within a run.
+
+A second, smaller deviation is in `/dev/bus/usb`: the device nodes are
+placeholder files, so `getdents64` reports them with `d_type` `DT_REG`
+where Linux reports `DT_CHR`. `stat()` is correct -- the intercept fills
+`S_IFCHR` with major 189 and the right minor, which is what libusb, nusb
+and `lsusb` consult -- so only a scanner that filters on `d_type` alone,
+without ever calling `stat`, would skip the nodes. No such consumer is
+known; creating real character devices needs privileges elfuse does not
+ask for, so the placeholder stays and the deviation is recorded here
+rather than papered over.
+
+One boundary is worth stating plainly: there are no `usbN` root-hub
+entries. macOS publishes no root hub as a USB device -- the registry match
+returns downstream devices only -- so the tree carries no bus entry and no
+parent link from a device up to it. Enumeration is unaffected (libusb
+leaves the parent NULL, nusb skips port-less names), but topology is: a
+`lsusb -t` listing shows the devices without the bus rows above them.
+
+The `configuration` attribute is the other one. It holds the string named
+by the active configuration's `iConfiguration`, and a string descriptor is
+fetched over an ep0 control transfer on an open device -- which this layer
+does not do. IOKit does not offer a way around it: an `IOUSBHostDevice`
+registry entry publishes `iManufacturer`, `iProduct` and `iSerialNumber`
+alongside the three strings the family caches for them, but no
+`iConfiguration` and no configuration string. So the file is emitted
+empty, and that is not a claim the configuration has no string: Linux's
+`usb_cache_string` returns NULL "if the index is 0 **or the string could
+not be read**", and `configuration_show` emits nothing in both cases, so
+an empty `configuration` on Linux means "no cached string" and every
+device here takes the second of those two routes to it. The file stays
+present rather than being omitted, because `dev_attr_grp` carries no
+`.is_visible` hook and so every Linux USB device has all four of
+`bNumInterfaces`, `bmAttributes`, `bMaxPower` and `configuration`; a value
+the kernel cannot supply is a zero-length read, never an `ENOENT`. The
+same rule is why those first three are emitted even for a device whose
+descriptor blob carries no usable configuration at all. The fidelity gap
+that remains is narrow and one-directional: a device whose
+`iConfiguration` is non-zero and whose string descriptor is readable shows
+that string on Linux and shows nothing here.
+
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
-`src/syscall/fs.c`, `src/syscall/proc-state.c`.
+`src/syscall/fs.c`, `src/syscall/proc-state.c`, `src/runtime/usb-sysfs.c`.
+
+### Limits Of The IOKit Mapping
+
+This tree enumerates devices; the pieces that follow open them and
+move data. It is worth stating where the approach stops, because three
+of the limits are macOS policy that no amount of translation moves, and
+the rest cost something permanent. The short version: the layer is
+complete for devices macOS does not claim, honest but limited for the
+ones it does, and structurally unable to present bus topology.
+
+Driver arbitration decides which devices are reachable at all. Once a
+class driver matches an interface, `USBInterfaceOpen` returns
+`kIOReturnExclusiveAccess`, and an unprivileged process has no way past
+it. On the ESP32-S3 used to develop this: interface 0 (CDC control) is
+held by `AppleUSBACMControl` and always refuses, interface 1 (CDC data)
+refuses whenever anything holds a `/dev/cu.usbmodem*` node, and
+interface 2 (a vendor JTAG class with no matching driver) opens freely.
+The documented escape, `USBDeviceReEnumerate` with
+`kUSBReEnumerateCaptureDeviceMask`, needs root or the
+`com.apple.vm.device-access` entitlement; an unentitled non-root caller
+gets a success return that changes nothing, the registry ID and the
+driver binding both intact. Mass storage is excluded from capture
+outright. So the layer serves vendor and bulk devices completely, while
+CDC and HID stay reachable only through the interfaces macOS already
+exposes -- `/dev/cu.*` and `IOHIDManager`. This is why the ttyACM /
+ttyUSB aliasing is a companion to the USB layer rather than a workaround
+for it.
+
+Cancellation granularity differs in a way that costs throughput.
+`USBDEVFS_DISCARDURB` cancels one URB; IOKit's `AbortPipe` cancels
+everything outstanding on the pipe. Preserving the Linux semantics means
+queueing inside elfuse and handing IOKit one transfer per endpoint at a
+time, which gives up the pipelining a bulk-heavy workload depends on.
+The alternative -- report the collateral cancellations as `-ECONNRESET`
+and let the guest resubmit, which libusb and nusb both do -- lets a
+cancel on one transfer disturb unrelated ones. Neither choice is free,
+and no macOS API removes the tradeoff.
+
+Reset is an unplug. `ResetDevice` has been a no-op since OS X 10.11, so
+the only real reset is `USBDeviceReEnumerate`, which tears down the user
+client and re-runs matching. Linux `USBDEVFS_RESET` keeps the fd valid
+and the device numbering stable. Emulating it means holding `busnum` and
+`devnum` steady across a registry identity that changed underneath,
+waiting for the re-attach, and diffing descriptors afterward -- and
+distinguishing "came back different" from "never came back", since
+firmware update flows (DFU) are both the workflow that leans on reset
+and the one where the descriptors legitimately change.
+
+Identity is topological, not device-based. A `locationID` encodes the
+port path, so unplugging one device and plugging another into the same
+port yields the same value. The enumeration cross-checks `idVendor`,
+`idProduct` and the serial string against the cached model and answers
+`-ENODEV` on a mismatch, which is safe but not complete: the model is a
+one-shot snapshot with no hotplug observer, so a device attached mid-run
+is unusable until the process restarts. Real hotplug would rewrite IOKit
+attach and detach notifications as uevents on the netlink socket -- a
+fair amount of machinery for something libusb tolerates the absence of.
+
+Bus topology has no macOS source, the boundary noted above: macOS
+publishes no root hub as a USB device, so there is no `usbN` entry, no
+parent link, and `lsusb -t` loses its bus rows. A plausible root hub
+could be synthesized, but it would be a device no registry entry backs,
+and its `maxchild`, port numbering and `/sys/bus/usb/devices/usb1` node
+would be invention too. The tree stays short rather than carrying a
+fabricated node.
+
+Two narrower ones. Isochronous transfers need explicit frame scheduling
+through `GetBusFrameNumber`, where usbfs lets `URB_ISO_ASAP` hand the
+timing to the controller, so audio and video capture do not map cleanly.
+And the permission models do not correspond: Linux gates usbfs through
+udev rules and file permissions, macOS gates IOKit through driver
+matching and entitlements, and there is no single spelling of "let this
+program use this device" that means the same on both.
 
 ## Path Resolution
 

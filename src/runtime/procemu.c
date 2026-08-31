@@ -63,6 +63,7 @@
 #include "debug/log.h"
 #include "runtime/procemu.h"
 #include "runtime/procemu-internal.h"
+#include "runtime/usb-sysfs.h"
 #include "core/rosetta.h"
 #include "runtime/thread.h"
 
@@ -372,7 +373,8 @@ static int oom_score_adj_to_adj(int v)
 
 static int proc_oom_format_value(int kind, char *buf, size_t bufsz)
 {
-    int score_adj = atomic_load(&oom_score_adj_value);
+    int score_adj =
+        atomic_load_explicit(&oom_score_adj_value, memory_order_relaxed);
     int val = 0;
     if (kind == OOM_PATH_SCORE_ADJ)
         val = score_adj;
@@ -1227,6 +1229,23 @@ static int proc_parse_int_write(const void *buf, size_t count, int *out)
 
 int proc_open_dir_fd(const char *path, int linux_flags)
 {
+    /* Linux refuses write access to a directory in open(2) itself: O_WRONLY,
+     * O_RDWR, O_CREAT or O_TRUNC against a directory is EISDIR, decided before
+     * the descriptor exists. Synthesizing the directory does not exempt it -- a
+     * guest opening /dev/bus/usb or /proc/self for write must be told EISDIR
+     * the way a real mount would, not handed a readable descriptor whose first
+     * write then fails with something else.
+     *
+     * O_PATH is the documented exception: it opens the object for name
+     * operations only, and the access mode is ignored rather than checked.
+     */
+    if (!(linux_flags & LINUX_O_PATH) &&
+        ((linux_flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY ||
+         (linux_flags & (LINUX_O_CREAT | LINUX_O_TRUNC)))) {
+        errno = EISDIR;
+        return -1;
+    }
+
     int oflags = O_RDONLY | O_DIRECTORY;
 
     if (linux_flags & LINUX_O_CLOEXEC)
@@ -1691,7 +1710,7 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
 {
     proc_task_collect_ctx_t *c = arg;
     if (c->ntids < MAX_THREADS)
-        c->tids[c->ntids++] = t->guest_tid;
+        c->tids[c->ntids++] = thread_tid(t);
 }
 
 
@@ -3047,11 +3066,23 @@ int proc_intercept_open(const guest_t *g,
         }
     }
 
+    /* /dev/bus/usb and /sys/bus/usb: synthetic USB trees from IOKit. */
+    {
+        int ufd = usb_sysfs_intercept_open(path, linux_flags, mode);
+        if (ufd != PROC_NOT_INTERCEPTED)
+            return ufd;
+    }
+
     return PROC_NOT_INTERCEPTED;
 }
 
 
 int proc_intercept_stat(const char *path, struct stat *st)
+{
+    return proc_intercept_stat_at(path, st, false);
+}
+
+int proc_intercept_stat_at(const char *path, struct stat *st, bool follow)
 {
     /* Intercept stat for /proc paths emulated via proc_intercept_open. Without
      * this, runtime libraries that probe a file's existence via stat() before
@@ -3195,7 +3226,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
         if (aliased < 0)
             return -1;
         if (aliased > 0)
-            return proc_intercept_stat(alias, st);
+            return proc_intercept_stat_at(alias, st, follow);
     }
 
     /* /proc/self/task and /proc/self/task/<tid> are directories */
@@ -3339,6 +3370,13 @@ int proc_intercept_stat(const char *path, struct stat *st)
         }
     }
 
+    /* /dev/bus/usb and /sys/bus/usb: synthetic USB trees from IOKit. */
+    {
+        int urc = usb_sysfs_intercept_stat(path, st, follow);
+        if (urc != PROC_NOT_INTERCEPTED)
+            return urc;
+    }
+
     return PROC_NOT_INTERCEPTED;
 }
 
@@ -3432,6 +3470,26 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
             return -1;
         }
 
+        /* Descriptors opened through the synthetic USB trees are backed by
+         * scratch dirs under /tmp; F_GETPATH would leak that host location, and
+         * consumers compare the magic-link target against the guest path they
+         * opened (systemd chase() rejects a syspath that does not start with
+         * /sys). Report the stamped guest spelling instead. Kept narrow (USB
+         * prefixes only) so the pty and shm reporting stays as it was.
+         */
+        {
+            fd_entry_t fd_snap;
+            if (fd_snapshot((int) n, &fd_snap) && fd_snap.proc_path[0] == '/' &&
+                (path_prefix_match(fd_snap.proc_path, "/sys", 4) ||
+                 path_prefix_match(fd_snap.proc_path, "/dev/bus", 8))) {
+                size_t plen = strlen(fd_snap.proc_path);
+                if (plen > bufsiz)
+                    plen = bufsiz;
+                memcpy(buf, fd_snap.proc_path, plen);
+                return (int) plen;
+            }
+        }
+
         char fdpath[MAXPATHLEN];
         if (fcntl(host_fd, F_GETPATH, fdpath) < 0) {
             errno = ENOENT;
@@ -3459,6 +3517,16 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
             len = bufsiz;
         memcpy(buf, report, len);
         return (int) len;
+    }
+
+    /* /dev/bus/usb and /sys/bus/usb entries are real dirs/files, never
+     * symlinks; answer EINVAL for existing paths rather than falling through to
+     * the host (where /sys does not exist and the error would be ENOENT).
+     */
+    {
+        int urc = usb_sysfs_intercept_readlink(path, buf, bufsiz);
+        if (urc != PROC_NOT_INTERCEPTED)
+            return urc;
     }
 
     return PROC_NOT_INTERCEPTED;
@@ -3608,7 +3676,8 @@ int proc_intercept_write(int guest_fd,
     if (!use_pwrite && lseek(host_fd, offset + (int64_t) count, SEEK_SET) < 0)
         goto unlock;
 
-    atomic_store(&oom_score_adj_value, score_adj);
+    atomic_store_explicit(&oom_score_adj_value, score_adj,
+                          memory_order_relaxed);
     proc_oom_refresh_live_fds_locked();
     *written_out = (ssize_t) count;
     rc = 1;

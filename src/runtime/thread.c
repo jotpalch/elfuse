@@ -104,7 +104,7 @@ static _Atomic bool exec_de_thread_active;
  */
 #define THREAD_FOR_EACH_ACTIVE(t) \
     THREAD_FOR_EACH (t)           \
-        if (__atomic_load_n(&t->active, __ATOMIC_RELAXED))
+        if (atomic_load_explicit(&t->active, memory_order_relaxed))
 
 /* Iterate active slots without holding thread_lock. Uses an acquire load on the
  * active flag so the lock-free observers in thread_tid_alive() and
@@ -112,7 +112,7 @@ static _Atomic bool exec_de_thread_active;
  */
 #define THREAD_FOR_EACH_ACTIVE_RELAXED(t) \
     THREAD_FOR_EACH (t)                   \
-        if (__atomic_load_n(&t->active, __ATOMIC_ACQUIRE))
+        if (atomic_load_explicit(&t->active, memory_order_acquire))
 
 /* Bitmask tracking allocated SP_EL1 slots. Bit N set = slot N in use.
  * MAX_THREADS=64 fits exactly in a uint64_t. Slot 0 is the main thread (top of
@@ -133,7 +133,7 @@ void thread_init(void)
     pthread_mutex_lock(&thread_lock);
     memset(thread_table, 0, sizeof(thread_table));
     sp_el1_allocated = 0;
-    atomic_store(&active_thread_count, 0);
+    atomic_store_explicit(&active_thread_count, 0, memory_order_relaxed);
     current_thread = NULL;
     pthread_mutex_unlock(&thread_lock);
 }
@@ -146,7 +146,7 @@ void thread_register_main(hv_vcpu_t vcpu,
     pthread_mutex_lock(&thread_lock);
 
     thread_entry_t *t = &thread_table[0];
-    __atomic_store_n(&t->guest_tid, tid, __ATOMIC_RELAXED);
+    atomic_store_explicit(&t->guest_tid, tid, memory_order_relaxed);
     t->vcpu = vcpu;
     t->vcpu_valid = true;
     t->vexit = vexit;
@@ -163,11 +163,11 @@ void thread_register_main(hv_vcpu_t vcpu,
      * this slot's initialized fields (see thread_pending_union,
      * thread_tid_alive).
      */
-    __atomic_store_n(&t->active, 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&t->active, 1, memory_order_release);
 
     /* Slot 0 is consumed by main thread */
     sp_el1_allocated = BIT64(0);
-    atomic_store(&active_thread_count, 1);
+    atomic_store_explicit(&active_thread_count, 1, memory_order_relaxed);
 
     pthread_mutex_unlock(&thread_lock);
 
@@ -175,8 +175,8 @@ void thread_register_main(hv_vcpu_t vcpu,
     current_thread = t;
 }
 
-/* Where thread_slot_clear starts its memset: just past the one word inside
- * tpending that a lock-free scan reads.
+/* Where thread_slot_clear starts its first memset: just past the one word
+ * inside tpending that a lock-free scan reads.
  */
 #define THREAD_SLOT_CLEAR_START           \
     (offsetof(thread_entry_t, tpending) + \
@@ -198,6 +198,8 @@ _Static_assert(THREAD_SLOT_KEPT(guest_tid),
                "guest_tid is cleared by the memset");
 _Static_assert(THREAD_SLOT_KEPT(tpending.pending),
                "tpending.pending is cleared by the memset");
+_Static_assert(THREAD_SLOT_KEPT(in_syscall),
+               "in_syscall is cleared by the memset");
 
 /* Clear a slot that thread_alloc is about to hand to a new thread.
  *
@@ -205,17 +207,18 @@ _Static_assert(THREAD_SLOT_KEPT(tpending.pending),
  * and each loads active and then a payload field with no lock in between, so
  * one of them can still be reading this slot after it went inactive and while
  * the recycle runs. Plain-writing any field they read is a data race, so the
- * four they touch are stored atomically and the memset skips them.
+ * five they touch are stored atomically and the memset skips them.
  */
 static void thread_slot_clear(thread_entry_t *t)
 {
-    __atomic_store_n(&t->active, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&t->blocked, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&t->guest_tid, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&t->tpending.pending, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&t->active, 0, memory_order_relaxed);
+    atomic_store_explicit(&t->blocked, 0, memory_order_relaxed);
+    atomic_store_explicit(&t->guest_tid, 0, memory_order_relaxed);
+    pending_store(&t->tpending.pending, 0);
+    atomic_store_explicit(&t->in_syscall, 0, memory_order_relaxed);
 
-    /* Everything past the scanned bitmask is lock-private: the rest of
-     * tpending, then the whole tail. One span covers both, padding included.
+    /* Everything past the scanned fields is lock-private: one span covers the
+     * rest of tpending and the whole tail, padding included.
      */
     memset((unsigned char *) t + THREAD_SLOT_CLEAR_START, 0,
            sizeof(*t) - THREAD_SLOT_CLEAR_START);
@@ -230,7 +233,7 @@ thread_entry_t *thread_alloc(int64_t tid,
     pthread_mutex_lock(&thread_lock);
 rescan:
     THREAD_FOR_EACH (t) {
-        if (__atomic_load_n(&t->active, __ATOMIC_RELAXED))
+        if (atomic_load_explicit(&t->active, memory_order_relaxed))
             continue;
 
         /* Skip slots where a tracer is still inside pthread_cond_wait on
@@ -273,8 +276,9 @@ rescan:
         thread_slot_clear(t);
         t->generation = next_generation;
         t->sp_el1_slot = -1; /* No SP_EL1 yet; thread_alloc_sp_el1 fills this */
-        t->in_syscall = -1;  /* Not in one; syscall_dispatch fills this */
-        __atomic_store_n(&t->guest_tid, tid, __ATOMIC_RELAXED);
+        /* Not in one; syscall_dispatch fills this */
+        atomic_store_explicit(&t->in_syscall, -1, memory_order_relaxed);
+        atomic_store_explicit(&t->guest_tid, tid, memory_order_relaxed);
         if (stack_start < stack_end) {
             t->stack_map_start = stack_start;
             t->stack_map_end = stack_end;
@@ -285,8 +289,9 @@ rescan:
         /* Release-store last so a lock-free scanner that observes active == 1
          * also sees the zeroed tpending / guest_tid set above.
          */
-        __atomic_store_n(&t->active, 1, __ATOMIC_RELEASE);
-        atomic_fetch_add(&active_thread_count, 1);
+        atomic_store_explicit(&t->active, 1, memory_order_release);
+        atomic_fetch_add_explicit(&active_thread_count, 1,
+                                  memory_order_relaxed);
         result = t;
         break;
     }
@@ -310,7 +315,8 @@ static void thread_free_sp_el1_locked(thread_entry_t *t)
 static void thread_ptrace_cleanup_locked(thread_entry_t *t)
 {
     if (!t->ptrace_conds_inited ||
-        __atomic_load_n(&t->active, __ATOMIC_RELAXED) || t->ptrace_waiters != 0)
+        atomic_load_explicit(&t->active, memory_order_relaxed) ||
+        t->ptrace_waiters != 0)
         return;
 
     pthread_cond_destroy(&t->ptrace_cond);
@@ -376,7 +382,7 @@ void thread_deactivate(thread_entry_t *t)
      * condvars, since broadcasting a destroyed condvar is undefined behavior.
      * Guard against double-deactivation: if already inactive, skip.
      */
-    if (!__atomic_load_n(&t->active, __ATOMIC_RELAXED)) {
+    if (!atomic_load_explicit(&t->active, memory_order_relaxed)) {
         pthread_mutex_unlock(&thread_lock);
         return;
     }
@@ -395,8 +401,8 @@ void thread_deactivate(thread_entry_t *t)
      * stores are still in flight. The joiner polls lock-free, so the mutex held
      * here provides no edge to it.
      */
-    __atomic_store_n(&t->active, 0, __ATOMIC_RELEASE);
-    atomic_fetch_sub(&active_thread_count, 1);
+    atomic_store_explicit(&t->active, 0, memory_order_release);
+    atomic_fetch_sub_explicit(&active_thread_count, 1, memory_order_relaxed);
 
     thread_fork_release_counted_locked(t);
 
@@ -423,7 +429,7 @@ thread_entry_t *thread_find(int64_t tid)
 
     pthread_mutex_lock(&thread_lock);
     THREAD_FOR_EACH_ACTIVE (t) {
-        if (t->guest_tid == tid) {
+        if (thread_tid(t) == tid) {
             result = t;
             break;
         }
@@ -436,7 +442,7 @@ thread_entry_t *thread_find(int64_t tid)
 thread_entry_t *thread_find_locked(int64_t tid)
 {
     THREAD_FOR_EACH_ACTIVE (t) {
-        if (t->guest_tid == tid)
+        if (thread_tid(t) == tid)
             return t;
     }
     return NULL;
@@ -451,7 +457,7 @@ uint64_t thread_pending_union(void)
      */
     uint64_t u = 0;
     THREAD_FOR_EACH_ACTIVE_RELAXED (t)
-        u |= __atomic_load_n(&t->tpending.pending, __ATOMIC_RELAXED);
+        u |= pending_load(&t->tpending.pending);
     return u;
 }
 
@@ -464,19 +470,20 @@ bool thread_tid_alive(int64_t tid)
      * on the next poll iteration (100ms later).
      */
     THREAD_FOR_EACH_ACTIVE_RELAXED (t)
-        if (__atomic_load_n(&t->guest_tid, __ATOMIC_RELAXED) == tid)
+        if (thread_tid(t) == tid)
             return true;
     return false;
 }
 
 int thread_active_count(void)
 {
-    return atomic_load(&active_thread_count);
+    return atomic_load_explicit(&active_thread_count, memory_order_relaxed);
 }
 
 int thread_is_single_active(void)
 {
-    return atomic_load(&active_thread_count) == 1;
+    return atomic_load_explicit(&active_thread_count, memory_order_relaxed) ==
+           1;
 }
 
 int thread_count_active_vm_clones(void)
@@ -541,15 +548,16 @@ static void thread_join_workers_mode(bool exec_mode)
 {
     /* Snapshot worker threads under the lock. The code needs the host_thread
      * handle and a way to check the active flag without re-locking. Storing the
-     * table entry pointer lets the loop use __atomic_load on active. Claim each
-     * joinable handle here (clear host_thread_needs_join) so a concurrent slot
-     * reuse in thread_alloc cannot join the same pthread twice. Unclaimed
-     * entries -- vm-clone children (created detached) and the main thread's
-     * slot when a worker drives teardown -- are still polled below so teardown
-     * waits for them to leave the guest, but their handle is never joined or
-     * detached. Entries a previous pass already detached (join_abandoned) are
-     * skipped outright: joining or detaching the same pthread twice is
-     * undefined, and main()'s join is followed by guest_destroy's internal one.
+     * table entry pointer lets the loop use atomic_load_explicit on active.
+     * Claim each joinable handle here (clear host_thread_needs_join) so a
+     * concurrent slot reuse in thread_alloc cannot join the same pthread twice.
+     * Unclaimed entries -- vm-clone children (created detached) and the main
+     * thread's slot when a worker drives teardown -- are still polled below so
+     * teardown waits for them to leave the guest, but their handle is never
+     * joined or detached. Entries a previous pass already detached
+     * (join_abandoned) are skipped outright: joining or detaching the same
+     * pthread twice is undefined, and main()'s join is followed by
+     * guest_destroy's internal one.
      */
     struct {
         pthread_t thr;
@@ -584,7 +592,7 @@ static void thread_join_workers_mode(bool exec_mode)
          * slot was never reused. Its pthread has terminated (or is in final
          * wind-down), so the join below is immediate.
          */
-        if (!__atomic_load_n(&t->active, __ATOMIC_RELAXED) &&
+        if (!atomic_load_explicit(&t->active, memory_order_relaxed) &&
             !t->host_thread_needs_join)
             continue;
         workers[nworkers].thr = t->host_thread;
@@ -618,7 +626,8 @@ static void thread_join_workers_mode(bool exec_mode)
         for (int w = 0; w < nworkers; w++) {
             if (workers[w].recycled)
                 continue;
-            if (!__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE))
+            if (!atomic_load_explicit(&workers[w].t->active,
+                                      memory_order_acquire))
                 continue;
 
             /* The slot may have been reused for a new logical thread while we
@@ -649,7 +658,8 @@ static void thread_join_workers_mode(bool exec_mode)
          * join-vs-detach decision for our (already-terminated) handle.
          */
         if (workers[w].recycled ||
-            !__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE)) {
+            !atomic_load_explicit(&workers[w].t->active,
+                                  memory_order_acquire)) {
             pthread_join(workers[w].thr, NULL);
         } else if (exec_mode) {
             /* Hand the claim back instead of detaching. The caller answers a
@@ -705,13 +715,14 @@ bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
             t->vcpu_valid = false;
             t->vcpu = 0;
             thread_free_sp_el1_locked(t);
-            __atomic_store_n(&t->active, 0, __ATOMIC_RELEASE);
+            atomic_store_explicit(&t->active, 0, memory_order_release);
 
             /* Keep the count accurate rather than zeroing the whole table: any
              * leaked live worker stays active and counted until process exit
              * reclaims it.
              */
-            atomic_fetch_sub(&active_thread_count, 1);
+            atomic_fetch_sub_explicit(&active_thread_count, 1,
+                                      memory_order_relaxed);
             main_destroyed = true;
 
             /* Do NOT destroy condvars. Same race as thread_deactivate: a waiter
@@ -1097,7 +1108,8 @@ static int thread_stop_requested_for_leader_work(void)
 void thread_note_syscall(int nr)
 {
     if (current_thread)
-        __atomic_store_n(&current_thread->in_syscall, nr, __ATOMIC_RELAXED);
+        atomic_store_explicit(&current_thread->in_syscall, nr,
+                              memory_order_relaxed);
 }
 
 int thread_stop_requested(void)
@@ -1266,17 +1278,18 @@ int thread_exec_de_thread(void)
         THREAD_FOR_EACH_ACTIVE (t) {
             if (!thread_is_joinable_sibling(t))
                 continue;
-            int32_t nr = __atomic_load_n(&t->in_syscall, __ATOMIC_RELAXED);
+            int32_t nr =
+                atomic_load_explicit(&t->in_syscall, memory_order_relaxed);
             if (nr < 0)
                 log_warn(
                     "execve: tid=%lld has not left the guest yet, "
                     "running guest code",
-                    (long long) t->guest_tid);
+                    (long long) thread_tid(t));
             else
                 log_warn(
                     "execve: tid=%lld has not left the guest yet, "
                     "in syscall %d",
-                    (long long) t->guest_tid, nr);
+                    (long long) thread_tid(t), nr);
         }
         pthread_mutex_unlock(&thread_lock);
     }
@@ -1390,7 +1403,7 @@ retry:
         }
 
         txns[nranges].thread = t;
-        txns[nranges].guest_tid = t->guest_tid;
+        txns[nranges].guest_tid = thread_tid(t);
         txns[nranges].start = ds;
         txns[nranges].end = de;
         txns[nranges].deferred_count = t->deferred_stack_unmap_count;
@@ -1428,8 +1441,8 @@ void thread_finish_deferred_stack_ranges(
     for (int i = 0; i < nranges; i++) {
         thread_entry_t *t = txns[i].thread;
 
-        if (!t || !__atomic_load_n(&t->active, __ATOMIC_RELAXED) ||
-            t->guest_tid != txns[i].guest_tid ||
+        if (!t || !atomic_load_explicit(&t->active, memory_order_relaxed) ||
+            thread_tid(t) != txns[i].guest_tid ||
             t->deferred_stack_unmap_busy <= 0)
             continue;
         t->deferred_stack_unmap_busy--;
@@ -1453,8 +1466,8 @@ void thread_rollback_deferred_stack_ranges(
     for (int i = 0; i < nranges; i++) {
         thread_entry_t *t = txns[i].thread;
 
-        if (!t || !__atomic_load_n(&t->active, __ATOMIC_RELAXED) ||
-            t->guest_tid != txns[i].guest_tid)
+        if (!t || !atomic_load_explicit(&t->active, memory_order_relaxed) ||
+            thread_tid(t) != txns[i].guest_tid)
             continue;
         t->deferred_stack_unmap_count = txns[i].deferred_count;
         for (int j = 0; j < txns[i].deferred_count; j++) {
@@ -1701,13 +1714,13 @@ static bool thread_matches_tracer_child(const thread_entry_t *t,
                                         int64_t tracer_tid,
                                         int pid)
 {
-    if (!__atomic_load_n(&t->active, __ATOMIC_RELAXED))
+    if (!atomic_load_explicit(&t->active, memory_order_relaxed))
         return false;
     bool is_child = (t->ptraced && t->tracer_tid == tracer_tid) ||
                     (t->is_vm_clone && t->parent_tid == tracer_tid);
     if (!is_child)
         return false;
-    if (pid > 0 && t->guest_tid != pid)
+    if (pid > 0 && thread_tid(t) != pid)
         return false;
     return true;
 }
@@ -1743,7 +1756,7 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
 
             /* Ptrace-stopped: report stop signal in wait status. */
             if (t->ptrace_stopped) {
-                int64_t tid = t->guest_tid;
+                int64_t tid = thread_tid(t);
                 if (out_status)
                     *out_status = (t->ptrace_stop_sig << 8) | 0x7F;
                 pthread_mutex_unlock(&thread_lock);
@@ -1752,7 +1765,7 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
 
             /* VM-clone child exited: reap and deactivate. */
             if (t->vm_exited) {
-                int64_t tid = t->guest_tid;
+                int64_t tid = thread_tid(t);
                 if (out_status)
                     *out_status = t->vm_exit_status;
 
@@ -1760,8 +1773,9 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                  * pthread_cond_wait().
                  */
                 thread_free_sp_el1_locked(t);
-                __atomic_store_n(&t->active, 0, __ATOMIC_RELEASE);
-                atomic_fetch_sub(&active_thread_count, 1);
+                atomic_store_explicit(&t->active, 0, memory_order_release);
+                atomic_fetch_sub_explicit(&active_thread_count, 1,
+                                          memory_order_relaxed);
                 t->ptrace_cleanup_pending = true;
                 thread_ptrace_cleanup_locked(t);
                 pthread_mutex_unlock(&thread_lock);

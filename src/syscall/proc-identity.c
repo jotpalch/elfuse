@@ -39,12 +39,12 @@ static _Atomic uint32_t initial_gid = GUEST_GID;
 
 void proc_set_fakeroot_enabled(bool enabled)
 {
-    atomic_store(&fakeroot_enabled, enabled);
+    atomic_store_explicit(&fakeroot_enabled, enabled, memory_order_relaxed);
 }
 
 bool proc_fakeroot_enabled(void)
 {
-    return atomic_load(&fakeroot_enabled);
+    return atomic_load_explicit(&fakeroot_enabled, memory_order_relaxed);
 }
 
 /* Written once during startup, before any guest code runs, and only read after
@@ -70,14 +70,17 @@ const char *proc_fakeroot_exec_path(void)
 
 void proc_set_initial_ids(uint32_t uid, uint32_t gid)
 {
-    atomic_store(&initial_uid, uid);
-    atomic_store(&initial_gid, gid);
-    atomic_store(&initial_ids_staged, true);
+    /* Release on the staged flag publishes the two ids with it. The consumer in
+     * proc_identity_init acquires through the same flag before reading them.
+     */
+    atomic_store_explicit(&initial_uid, uid, memory_order_relaxed);
+    atomic_store_explicit(&initial_gid, gid, memory_order_relaxed);
+    atomic_store_explicit(&initial_ids_staged, true, memory_order_release);
 }
 
 void proc_clear_initial_ids(void)
 {
-    atomic_store(&initial_ids_staged, false);
+    atomic_store_explicit(&initial_ids_staged, false, memory_order_relaxed);
 }
 
 void proc_identity_init(void)
@@ -97,9 +100,10 @@ void proc_identity_init(void)
     /* A staged --user wins over the defaults and over fakeroot; consumed here
      * so it applies to one bring-up only (contract in proc.h).
      */
-    if (atomic_exchange(&initial_ids_staged, false)) {
-        uid = atomic_load(&initial_uid);
-        gid = atomic_load(&initial_gid);
+    if (atomic_exchange_explicit(&initial_ids_staged, false,
+                                 memory_order_acquire)) {
+        uid = atomic_load_explicit(&initial_uid, memory_order_relaxed);
+        gid = atomic_load_explicit(&initial_gid, memory_order_relaxed);
     }
 
     emu_uid = uid;

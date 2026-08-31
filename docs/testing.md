@@ -151,6 +151,34 @@ What they do:
 - `make test-fuse-alpine`: validate guest `/dev/fuse` + `mount("fuse")`
   against the Alpine musl sysroot fixture
 - `make test-gdbstub`: debugger integration checks against the built-in GDB stub
+- `make test-sharun`: run sharun and its probe under elfuse in six arms of
+  increasing host requirements. The prebuilt launcher (`--version`) is a static
+  aarch64 ELF and runs anywhere elfuse does; the x86_64 build of the same
+  release goes through the Rosetta path as a static-pie musl Rust binary, a
+  shape no other lane covers, and skips without the translator. The cross-built
+  probe covers the loader path (`DT_NEEDED`, `dlopen`, `$ORIGIN` rpath, libm,
+  pthreads, fork) that no other aarch64 lane reaches, and skips without the
+  cross-glibc sysroot. Three further arms drive a bundle: the probe under the
+  real launcher, `--gen-lib-path` walking the tree and writing back to it from
+  inside the guest, and the negative path where the `dlopen` target is removed
+  and the loader's errno must surface rather than hang or crash. Nothing shells
+  out to `lib4bin`, so there is no Linux dependency: `tests/build-sharun-bundle.sh`
+  writes the bundle layout directly from the launcher, the probe, and a prebuilt
+  Debian glibc fetched by `tests/fetch-glibc.sh`. Point `SHARUN_FIXTURE_DIR` at
+  an unpacked bundle to test one built elsewhere instead. The lane skips
+  entirely with status 77 in two cases: it cannot reach the launcher for the
+  first arm, or that arm passed but every dynamic-loader arm skipped (no
+  cross-glibc sysroot and no `SHARUN_FIXTURE_DIR`). The second
+  keeps a run that covered only the static launcher from reporting the same
+  green as one that exercised the loader. Launcher
+  binaries and the glibc package are pinned and digest-checked by
+  `tests/sharun-fixture.lock` and cached under `$FIXTURES_DIR`, so they download
+  once and survive `make clean`. Every download happens inside the lane rather
+  than as a make prerequisite, so an unreachable network skips the affected arms
+  instead of failing `make check`. Editing a probe source under
+  `tests/fixtures/sharun/` is picked up on the next run: make rebuilds
+  `$(BUILD_DIR)/probe` and its two DSOs from those sources, and the bundle is
+  assembled from the rebuilt binaries. It also runs as a lane of `make check`.
 - `make test-matrix`: cross-check `elfuse` (aarch64), QEMU (aarch64),
   and `elfuse` (x86_64-via-Rosetta) on overlapping corpora
 - `make lint`: static analysis through `clang-tidy`

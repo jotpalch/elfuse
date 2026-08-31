@@ -179,44 +179,49 @@ void proc_init(void)
 
 void proc_set_rosetta_enabled(bool enabled)
 {
-    atomic_store(&rosetta_enabled, enabled);
+    atomic_store_explicit(&rosetta_enabled, enabled, memory_order_relaxed);
 }
 
 bool proc_rosetta_enabled(void)
 {
-    return atomic_load(&rosetta_enabled);
+    return atomic_load_explicit(&rosetta_enabled, memory_order_relaxed);
 }
 
 void proc_set_rosetta_active(bool active)
 {
-    atomic_store(&rosetta_active, active);
+    atomic_store_explicit(&rosetta_active, active, memory_order_relaxed);
 }
 
 bool proc_rosetta_active(void)
 {
-    return atomic_load(&rosetta_active);
+    return atomic_load_explicit(&rosetta_active, memory_order_relaxed);
 }
 
 void proc_request_exit_group(int code)
 {
-    atomic_store(&exit_group_code, code);
-    atomic_store(&exit_group_requested, 1);
+    /* Release on the flag, relaxed on the payload: a vCPU that observes the
+     * request through proc_exit_group_requested must also see the code that
+     * goes with it. Publishing them in the other order hands a racing thread
+     * the previous exit code.
+     */
+    atomic_store_explicit(&exit_group_code, code, memory_order_relaxed);
+    atomic_store_explicit(&exit_group_requested, 1, memory_order_release);
 }
 
 void proc_clear_exit_group(void)
 {
-    atomic_store(&exit_group_requested, 0);
-    atomic_store(&exit_group_code, 0);
+    atomic_store_explicit(&exit_group_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&exit_group_code, 0, memory_order_relaxed);
 }
 
 int proc_exit_group_requested(void)
 {
-    return atomic_load(&exit_group_requested);
+    return atomic_load_explicit(&exit_group_requested, memory_order_acquire);
 }
 
 static int proc_exit_group_code(void)
 {
-    return atomic_load(&exit_group_code);
+    return atomic_load_explicit(&exit_group_code, memory_order_relaxed);
 }
 
 static void proc_init_child_entry(proc_entry_t *entry,
@@ -414,7 +419,8 @@ int64_t proc_alloc_pid(void)
         return -LINUX_EAGAIN;
 
     if (absock_get_namespace_id() == (uint64_t) getpid() &&
-        !atomic_exchange(&owner_sequence_reset, true))
+        !atomic_exchange_explicit(&owner_sequence_reset, true,
+                                  memory_order_relaxed))
         unlink(path);
 
     int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -744,7 +750,8 @@ static int lifecycle_open_locked(char *path, size_t path_size)
     if (!lifecycle_registry_path(path, path_size))
         return -1;
     if (absock_get_namespace_id() == (uint64_t) getpid() &&
-        !atomic_exchange(&owner_reset_done, true))
+        !atomic_exchange_explicit(&owner_reset_done, true,
+                                  memory_order_relaxed))
         unlink(path);
     int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0)
@@ -1145,7 +1152,7 @@ static void proc_registry_reset_if_owner(const char *path)
     static _Atomic bool reset_done;
     if (absock_get_namespace_id() != (uint64_t) getpid())
         return;
-    if (atomic_exchange(&reset_done, true))
+    if (atomic_exchange_explicit(&reset_done, true, memory_order_relaxed))
         return;
     unlink(path);
 }
@@ -1865,7 +1872,7 @@ int64_t sys_ptrace(guest_t *g,
             return -LINUX_EPERM;
 
         target->ptraced = true;
-        target->tracer_tid = current_thread->guest_tid;
+        target->tracer_tid = thread_tid(current_thread);
         return 0;
     }
 
@@ -2304,7 +2311,7 @@ int64_t sys_wait4(guest_t *g,
      */
     if (current_thread) {
         int ptrace_status = 0;
-        int64_t ptrace_tid = thread_ptrace_wait(current_thread->guest_tid, pid,
+        int64_t ptrace_tid = thread_ptrace_wait(thread_tid(current_thread), pid,
                                                 &ptrace_status, options);
         if (ptrace_tid > 0) {
             if (status_gva) {
@@ -3308,7 +3315,9 @@ static void vcpu_handle_sysinstr_trap(hv_vcpu_t vcpu,
      * advanced PC and will restore X0 from its saved frame before returning to
      * EL0.
      */
-    atomic_fetch_add(&sysreg_write_count, 1);
+    uint64_t seq = atomic_fetch_add_explicit(&sysreg_write_count, 1,
+                                             memory_order_relaxed) +
+                   1;
     uint64_t rt_value = 0;
     hv_vcpu_get_reg(vcpu, HV_REG_X0, &rt_value);
     uint64_t esr;
@@ -3349,8 +3358,8 @@ static void vcpu_handle_sysinstr_trap(hv_vcpu_t vcpu,
             "%s: sysreg trap #%llu: %s "
             "(Op0=%u Op1=%u CRn=%u CRm=%u Op2=%u "
             "Rt=X%u val=0x%llx)",
-            prefix, (unsigned long long) atomic_load(&sysreg_write_count), name,
-            op0, op1, crn, crm, op2, rt, (unsigned long long) rt_value);
+            prefix, (unsigned long long) seq, name, op0, op1, crn, crm, op2, rt,
+            (unsigned long long) rt_value);
     }
 }
 
@@ -3419,9 +3428,9 @@ static bool vcpu_handle_wx_toggle(guest_t *g,
 
     /* Count W^X toggles for JIT debugging */
     if (type == 0)
-        atomic_fetch_add(&wxcount_to_rx, 1);
+        atomic_fetch_add_explicit(&wxcount_to_rx, 1, memory_order_relaxed);
     else
-        atomic_fetch_add(&wxcount_to_rw, 1);
+        atomic_fetch_add_explicit(&wxcount_to_rw, 1, memory_order_relaxed);
 
     if (verbose)
         log_debug("%s: W^X toggle at 0x%llx -> %s (page 0x%llx)", prefix,
@@ -3505,12 +3514,12 @@ static bool vcpu_handle_brk(guest_t *g,
         signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc, brk_esr);
         if (verbose) {
             uint64_t thread_blocked =
-                current_thread ? current_thread->blocked : 0xDEAD;
+                current_thread ? thread_blocked_load(current_thread) : 0xDEAD;
             log_debug(
                 "%s: BRK: thread_blocked=0x%llx "
                 "pending=0x%llx",
                 prefix, (unsigned long long) thread_blocked,
-                (unsigned long long) signal_get_state()->shared.pending);
+                (unsigned long long) signal_shared_pending_load());
         }
         int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGTRAP, exit_code);
         if (verbose)
@@ -3991,15 +4000,16 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                      * debug signal delivery issues.
                      */
                     if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
-                        const signal_state_t *ss = signal_get_state();
                         uint64_t tblocked =
-                            current_thread ? current_thread->blocked : 0xDEAD;
+                            current_thread ? thread_blocked_load(current_thread)
+                                           : 0xDEAD;
                         log_debug(
                             "%s: post-sigreturn state: "
                             "pending=0x%llx global_blocked=0x%llx "
                             "thread_blocked=0x%llx signal_pending=%d",
-                            prefix, (unsigned long long) ss->shared.pending,
-                            (unsigned long long) ss->blocked,
+                            prefix,
+                            (unsigned long long) signal_shared_pending_load(),
+                            (unsigned long long) signal_blocked_load(),
                             (unsigned long long) tblocked, signal_pending());
                     }
 

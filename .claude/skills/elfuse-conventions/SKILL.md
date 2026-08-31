@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that CONTRIBUTING.md does not carry: the register a comment or commit message is written in, comment brevity, the type and return conventions at the ABI boundary, PR etiquette, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
+description: elfuse conventions that CONTRIBUTING.md does not carry: the register a comment or commit message is written in, comment brevity, the type and return conventions at the ABI boundary, how shared mutable state is declared and which memory order a site states, PR etiquette, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, touching an atomic or a lock-free access, or wiring the build to anything a fresh clone would not have.
 ---
 
 # elfuse conventions
@@ -132,6 +132,64 @@ The conventions below are the ones that come from this project being a Linux
 ABI reimplementation rather than an ordinary C program. They settle what a
 declaration looks like, not whether the function should exist; for judging and
 cleaning code that already works, `elfuse-refactor` is the calibration set.
+
+### Shared mutable state
+
+Shared mutable state uses `_Atomic` objects and the C11 `atomic_*_explicit`
+operations from `<stdatomic.h>`. Compiler `__atomic_*` and obsolete `__sync_*`
+primitives are not allowed. They take a plain `T *`, so nothing in the
+declaration says the object is shared, and the next person to touch it adds a
+plain access without seeing a reason not to.
+
+Declare the object `_Atomic` wherever this tree owns the storage. The exception
+is memory whose layout the guest ABI fixes and the EL1 shim also reads:
+page-table descriptors, the `shim_data` slots, the vvar seqlock, a futex word.
+Those cannot be declared, so the host casts to `_Atomic T *` at the point of
+access. That cast holds only while `_Atomic T` is laid out like `T` and is
+lock-free, because a lock-based atomic would take a host-side lock the shim's
+LDAR and STLR cannot see, and the two sides would then order against different
+things. `src/core/guest.h` asserts both properties at compile time; without
+those asserts the cast is a guess about the toolchain.
+
+Never reach an `_Atomic` object through a plain C operator. `p->pending |= bit`
+is a sequentially-consistent read-modify-write, and a site already holding the
+lock that serializes it pays for ordering it does not need while saying nothing
+about the ordering it does. Where a file has many such sites, name the
+discipline once in helpers rather than spelling the order out at each: the
+`pending_load` / `pending_or` / `pending_clear` group at the top of
+`src/syscall/signal.c` is the shape.
+
+Never hand an `_Atomic` object to `memcpy` or to a guest read/write helper. That
+copies the object representation, which is not an atomic read of it. Load into a
+local first and pass the local.
+
+A shared field that many files read gets an accessor rather than an
+`atomic_load_explicit` at each site. `thread_blocked_load` and
+`thread_blocked_store` in `src/runtime/thread.h`, `thread_tid` beside them, and
+the `pending_load` / `pending_store` / `pending_or` / `pending_clear` group in
+`src/syscall/signal.h` are the set, and the header comment above each says why:
+one definition of how the field is reached means a new reader cannot plain-load
+it by omission, which is how forty of them accumulated before. A field only one
+file touches does not need one; `in_syscall` is reached directly in
+`src/runtime/thread.c` and stays there.
+
+The rule covers the bare `atomic_load(x)` spelling too, not just `x` on its own.
+It is an atomic operation, but a sequentially-consistent one by default, so it
+states no more about the ordering than the plain operator does.
+
+`scripts/check-atomics.py` holds the two halves a regex can settle: no
+`__atomic_*` or `__sync_*`, and no C11 atomic call without its `_explicit`
+form. It does not check plain-operator access to an `_Atomic` object, because
+finding those needs the declarations resolved and the tree still carries a large
+pre-existing set of them; that half stays a review question.
+
+State the order and name what it pairs with. Relaxed is right under a lock that
+already serializes the access. Release and acquire are for a publish a lock-free
+reader chases, and the comment says which reader. Sequential consistency is for
+the cases that need the contrapositive rather than the forward direction, which
+in this tree means the attention bits in `src/core/shim-globals.c`, where a
+sibling vCPU observing a zero must not then observe the stores that preceded the
+publish.
 
 Fixed-width types for anything the guest defines: guest addresses, Linux ABI
 structures, binary layouts, protocol fields, page-table entries. Host-side

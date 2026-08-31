@@ -25,6 +25,29 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* The guest slab and the shim_data block are plain byte-addressed mappings
+ * whose layout the guest ABI fixes, so the words the host and the guest both
+ * touch (page-table descriptors, the shim_data identity and urandom slots, the
+ * vvar seqlock, a futex word) cannot be declared _Atomic. The host reaches them
+ * by casting to _Atomic T *, which holds only while _Atomic T is laid out like
+ * T and is lock-free: a lock-based atomic would take a host-side lock the
+ * guest's LDAR/STLR in shim.S cannot see, and the two sides would order against
+ * different things. Both properties are toolchain-dependent, so assert them
+ * rather than assume them.
+ */
+_Static_assert(sizeof(_Atomic uint8_t) == sizeof(uint8_t) &&
+                   _Alignof(_Atomic uint8_t) == _Alignof(uint8_t) &&
+                   ATOMIC_CHAR_LOCK_FREE == 2,
+               "8-bit atomics must match plain uint8_t and be lock-free");
+_Static_assert(sizeof(_Atomic uint32_t) == sizeof(uint32_t) &&
+                   _Alignof(_Atomic uint32_t) == _Alignof(uint32_t) &&
+                   ATOMIC_INT_LOCK_FREE == 2,
+               "32-bit atomics must match plain uint32_t and be lock-free");
+_Static_assert(sizeof(_Atomic uint64_t) == sizeof(uint64_t) &&
+                   _Alignof(_Atomic uint64_t) == _Alignof(uint64_t) &&
+                   ATOMIC_LLONG_LOCK_FREE == 2,
+               "64-bit atomics must match plain uint64_t and be lock-free");
+
 /* Memory layout constants.
  *
  * Guest memory size is determined dynamically from the VM's IPA width (36-bit =

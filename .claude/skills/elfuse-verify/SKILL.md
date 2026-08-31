@@ -184,10 +184,11 @@ thought.
 ### frama-c-stubs/
 
 Declarations the analyzer needs that the compiler or macOS supplies:
-`Hypervisor/Hypervisor.h`, `gcc-atomics.h` (Frama-C does not model
-`__atomic_*_n`; without a declaration each file infers its own argument widths
-and two files conflict), and `macos-libc.h` for Darwin constants the modeled
-libc omits.
+`Hypervisor/Hypervisor.h` and `macos-libc.h` for Darwin constants the modeled
+libc omits, plus `prelude.h`, which declares nothing of its own and instead
+force-includes the two headers Frama-C ships but never reaches on its own: its
+gcc-builtins model, and its stdatomic.h for the `_Atomic` qualifier its front
+end cannot parse and for the C11 atomics vocabulary the tree calls.
 
 It sits outside `src/` on purpose so a real compile, which resolves through
 `-Isrc`, cannot reach it. Only `FRAMAC_STUB_DIR` in `mk/verify.mk` does.

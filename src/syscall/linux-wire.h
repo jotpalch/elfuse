@@ -579,6 +579,15 @@ typedef struct {
                           * pointer for FD_EPOLL entries (NULL otherwise)
                           */
     char proc_path[FD_VIRTUAL_PATH_MAX]; /* Virtual /proc dir root for *at */
+
+    /* Linux gives the file this path intercept stands for a poll method, so
+     * epoll_ctl accepts it. Recorded at open because fstat cannot recover it
+     * later: an intercepted tree is served from elfuse's own staging file, and
+     * the host object then describes the staging rather than the file the guest
+     * named. False for every non-intercepted open, where the host object is the
+     * file and answers for itself. path_intercept_poll_capable decides it.
+     */
+    bool path_poll_capable;
     int seals;      /* F_SEAL_* bits (non-zero only for memfd_create fds) */
     bool can_block; /* host read/write on this fd may block (pipe, socket, fifo,
                      * char/tty); false for regular files and directories. Set

@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "core/guest.h"         /* guest_t (for thread_alloc_sp_el1) */
 #include "syscall/linux-wire.h" /* linux_user_pt_regs_t */
@@ -46,16 +47,25 @@ typedef struct thread_entry {
      * struct; thread.c asserts that each one sits below where its memset
      * starts.
      */
-    int active;        /* Non-zero while thread is running. Stays int (not bool)
-                        * because lock-free paths in thread.c use __atomic_load_n
-                        * on it; the 32-bit width keeps the access pattern
-                        * predictable across architectures.
-                        */
-    uint64_t blocked;  /* Per-thread signal mask (POSIX requires each thread to
-                        * have its own). Initialized to the parent's mask on
-                        * clone, modified via rt_sigprocmask.
-                        */
-    int64_t guest_tid; /* Linux TID (unique per thread) */
+    _Atomic int active; /* Non-zero while thread is running. Stays int (not
+                         * bool) because lock-free paths in thread.c use
+                         * atomic_load_explicit on it; the 32-bit width keeps
+                         * the access pattern predictable across architectures.
+                         */
+    _Atomic uint64_t
+        blocked; /* Per-thread signal mask (POSIX requires each thread to
+                  * have its own). Initialized to the parent's mask on
+                  * clone, modified via rt_sigprocmask.
+                  */
+    _Atomic int64_t guest_tid; /* Linux TID (unique per thread) */
+
+    /* The Linux syscall this thread is inside, or -1 between calls. Written
+     * around the handler call in syscall_dispatch and read only by the execve
+     * teardown, which otherwise reports a sibling that would not leave by tid
+     * alone and leaves the wait it is parked in to be guessed. Sits in this
+     * group so the one memset below it stays one memset.
+     */
+    _Atomic int32_t in_syscall;
 
     /* Thread-directed pending signals (Linux task->pending). tgkill/tkill and
      * pthread_kill queue here so only this thread consumes them. Written and
@@ -121,13 +131,6 @@ typedef struct thread_entry {
     int32_t altstack_flags; /* SS_DISABLE / 0 */
     uint64_t altstack_size; /* Alternate signal stack size */
     bool on_altstack;       /* True if currently delivering on altstack */
-
-    /* The Linux syscall this thread is inside, or -1 between calls. Written
-     * around the handler call in syscall_dispatch and read only by the execve
-     * teardown, which otherwise reports a sibling that would not leave by tid
-     * alone and leaves the wait it is parked in to be guessed.
-     */
-    int32_t in_syscall;
 
     /* Robust futex list head (GVA). When non-zero, thread exit walks the list
      * and sets FUTEX_OWNER_DIED on each lock word.
@@ -222,12 +225,23 @@ typedef struct thread_entry {
  */
 static inline void thread_blocked_store(thread_entry_t *t, uint64_t mask)
 {
-    __atomic_store_n(&t->blocked, mask, __ATOMIC_RELEASE);
+    atomic_store_explicit(&t->blocked, mask, memory_order_release);
 }
 
 static inline uint64_t thread_blocked_load(const thread_entry_t *t)
 {
-    return __atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE);
+    return atomic_load_explicit(&t->blocked, memory_order_acquire);
+}
+
+/* The same treatment for the TID, which the lock-free scans in thread_tid_alive
+ * and the /proc walkers read while thread_alloc is writing a recycled slot.
+ * Relaxed is the whole requirement: the field is a value, not a gate on
+ * anything else, and every caller that needs the slot's other fields reaches
+ * them through the active flag's release-acquire pair.
+ */
+static inline int64_t thread_tid(const thread_entry_t *t)
+{
+    return atomic_load_explicit(&t->guest_tid, memory_order_relaxed);
 }
 
 typedef struct {

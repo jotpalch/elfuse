@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sched.h>
 
@@ -109,19 +110,19 @@ static uint8_t *cache_base(const guest_t *g)
 
 static void store_u64(uint8_t *page, uint32_t off, uint64_t value)
 {
-    uint64_t *slot = (uint64_t *) (page + off);
-    __atomic_store_n(slot, value, __ATOMIC_RELEASE);
+    _Atomic uint64_t *slot = (_Atomic uint64_t *) (page + off);
+    atomic_store_explicit(slot, value, memory_order_release);
 }
 
-static void urandom_ring_lock(uint32_t *lock_p)
+static void urandom_ring_lock(_Atomic uint32_t *lock_p)
 {
-    while (__atomic_exchange_n(lock_p, 1, __ATOMIC_ACQUIRE) != 0)
+    while (atomic_exchange_explicit(lock_p, 1, memory_order_acquire) != 0)
         sched_yield();
 }
 
-static void urandom_ring_unlock(uint32_t *lock_p)
+static void urandom_ring_unlock(_Atomic uint32_t *lock_p)
 {
-    __atomic_store_n(lock_p, 0, __ATOMIC_RELEASE);
+    atomic_store_explicit(lock_p, 0, memory_order_release);
 }
 
 void shim_globals_init(guest_t *g)
@@ -241,26 +242,26 @@ void shim_globals_reset_singleton(void)
     singleton_g = NULL;
 }
 
-static uint64_t *urandom_bitmap_word(int fd)
+static _Atomic uint64_t *urandom_bitmap_word(int fd)
 {
     if (!singleton_g)
         return NULL;
     if (fd < 0 || fd >= FD_TABLE_SIZE)
         return NULL;
     uint8_t *base = cache_base(singleton_g) + SHIM_URANDOM_OFF_BITMAP;
-    return (uint64_t *) base + (fd / 64);
+    return (_Atomic uint64_t *) base + (fd / 64);
 }
 
 void shim_globals_mark_urandom_fd(int fd, bool is_urandom)
 {
-    uint64_t *word = urandom_bitmap_word(fd);
+    _Atomic uint64_t *word = urandom_bitmap_word(fd);
     if (!word)
         return;
     uint64_t mask = (uint64_t) 1 << (fd & 63);
     if (is_urandom)
-        __atomic_fetch_or(word, mask, __ATOMIC_RELEASE);
+        atomic_fetch_or_explicit(word, mask, memory_order_release);
     else
-        __atomic_fetch_and(word, ~mask, __ATOMIC_RELEASE);
+        atomic_fetch_and_explicit(word, ~mask, memory_order_release);
 }
 
 void shim_globals_rebuild_urandom_bitmap(void)
@@ -300,9 +301,12 @@ void shim_globals_rebuild_urandom_bitmap(void)
 void shim_globals_refill_urandom_ring(guest_t *g)
 {
     uint8_t *base = cache_base(g);
-    uint32_t *head_p = (uint32_t *) (base + SHIM_URANDOM_OFF_RING_HEAD);
-    uint32_t *tail_p = (uint32_t *) (base + SHIM_URANDOM_OFF_RING_TAIL);
-    uint32_t *lock_p = (uint32_t *) (base + SHIM_URANDOM_OFF_RING_LOCK);
+    _Atomic uint32_t *head_p =
+        (_Atomic uint32_t *) (base + SHIM_URANDOM_OFF_RING_HEAD);
+    _Atomic uint32_t *tail_p =
+        (_Atomic uint32_t *) (base + SHIM_URANDOM_OFF_RING_TAIL);
+    _Atomic uint32_t *lock_p =
+        (_Atomic uint32_t *) (base + SHIM_URANDOM_OFF_RING_LOCK);
     uint8_t *ring = base + SHIM_URANDOM_OFF_RING;
 
     /* Pre-lock estimate: skip the arc4random_buf + lock when the ring is
@@ -314,8 +318,8 @@ void shim_globals_refill_urandom_ring(guest_t *g)
      * full-detection; any other (valid or torn) reading falls through to the
      * lock-held recheck below.
      */
-    uint32_t head_pre = __atomic_load_n(head_p, __ATOMIC_RELAXED);
-    uint32_t tail_pre = __atomic_load_n(tail_p, __ATOMIC_RELAXED);
+    uint32_t head_pre = atomic_load_explicit(head_p, memory_order_relaxed);
+    uint32_t tail_pre = atomic_load_explicit(tail_p, memory_order_relaxed);
     uint32_t fill_pre = tail_pre - head_pre;
     if (fill_pre == SHIM_URANDOM_RING_SIZE)
         return;
@@ -325,8 +329,8 @@ void shim_globals_refill_urandom_ring(guest_t *g)
 
     urandom_ring_lock(lock_p);
 
-    uint32_t head = __atomic_load_n(head_p, __ATOMIC_ACQUIRE);
-    uint32_t tail = __atomic_load_n(tail_p, __ATOMIC_RELAXED);
+    uint32_t head = atomic_load_explicit(head_p, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(tail_p, memory_order_relaxed);
     uint32_t fill = tail - head;
     if (fill >= SHIM_URANDOM_RING_SIZE)
         goto out; /* concurrent refill caught up */
@@ -346,7 +350,7 @@ void shim_globals_refill_urandom_ring(guest_t *g)
     /* Release-store the new tail so any fast-path consumer that loads tail with
      * an acquiring read sees the bytes already in the ring.
      */
-    __atomic_store_n(tail_p, tail + to_fill, __ATOMIC_RELEASE);
+    atomic_store_explicit(tail_p, tail + to_fill, memory_order_release);
 
 out:
     urandom_ring_unlock(lock_p);
@@ -358,7 +362,8 @@ out:
  */
 void shim_globals_attn_or(guest_t *g, uint32_t bits)
 {
-    uint32_t *slot = (uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
+    _Atomic uint32_t *slot =
+        (_Atomic uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
 
     /* SEQ_CST, not ACQ_REL. The CRED_BRACKETED invariant is the contrapositive
      * of release-acquire: if a sibling vCPU LDAR-loads attn and sees 0, that
@@ -371,19 +376,20 @@ void shim_globals_attn_or(guest_t *g, uint32_t bits)
      * after publish_creds and only needs to order those prior stores before the
      * clear.
      */
-    __atomic_fetch_or(slot, bits, __ATOMIC_SEQ_CST);
+    atomic_fetch_or_explicit(slot, bits, memory_order_seq_cst);
     vdso_attention_or(g, bits);
 }
 
 void shim_globals_attn_and(guest_t *g, uint32_t mask)
 {
-    uint32_t *slot = (uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
+    _Atomic uint32_t *slot =
+        (_Atomic uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
 
     /* RELEASE is sufficient for the clear path: the bracket runs publish_creds
      * BEFORE this clear, and RELEASE here pairs with the shim's LDAR so any
      * sibling that observes the cleared bit also sees the published cred slots.
      */
-    __atomic_fetch_and(slot, mask, __ATOMIC_RELEASE);
+    atomic_fetch_and_explicit(slot, mask, memory_order_release);
     vdso_attention_and(g, mask);
 }
 
@@ -453,9 +459,9 @@ uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot)
     if (slot >= SHIM_COUNTERS_N)
         return 0;
     const uint8_t *page = (const uint8_t *) g->host_base + g->shim_data_base;
-    const uint64_t *slot_p =
-        (const uint64_t *) (page + SHIM_COUNTERS_OFF) + slot;
-    return __atomic_load_n(slot_p, __ATOMIC_RELAXED);
+    const _Atomic uint64_t *slot_p =
+        (const _Atomic uint64_t *) (page + SHIM_COUNTERS_OFF) + slot;
+    return atomic_load_explicit(slot_p, memory_order_relaxed);
 }
 
 void shim_globals_counters_dump(const guest_t *g)
@@ -488,7 +494,8 @@ bool shim_globals_stats_enabled(void)
 
 void shim_globals_publish_stats_gate(guest_t *g)
 {
-    uint8_t *slot = cache_base(g) + SHIM_GLOBALS_OFF_STATS_EN;
+    _Atomic uint8_t *slot =
+        (_Atomic uint8_t *) (cache_base(g) + SHIM_GLOBALS_OFF_STATS_EN);
     uint8_t v = shim_globals_stats_enabled() ? 1 : 0;
 
     /* One-shot bring-up publish. Every caller (bootstrap, fork-child receive,
@@ -500,5 +507,5 @@ void shim_globals_publish_stats_gate(guest_t *g)
      * to ldarb (or gate the read on the attention flag) -- a release-store
      * alone does not synchronize with a plain ldrb on the same address.
      */
-    __atomic_store_n(slot, v, __ATOMIC_RELEASE);
+    atomic_store_explicit(slot, v, memory_order_release);
 }

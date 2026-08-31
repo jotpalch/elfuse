@@ -26,6 +26,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -144,12 +145,12 @@ static struct {
     pthread_cond_t resume_cond; /* Signaled when GDB resumes threads */
 
     /* Stop state */
-    int all_stopped;    /* All threads are stopped */
-    int64_t stop_tid;   /* TID of thread that triggered the stop */
-    int stop_reason;    /* GDB_STOP_* value */
-    uint64_t stop_addr; /* Address associated with stop (bp/wp addr) */
-    int resume_action;  /* 0=continue, 1=step (per stop_tid) */
-    int stop_requested; /* GDB sent Ctrl+C or bp hit */
+    int all_stopped;            /* All threads are stopped */
+    int64_t stop_tid;           /* TID of thread that triggered the stop */
+    int stop_reason;            /* GDB_STOP_* value */
+    uint64_t stop_addr;         /* Address associated with stop (bp/wp addr) */
+    int resume_action;          /* 0=continue, 1=step (per stop_tid) */
+    _Atomic int stop_requested; /* GDB sent Ctrl+C or bp hit */
 
     /* Breakpoints and watchpoints */
     hw_bp_t breakpoints[MAX_HW_BREAKPOINTS];
@@ -765,7 +766,7 @@ static void collect_tids_cb(thread_entry_t *t, void *c)
 {
     tid_collector_t *cc = c;
     if (cc->count < MAX_THREADS)
-        cc->tids[cc->count++] = t->guest_tid;
+        cc->tids[cc->count++] = thread_tid(t);
 }
 
 /* Handle qfThreadInfo / qsThreadInfo: list guest threads. */
@@ -880,7 +881,7 @@ static void handle_vcont(const char *pkt)
     /* Signal all stopped threads to resume */
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
-    gdb.stop_requested = 0;
+    atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 }
@@ -903,7 +904,7 @@ static void handle_continue(const char *pkt)
     gdb.resume_action = 0;
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
-    gdb.stop_requested = 0;
+    atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 }
@@ -938,7 +939,7 @@ static void handle_step(const char *pkt)
     gdb.resume_action = 1;
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
-    gdb.stop_requested = 0;
+    atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 }
@@ -947,7 +948,11 @@ static void handle_step(const char *pkt)
 static void handle_interrupt(void)
 {
     pthread_mutex_lock(&gdb.lock);
-    gdb.stop_requested = 1;
+
+    /* Release pairs with the lock-free acquire load in gdb_stub_stop_requested:
+     * gdb.lock serializes the writers only, never the polling vCPU threads.
+     */
+    atomic_store_explicit(&gdb.stop_requested, 1, memory_order_release);
     pthread_mutex_unlock(&gdb.lock);
 
     /* Force all vCPUs out of hv_vcpu_run */
@@ -966,7 +971,7 @@ static void handle_detach(void)
     /* Resume all threads */
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
-    gdb.stop_requested = 0;
+    atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 
@@ -1226,7 +1231,7 @@ static void *listener_thread_fn(void *arg)
         pthread_mutex_lock(&gdb.lock);
         if (gdb.all_stopped) {
             gdb.all_stopped = 0;
-            gdb.stop_requested = 0;
+            atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
             memset(gdb.breakpoints, 0, sizeof(gdb.breakpoints));
             memset(gdb.watchpoints, 0, sizeof(gdb.watchpoints));
             pthread_cond_broadcast(&gdb.resume_cond);
@@ -1331,7 +1336,7 @@ void gdb_stub_wait_for_attach(void)
 
     /* Enter stopped state so GDB can inspect initial state */
     gdb.all_stopped = 1;
-    gdb.stop_tid = current_thread ? current_thread->guest_tid : 1;
+    gdb.stop_tid = current_thread ? thread_tid(current_thread) : 1;
     gdb.stop_reason = GDB_STOP_ENTRY;
     gdb.stop_addr = 0;
     gdb.current_g_tid = gdb.stop_tid;
@@ -1369,7 +1374,7 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
     if (!gdb.initialized || gdb.client_fd < 0)
         return 0;
 
-    int64_t my_tid = current_thread ? current_thread->guest_tid : 1;
+    int64_t my_tid = current_thread ? thread_tid(current_thread) : 1;
 
     /* Snapshot vCPU registers into thread entry. Must happen on the vCPU's
      * owning thread (HVF requirement). The GDB handler thread reads/writes this
@@ -1396,7 +1401,7 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
         gdb.stop_tid = my_tid;
         gdb.stop_reason = stop_reason;
         gdb.stop_addr = stop_addr;
-        gdb.stop_requested = 0;
+        atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
 
         /* Update focus thread */
         gdb.current_g_tid = my_tid;
@@ -1447,7 +1452,7 @@ int gdb_stub_stop_requested(void)
 {
     if (!gdb.initialized)
         return 0;
-    return __atomic_load_n(&gdb.stop_requested, __ATOMIC_ACQUIRE);
+    return atomic_load_explicit(&gdb.stop_requested, memory_order_acquire);
 }
 
 void gdb_stub_shutdown(void)
@@ -1470,7 +1475,7 @@ void gdb_stub_shutdown(void)
     /* Resume any stopped threads so they can exit */
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
-    gdb.stop_requested = 0;
+    atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 

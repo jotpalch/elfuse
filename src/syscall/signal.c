@@ -42,6 +42,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <mach/arm/thread_status.h>
 #include <sys/ucontext.h>
 #include <setjmp.h>
@@ -235,7 +236,7 @@ host_sigbus_recovery_t *signal_host_sigbus_recovery(void)
  * is checked after each syscall in the vCPU loop via signal_check_timer().
  */
 typedef struct {
-    int active;              /* Non-zero if timer is armed */
+    _Atomic int active;      /* Non-zero if timer is armed */
     struct timeval expiry;   /* Absolute wall-clock time of next fire */
     struct timeval interval; /* Repeat interval (zero = one-shot) */
 } guest_itimer_t;
@@ -325,11 +326,12 @@ static void signal_standard_enqueue_locked(signal_pending_t *p,
     int idx = signum - 1;
     uint64_t bit = sig_bit(signum);
 
-    if (!(p->pending & bit)) {
+    uint64_t cur = pending_load(&p->pending);
+    if (!(cur & bit)) {
         p->std_info[idx] = info ? *info : signal_default_info(signum);
         p->std_info_valid[idx] = info != NULL;
     }
-    p->pending |= bit;
+    pending_store(&p->pending, cur | bit);
 }
 
 static signal_rt_info_t signal_standard_peek_locked(signal_pending_t *p,
@@ -349,7 +351,7 @@ static void signal_rt_enqueue_locked(signal_pending_t *p,
     signal_rt_info_t fallback = signal_default_info(signum);
     const signal_rt_info_t *entry = info ? info : &fallback;
 
-    p->pending |= sig_bit(signum);
+    pending_or(&p->pending, sig_bit(signum));
     if (p->rt_queue[idx] >= RT_SIGQUEUE_MAX)
         return;
 
@@ -364,7 +366,7 @@ static bool signal_rt_dequeue_locked(signal_pending_t *p,
 {
     int idx = signum - LINUX_SIGRTMIN;
     if (p->rt_queue[idx] <= 0) {
-        p->pending &= ~sig_bit(signum);
+        pending_clear(&p->pending, sig_bit(signum));
         return false;
     }
 
@@ -373,7 +375,7 @@ static bool signal_rt_dequeue_locked(signal_pending_t *p,
     p->rt_head[idx] = (uint8_t) ((p->rt_head[idx] + 1) % RT_SIGQUEUE_MAX);
     p->rt_queue[idx]--;
     if (p->rt_queue[idx] == 0) {
-        p->pending &= ~sig_bit(signum);
+        pending_clear(&p->pending, sig_bit(signum));
         p->rt_head[idx] = 0;
     }
     return true;
@@ -398,7 +400,8 @@ static void signal_enqueue_locked(signal_pending_t *p,
  */
 static void refresh_pending_hint_locked(void)
 {
-    uint64_t hint = sig_state.shared.pending | thread_pending_union();
+    uint64_t hint =
+        pending_load(&sig_state.shared.pending) | thread_pending_union();
     atomic_store_explicit(&sig_pending_hint, hint, memory_order_release);
 }
 
@@ -407,9 +410,9 @@ static void refresh_pending_hint_locked(void)
  */
 static inline uint64_t self_pending_locked(void)
 {
-    uint64_t pending = sig_state.shared.pending;
+    uint64_t pending = pending_load(&sig_state.shared.pending);
     if (current_thread)
-        pending |= current_thread->tpending.pending;
+        pending |= pending_load(&current_thread->tpending.pending);
     return pending;
 }
 
@@ -417,7 +420,7 @@ static inline uint64_t self_pending_locked(void)
  * blocked mask. Falls back to sig_state.blocked when current_thread is NULL
  * (early startup, before threads are initialized).
  */
-static inline uint64_t *thread_blocked_ptr(void)
+static inline _Atomic uint64_t *thread_blocked_ptr(void)
 {
     if (current_thread)
         return &current_thread->blocked;
@@ -455,6 +458,13 @@ static guest_t *_Atomic attention_guest;
 void signal_init(void)
 {
     host_sigbus_install();
+
+    /* One memset over the whole struct, atomic members included. Both callers
+     * (bootstrap and the fork-child receive) run before any sibling vCPU
+     * exists, so there is no concurrent reader to race, and guest.h asserts the
+     * atomic members are laid out like their plain types. Enumerating the
+     * fields instead would silently drop a field added later.
+     */
     memset(&sig_state, 0, sizeof(sig_state));
 
     /* Clear the attention singleton on every init pass. Bootstrap and the
@@ -719,7 +729,8 @@ int signal_pending(void)
      */
     uint64_t hint =
         atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
-    uint64_t blocked = __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
+    uint64_t blocked =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
     if ((hint & ~blocked) == 0)
         return 0;
 
@@ -727,7 +738,7 @@ int signal_pending(void)
      * (thread-directed) plus the shared set (process-directed), minus blocked.
      */
     pthread_mutex_lock(&sig_lock);
-    blocked = __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
+    blocked = atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
     int result = (self_pending_locked() & ~blocked) != 0;
     pthread_mutex_unlock(&sig_lock);
     return result;
@@ -750,9 +761,9 @@ bool signal_attention_needed(void)
      * at any moment, and signal_check_timer needs an HVC #5 epilogue to notice
      * it. Keep attention raised while any timer is armed.
      */
-    if (__atomic_load_n(&guest_itimer.active, __ATOMIC_ACQUIRE) ||
-        __atomic_load_n(&guest_itimer_virt.active, __ATOMIC_ACQUIRE) ||
-        __atomic_load_n(&guest_itimer_prof.active, __ATOMIC_ACQUIRE))
+    if (atomic_load_explicit(&guest_itimer.active, memory_order_acquire) ||
+        atomic_load_explicit(&guest_itimer_virt.active, memory_order_acquire) ||
+        atomic_load_explicit(&guest_itimer_prof.active, memory_order_acquire))
         return true;
     return false;
 }
@@ -760,7 +771,8 @@ bool signal_attention_needed(void)
 bool signal_pending_interruption(bool *restart_out)
 {
     pthread_mutex_lock(&sig_lock);
-    uint64_t blocked = __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
+    uint64_t blocked =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
     uint64_t deliverable = self_pending_locked() & ~blocked;
     if (deliverable == 0) {
         pthread_mutex_unlock(&sig_lock);
@@ -813,24 +825,54 @@ bool signal_pending_interruption(bool *restart_out)
     return any_interrupt;
 }
 
-const signal_state_t *signal_get_state(void)
+void signal_get_state(signal_state_snapshot_t *state)
 {
     /* Populate IPC-serializable fields from per-thread state under the lock to
      * avoid data races with concurrent sigaction calls. This ensures fork
      * children inherit the parent thread's blocked mask and altstack (POSIX:
      * fork preserves signal mask).
      */
+    if (!state)
+        return;
+
+    /* Zero outside the lock: the only bytes this contributes are the struct
+     * padding the field-by-field fill below cannot reach, and the snapshot goes
+     * to a socket, so uninitialized padding would be written to the child.
+     * state is the caller's local, so nothing else can see it yet.
+     */
+    memset(state, 0, sizeof(*state));
+
     pthread_mutex_lock(&sig_lock);
+    uint64_t self_blocked =
+        atomic_load_explicit(&sig_state.blocked, memory_order_relaxed);
     if (current_thread) {
-        sig_state.blocked = current_thread->blocked;
+        self_blocked = thread_blocked_load(current_thread);
+        atomic_store_explicit(&sig_state.blocked, self_blocked,
+                              memory_order_relaxed);
         sig_state.altstack.ss_sp = current_thread->altstack_sp;
         sig_state.altstack.ss_flags = current_thread->altstack_flags;
         sig_state.altstack._pad = 0;
         sig_state.altstack.ss_size = current_thread->altstack_size;
         sig_state.on_altstack = current_thread->on_altstack;
     }
+    memcpy(state->actions, sig_state.actions, sizeof(state->actions));
+    state->shared.pending = pending_load(&sig_state.shared.pending);
+    memcpy(state->shared.std_info_valid, sig_state.shared.std_info_valid,
+           sizeof(state->shared.std_info_valid));
+    memcpy(state->shared.std_info, sig_state.shared.std_info,
+           sizeof(state->shared.std_info));
+    memcpy(state->shared.rt_queue, sig_state.shared.rt_queue,
+           sizeof(state->shared.rt_queue));
+    memcpy(state->shared.rt_head, sig_state.shared.rt_head,
+           sizeof(state->shared.rt_head));
+    memcpy(state->shared.rt_info, sig_state.shared.rt_info,
+           sizeof(state->shared.rt_info));
+    state->blocked = self_blocked;
+    state->saved_blocked = sig_state.saved_blocked;
+    state->saved_blocked_valid = sig_state.saved_blocked_valid;
+    state->altstack = sig_state.altstack;
+    state->on_altstack = sig_state.on_altstack;
     pthread_mutex_unlock(&sig_lock);
-    return &sig_state;
 }
 
 static bool sigaction_autoreaps_sigchld(const linux_sigaction_t *act)
@@ -858,12 +900,30 @@ bool signal_refresh_identity_cache(void)
     return true;
 }
 
-void signal_set_state(const signal_state_t *state)
+void signal_set_state(const signal_state_snapshot_t *state)
 {
     if (!state)
         return;
     pthread_mutex_lock(&sig_lock);
-    sig_state = *state;
+    memcpy(sig_state.actions, state->actions, sizeof(sig_state.actions));
+    atomic_store_explicit(&sig_state.shared.pending, state->shared.pending,
+                          memory_order_relaxed);
+    memcpy(sig_state.shared.std_info_valid, state->shared.std_info_valid,
+           sizeof(sig_state.shared.std_info_valid));
+    memcpy(sig_state.shared.std_info, state->shared.std_info,
+           sizeof(sig_state.shared.std_info));
+    memcpy(sig_state.shared.rt_queue, state->shared.rt_queue,
+           sizeof(sig_state.shared.rt_queue));
+    memcpy(sig_state.shared.rt_head, state->shared.rt_head,
+           sizeof(sig_state.shared.rt_head));
+    memcpy(sig_state.shared.rt_info, state->shared.rt_info,
+           sizeof(sig_state.shared.rt_info));
+    atomic_store_explicit(&sig_state.blocked, state->blocked,
+                          memory_order_relaxed);
+    sig_state.saved_blocked = state->saved_blocked;
+    sig_state.saved_blocked_valid = state->saved_blocked_valid;
+    sig_state.altstack = state->altstack;
+    sig_state.on_altstack = state->on_altstack;
 
     /* Restore per-thread state from deserialized signal state (fork child).
      * POSIX: fork preserves blocked mask, altstack, and on_altstack.
@@ -876,6 +936,16 @@ void signal_set_state(const signal_state_t *state)
         current_thread->on_altstack = state->on_altstack;
     }
     pthread_mutex_unlock(&sig_lock);
+}
+
+uint64_t signal_shared_pending_load(void)
+{
+    return pending_load(&sig_state.shared.pending);
+}
+
+uint64_t signal_blocked_load(void)
+{
+    return atomic_load_explicit(thread_blocked_ptr(), memory_order_relaxed);
 }
 
 size_t signal_peek_signalfd(uint64_t mask,
@@ -914,7 +984,7 @@ size_t signal_peek_signalfd(uint64_t mask,
          */
         for (int signum = 1; signum <= LINUX_NSIG && total < max; signum++) {
             uint64_t bit = BIT64(signum - 1);
-            if (!(mask & bit) || !(sp->pending & bit))
+            if (!(mask & bit) || !(pending_load(&sp->pending) & bit))
                 continue;
 
             if (signum >= LINUX_SIGRTMIN) {
@@ -985,7 +1055,7 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
             break;
         signal_pending_t *sp = sets[s];
         uint64_t bit = sig_bit(signum);
-        if (!(sp->pending & bit))
+        if (!(pending_load(&sp->pending) & bit))
             break;
 
         const signal_rt_info_t *want = &expected[total];
@@ -995,8 +1065,10 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
                 break;
             const signal_rt_info_t *head = &sp->rt_info[idx][sp->rt_head[idx]];
 
-            /* Compare field by field; signal_rt_info_t has padding between
-             * si_int and si_ptr that memcmp would treat as significant.
+            /* Compare field by field. The gap between si_int and si_ptr is a
+             * named _pad member rather than compiler padding, so its bytes are
+             * defined, but it carries no meaning and memcmp would weigh it the
+             * same as a payload field.
              */
             if (head->signum != want->signum ||
                 head->si_code != want->si_code ||
@@ -1014,7 +1086,7 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
                 current.si_ptr != want->si_ptr)
                 break;
             sp->std_info_valid[signum - 1] = false;
-            sp->pending &= ~bit;
+            pending_clear(&sp->pending, bit);
         }
     }
     refresh_pending_hint_locked();
@@ -1026,7 +1098,8 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
 uint64_t signal_save_blocked(void)
 {
     pthread_mutex_lock(&sig_lock);
-    uint64_t saved = *thread_blocked_ptr();
+    uint64_t saved =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_relaxed);
     pthread_mutex_unlock(&sig_lock);
     return saved;
 }
@@ -1035,8 +1108,8 @@ void signal_set_blocked(uint64_t mask)
 {
     uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
     pthread_mutex_lock(&sig_lock);
-    __atomic_store_n(thread_blocked_ptr(), mask & ~unmaskable,
-                     __ATOMIC_RELEASE);
+    atomic_store_explicit(thread_blocked_ptr(), mask & ~unmaskable,
+                          memory_order_release);
     pthread_mutex_unlock(&sig_lock);
 }
 
@@ -1044,8 +1117,8 @@ void signal_restore_blocked(uint64_t saved)
 {
     uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
     pthread_mutex_lock(&sig_lock);
-    __atomic_store_n(thread_blocked_ptr(), saved & ~unmaskable,
-                     __ATOMIC_RELEASE);
+    atomic_store_explicit(thread_blocked_ptr(), saved & ~unmaskable,
+                          memory_order_release);
     pthread_mutex_unlock(&sig_lock);
 }
 
@@ -1132,7 +1205,7 @@ void signal_set_itimer(const struct timeval *value,
     if (old_interval)
         *old_interval = guest_itimer.interval;
     if (old_value) {
-        if (guest_itimer.active &&
+        if (atomic_load_explicit(&guest_itimer.active, memory_order_relaxed) &&
             timeval_cmp(&guest_itimer.expiry, &now) > 0) {
             *old_value = timeval_sub(&guest_itimer.expiry, &now);
         } else {
@@ -1149,7 +1222,7 @@ void signal_set_itimer(const struct timeval *value,
     bool arm = (value->tv_sec != 0 || value->tv_usec != 0);
     if (!arm) {
         /* Disarm */
-        __atomic_store_n(&guest_itimer.active, 0, __ATOMIC_RELEASE);
+        atomic_store_explicit(&guest_itimer.active, 0, memory_order_release);
     } else {
         /* Publish expiry and interval BEFORE the release-store of active.
          * signal_check_timer and signal_attention_needed ACQUIRE-load active
@@ -1160,7 +1233,7 @@ void signal_set_itimer(const struct timeval *value,
          */
         guest_itimer.expiry = timeval_add(&now, value);
         guest_itimer.interval = interval ? *interval : (struct timeval) {0, 0};
-        __atomic_store_n(&guest_itimer.active, 1, __ATOMIC_RELEASE);
+        atomic_store_explicit(&guest_itimer.active, 1, memory_order_release);
     }
     pthread_mutex_unlock(&sig_lock);
 
@@ -1179,7 +1252,7 @@ void signal_get_itimer(struct timeval *value, struct timeval *interval)
     if (interval)
         *interval = guest_itimer.interval;
     if (value) {
-        if (guest_itimer.active) {
+        if (atomic_load_explicit(&guest_itimer.active, memory_order_relaxed)) {
             struct timeval now = monotonic_now();
             if (timeval_cmp(&guest_itimer.expiry, &now) > 0) {
                 *value = timeval_sub(&guest_itimer.expiry, &now);
@@ -1202,7 +1275,7 @@ void signal_get_itimer(struct timeval *value, struct timeval *interval)
  */
 static bool check_one_timer(guest_itimer_t *timer, const struct timeval *now)
 {
-    if (!timer->active)
+    if (!atomic_load_explicit(&timer->active, memory_order_relaxed))
         return false;
     if (timeval_cmp(now, &timer->expiry) < 0)
         return false;
@@ -1210,7 +1283,7 @@ static bool check_one_timer(guest_itimer_t *timer, const struct timeval *now)
     if (timer->interval.tv_sec != 0 || timer->interval.tv_usec != 0) {
         timer->expiry = timeval_add(&timer->expiry, &timer->interval);
     } else {
-        __atomic_store_n(&timer->active, 0, __ATOMIC_RELEASE);
+        atomic_store_explicit(&timer->active, 0, memory_order_release);
     }
     return true; /* expired */
 }
@@ -1233,10 +1306,11 @@ static bool check_one_timer(guest_itimer_t *timer, const struct timeval *now)
  */
 static void signal_check_timers(bool cpu_timers)
 {
-    if (!__atomic_load_n(&guest_itimer.active, __ATOMIC_ACQUIRE) &&
-        (!cpu_timers ||
-         (!__atomic_load_n(&guest_itimer_virt.active, __ATOMIC_ACQUIRE) &&
-          !__atomic_load_n(&guest_itimer_prof.active, __ATOMIC_ACQUIRE))))
+    if (!atomic_load_explicit(&guest_itimer.active, memory_order_acquire) &&
+        (!cpu_timers || (!atomic_load_explicit(&guest_itimer_virt.active,
+                                               memory_order_acquire) &&
+                         !atomic_load_explicit(&guest_itimer_prof.active,
+                                               memory_order_acquire))))
         return;
 
     struct timeval now = monotonic_now();
@@ -1287,7 +1361,8 @@ void signal_set_itimer_virt(int which,
     if (old_interval)
         *old_interval = timer->interval;
     if (old_value) {
-        if (timer->active && timeval_cmp(&timer->expiry, &now) > 0)
+        if (atomic_load_explicit(&timer->active, memory_order_relaxed) &&
+            timeval_cmp(&timer->expiry, &now) > 0)
             *old_value = timeval_sub(&timer->expiry, &now);
         else
             *old_value = (struct timeval) {0, 0};
@@ -1295,11 +1370,11 @@ void signal_set_itimer_virt(int which,
     bool arm = value && (value->tv_sec != 0 || value->tv_usec != 0);
     if (value) {
         if (!arm) {
-            __atomic_store_n(&timer->active, 0, __ATOMIC_RELEASE);
+            atomic_store_explicit(&timer->active, 0, memory_order_release);
         } else {
             timer->expiry = timeval_add(&now, value);
             timer->interval = interval ? *interval : (struct timeval) {0, 0};
-            __atomic_store_n(&timer->active, 1, __ATOMIC_RELEASE);
+            atomic_store_explicit(&timer->active, 1, memory_order_release);
         }
     }
     pthread_mutex_unlock(&sig_lock);
@@ -1319,7 +1394,7 @@ void signal_get_itimer_virt(int which,
     if (interval)
         *interval = timer->interval;
     if (value) {
-        if (timer->active) {
+        if (atomic_load_explicit(&timer->active, memory_order_relaxed)) {
             struct timeval now = monotonic_now();
             if (timeval_cmp(&timer->expiry, &now) > 0)
                 *value = timeval_sub(&timer->expiry, &now);
@@ -1415,11 +1490,15 @@ int64_t signal_rt_sigprocmask(guest_t *g,
         return -LINUX_EINVAL;
 
     pthread_mutex_lock(&sig_lock);
-    uint64_t *blocked = thread_blocked_ptr();
+    _Atomic uint64_t *blocked = thread_blocked_ptr();
 
-    /* Return old mask if requested */
+    /* Return old mask if requested. Load the value out first: handing
+     * guest_write_small the _Atomic object copies its representation rather
+     * than performing an atomic read of it.
+     */
     if (oldset_gva) {
-        if (guest_write_small(g, oldset_gva, blocked, sizeof(*blocked)) < 0) {
+        uint64_t old_mask = atomic_load_explicit(blocked, memory_order_relaxed);
+        if (guest_write_small(g, oldset_gva, &old_mask, sizeof(old_mask)) < 0) {
             pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
         }
@@ -1436,7 +1515,8 @@ int64_t signal_rt_sigprocmask(guest_t *g,
         /* Never allow blocking SIGKILL or SIGSTOP */
         uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
 
-        uint64_t old_blocked = __atomic_load_n(blocked, __ATOMIC_RELAXED);
+        uint64_t old_blocked =
+            atomic_load_explicit(blocked, memory_order_relaxed);
 
         uint64_t new_mask;
         switch (how) {
@@ -1456,10 +1536,10 @@ int64_t signal_rt_sigprocmask(guest_t *g,
         new_mask &= ~unmaskable;
 
         /* Atomic store: thread_signal_deliverable reads this field lock-free
-         * via __atomic_load_n. Without atomic stores, the concurrent read is a
-         * C data race (UB).
+         * via atomic_load_explicit. Without atomic stores, the concurrent read
+         * is a C data race (UB).
          */
-        __atomic_store_n(blocked, new_mask, __ATOMIC_RELEASE);
+        atomic_store_explicit(blocked, new_mask, memory_order_release);
 
         /* If this mask change makes a queued signal deliverable on the current
          * thread, refresh the global hint. The caller is already returning
@@ -1471,7 +1551,7 @@ int64_t signal_rt_sigprocmask(guest_t *g,
          * every thread, skipped the interrupt path, and this thread then
          * unblocked it.
          */
-        uint64_t newly_unblocked = old_blocked & ~*blocked;
+        uint64_t newly_unblocked = old_blocked & ~new_mask;
         if (newly_unblocked & self_pending_locked())
             refresh_pending_hint_locked();
     }
@@ -1538,7 +1618,7 @@ static void signal_claim_shared_locked(signal_pending_t *tp, int signum)
     } else {
         info = signal_standard_peek_locked(&sig_state.shared, signum);
         sig_state.shared.std_info_valid[signum - 1] = false;
-        sig_state.shared.pending &= ~sig_bit(signum);
+        pending_clear(&sig_state.shared.pending, sig_bit(signum));
     }
     signal_enqueue_locked(tp, signum, &info);
     refresh_pending_hint_locked();
@@ -1559,14 +1639,16 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
             return -LINUX_EFAULT;
 
         pthread_mutex_lock(&sig_lock);
-        uint64_t *blocked = thread_blocked_ptr();
+        _Atomic uint64_t *blocked = thread_blocked_ptr();
 
         /* Save original blocked mask for restoration after signal delivery */
-        uint64_t saved_blocked = *blocked;
+        uint64_t saved_blocked =
+            atomic_load_explicit(blocked, memory_order_relaxed);
 
         /* Temporarily set blocked mask (never block SIGKILL/SIGSTOP) */
         uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
-        __atomic_store_n(blocked, mask & ~unmaskable, __ATOMIC_RELEASE);
+        atomic_store_explicit(blocked, mask & ~unmaskable,
+                              memory_order_release);
         pthread_mutex_unlock(&sig_lock);
 
         /* Suspend until a signal that will actually reach the guest becomes
@@ -1594,19 +1676,19 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
             signal_check_timer();
 
             pthread_mutex_lock(&sig_lock);
-            uint64_t now_blocked =
-                __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
+            uint64_t now_blocked = atomic_load_explicit(thread_blocked_ptr(),
+                                                        memory_order_acquire);
             signal_pending_t *tp =
                 current_thread ? &current_thread->tpending : NULL;
 
             /* Private set first, matching signal_deliver()'s dequeue order: a
              * thread-directed signal is already bound here and needs no claim.
              */
-            int wake_sig =
-                signal_first_waking_locked(tp ? tp->pending & ~now_blocked : 0);
+            int wake_sig = signal_first_waking_locked(
+                tp ? pending_load(&tp->pending) & ~now_blocked : 0);
             if (!wake_sig) {
                 int shared_sig = signal_first_waking_locked(
-                    sig_state.shared.pending & ~now_blocked);
+                    pending_load(&sig_state.shared.pending) & ~now_blocked);
                 if (shared_sig) {
                     wake_sig = shared_sig;
 
@@ -1648,8 +1730,8 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
              * signal_pending() and thread_signal_deliverable() read this field
              * lock-free, so store it the same way rt_sigprocmask does.
              */
-            __atomic_store_n(thread_blocked_ptr(), saved_blocked,
-                             __ATOMIC_RELEASE);
+            atomic_store_explicit(thread_blocked_ptr(), saved_blocked,
+                                  memory_order_release);
         }
         pthread_mutex_unlock(&sig_lock);
     }
@@ -1698,8 +1780,8 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
      * matching Linux dequeue_signal() priority.
      */
     signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
-    uint64_t thread_m = tp ? (tp->pending & mask) : 0;
-    uint64_t shared_m = sig_state.shared.pending & mask;
+    uint64_t thread_m = tp ? (pending_load(&tp->pending) & mask) : 0;
+    uint64_t shared_m = pending_load(&sig_state.shared.pending) & mask;
 
     if ((thread_m | shared_m) == 0) {
         pthread_mutex_unlock(&sig_lock);
@@ -1718,11 +1800,20 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
 
     /* Dequeue: same logic as signal_deliver. */
     if (signum >= LINUX_SIGRTMIN) {
+        /* Seed before dequeuing, the same way signal_deliver and
+         * signal_claim_shared_locked do. A pending RT bit whose queue holds no
+         * saved siginfo is reachable, and signal_rt_dequeue_locked leaves the
+         * descriptor untouched when it hits one, so without the seed the caller
+         * copies uninitialized host stack into the guest's siginfo_t. Linux
+         * collect_signal() fills the same default rather than withholding the
+         * signal, so the signum is still reported.
+         */
+        *info_out = signal_default_info(signum);
         signal_rt_dequeue_locked(src, signum, info_out);
     } else {
         *info_out = signal_standard_peek_locked(src, signum);
         src->std_info_valid[signum - 1] = false;
-        src->pending &= ~sig_bit(signum);
+        pending_clear(&src->pending, sig_bit(signum));
     }
     refresh_pending_hint_locked();
 
@@ -1810,8 +1901,10 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
          * TERM/CORE disposition, justifies waking the caller with -EINTR.
          */
         pthread_mutex_lock(&sig_lock);
-        uint64_t *blocked = thread_blocked_ptr();
-        uint64_t candidates = self_pending_locked() & ~*blocked & ~mask;
+        _Atomic uint64_t *blocked = thread_blocked_ptr();
+        uint64_t candidates =
+            self_pending_locked() &
+            ~atomic_load_explicit(blocked, memory_order_relaxed) & ~mask;
         bool interrupt = signal_set_would_wake_locked(candidates);
         pthread_mutex_unlock(&sig_lock);
         if (interrupt) {
@@ -2018,7 +2111,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
                                  signal_rt_info_t rt_info,
                                  int *exit_code)
 {
-    uint64_t *blocked = thread_blocked_ptr();
+    _Atomic uint64_t *blocked = thread_blocked_ptr();
     uint64_t *saved_ptr = thread_saved_blocked_ptr();
     bool *valid_ptr = thread_saved_valid_ptr();
 
@@ -2160,7 +2253,8 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         frame.uc.uc_sigmask = *saved_ptr;
         *valid_ptr = false;
     } else {
-        frame.uc.uc_sigmask = *blocked;
+        frame.uc.uc_sigmask =
+            atomic_load_explicit(blocked, memory_order_relaxed);
     }
 
     /* sigcontext: save all registers. fault_address: for synchronous faults
@@ -2299,13 +2393,13 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * thread and, before its pthread exists, the parent that cloned it, so the
      * two can never overlap.
      */
-    uint64_t new_blocked = __atomic_load_n(blocked, __ATOMIC_RELAXED);
+    uint64_t new_blocked = atomic_load_explicit(blocked, memory_order_relaxed);
     if (!(act->sa_flags & LINUX_SA_NODEFER))
         new_blocked |= sig_bit(signum);
     new_blocked |= act->sa_mask;
     /* Never block SIGKILL/SIGSTOP */
     new_blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
-    __atomic_store_n(blocked, new_blocked, __ATOMIC_RELEASE);
+    atomic_store_explicit(blocked, new_blocked, memory_order_release);
 
     /* 6. Track per-thread altstack usage */
     if (use_altstack && thr)
@@ -2385,7 +2479,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 {
     pthread_mutex_lock(&sig_lock);
-    uint64_t *blocked = thread_blocked_ptr();
+    _Atomic uint64_t *blocked = thread_blocked_ptr();
 
     /* Consider this thread's private (thread-directed) set plus the shared
      * (process-directed) set. Linux dequeue_signal() drains task->pending
@@ -2393,8 +2487,9 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
      * wins.
      */
     signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
-    uint64_t thread_d = tp ? (tp->pending & ~*blocked) : 0;
-    uint64_t shared_d = sig_state.shared.pending & ~*blocked;
+    uint64_t self_blocked = atomic_load_explicit(blocked, memory_order_relaxed);
+    uint64_t thread_d = tp ? (pending_load(&tp->pending) & ~self_blocked) : 0;
+    uint64_t shared_d = pending_load(&sig_state.shared.pending) & ~self_blocked;
     if ((thread_d | shared_d) == 0) {
         pthread_mutex_unlock(&sig_lock);
         return 0;
@@ -2424,7 +2519,7 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
     } else {
         rt_info = signal_standard_peek_locked(src, signum);
         src->std_info_valid[signum - 1] = false;
-        src->pending &= ~sig_bit(signum);
+        pending_clear(&src->pending, sig_bit(signum));
     }
 
     /* A directed dequeue cleared a bit that only this thread's set held, so the
@@ -2464,9 +2559,10 @@ int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
      */
     int idx = signum - 1;
     if (RANGE_CHECK(idx, 0, LINUX_NSIG)) {
-        uint64_t *blocked = thread_blocked_ptr();
+        _Atomic uint64_t *blocked = thread_blocked_ptr();
         linux_sigaction_t *act = &sig_state.actions[idx];
-        if (act->sa_handler == LINUX_SIG_IGN || (*blocked & sig_bit(signum))) {
+        uint64_t cur = atomic_load_explicit(blocked, memory_order_relaxed);
+        if (act->sa_handler == LINUX_SIG_IGN || (cur & sig_bit(signum))) {
             act->sa_handler = LINUX_SIG_DFL;
             act->sa_flags &= ~LINUX_SA_SIGINFO;
 
@@ -2475,9 +2571,8 @@ int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
              * (signal_queue_thread_common, thread_signal_deliverable), so a
              * plain read-modify-write here races that scan.
              */
-            uint64_t cleared =
-                __atomic_load_n(blocked, __ATOMIC_RELAXED) & ~sig_bit(signum);
-            __atomic_store_n(blocked, cleared, __ATOMIC_RELEASE);
+            atomic_store_explicit(blocked, cur & ~sig_bit(signum),
+                                  memory_order_release);
         }
     }
 
@@ -2579,7 +2674,7 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
      * on_altstack=1. Matches Linux kernel's restore_altstack.
      */
     pthread_mutex_lock(&sig_lock);
-    uint64_t *blocked = thread_blocked_ptr();
+    _Atomic uint64_t *blocked = thread_blocked_ptr();
 
     /* Published in one release store, not built up in place. sig_lock only
      * serializes the writers; thread_signal_deliverable reads this field
@@ -2589,7 +2684,7 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
      */
     uint64_t restored_mask = frame.uc.uc_sigmask &
                              ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
-    __atomic_store_n(blocked, restored_mask, __ATOMIC_RELEASE);
+    atomic_store_explicit(blocked, restored_mask, memory_order_release);
     if (current_thread) {
         uint64_t restored_sp = frame.uc.uc_mcontext.sp;
         if (current_thread->altstack_sp &&

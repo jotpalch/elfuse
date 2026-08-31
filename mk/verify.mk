@@ -55,10 +55,10 @@
 #
 # Frama-C 33 ships a macos_arm machdep, which sounds like the honest name for
 # what is being assumed here, and it is not usable: it is not GCC-based, and
-# -include gcc-atomics.h pulls in Frama-C's own __fc_gcc_builtins.h, which
+# -include prelude.h pulls in Frama-C's own __fc_gcc_builtins.h, which
 # refuses __int128 outside a GCC-based machdep. Measured, not assumed: every
 # target aborts at parse time with "use a GCC-based machdep to enable it".
-# Revisit if the atomics stub ever stops being needed.
+# Revisit if the prelude ever stops being needed.
 #
 # The RSP proof DOES cover functions taking plain char: gdb_hex_pair,
 # gdb_hex_decode, gdb_parse_hex and rsp_checksum. What keeps their results
@@ -98,21 +98,22 @@ CPP_DEFS :=
 # every source reaching src/core/guest.h or src/runtime/thread.h aborted on the
 # missing header before parsing began. See the stub for what it declares.
 #
-# -include gcc-atomics.h covers everything the analyzer needs and a compiler
-# provides for free. It supplies the type-generic __atomic_*_n builtins, which
-# Frama-C's libc does not model at all; without them those calls are implicit
-# declarations whose argument types are inferred per translation unit, which
-# parses one file at a time and then refuses the moment two files disagree on a
-# width. It also pulls in __fc_gcc_builtins.h for the builtins Frama-C does
-# model, and stdatomic.h for the _Atomic qualifier its front end cannot parse --
-# that header is where Frama-C states "_Atomic is currently ignored", so the
-# concession is the analyzer's own rather than one invented here. The tree
-# includes stdatomic.h nowhere, so it has to arrive ahead of the source.
+# -include prelude.h covers the two things the analyzer needs and a compiler
+# provides for free. It pulls in __fc_gcc_builtins.h, where Frama-C models
+# __builtin_ctzll, __builtin_add_overflow and the fences; nothing in the modeled
+# libc includes that header, so without it those are implicit declarations whose
+# argument types are inferred per translation unit, which parses one file at a
+# time and then refuses the moment two files disagree on a width. It also pulls
+# in stdatomic.h, both for the _Atomic qualifier the front end cannot parse and
+# for the atomic_*_explicit vocabulary the tree calls, all of which Frama-C
+# models there. That header is where Frama-C states "_Atomic is currently
+# ignored", so the concession is the analyzer's own rather than one invented
+# here. The qualifier reaches a source through headers it includes first, so the
+# definition has to arrive ahead of everything.
 #
 # Ignoring _Atomic is sound for exactly the reasoning these targets do, which is
 # per-function runtime-error and bounds obligations under WP, one thread at a
 # time. It would NOT be sound for a concurrency analysis. No target here is one.
-# See the stub for the same limit on the atomic builtins.
 #
 # Together these are what makes most of the parsing set parse at all: without
 # the stubs only a couple of sources load. The rest stop on macOS headers
@@ -125,7 +126,7 @@ FRAMAC_STUB_DIR := frama-c-stubs
 
 FRAMAC_CPP_ARGS = -nostdinc \
     -isystem $$($(FRAMAC) -print-share-path)/libc \
-    -I$(FRAMAC_STUB_DIR) -include gcc-atomics.h -include macos-libc.h -Isrc -I$(BUILD_DIR) \
+    -I$(FRAMAC_STUB_DIR) -include prelude.h -include macos-libc.h -Isrc -I$(BUILD_DIR) \
     $(CPP_DEFS)
 
 # One proof per attacker-facing parser. Each is declared by a single

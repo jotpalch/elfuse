@@ -36,7 +36,14 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
     return path[plen] == '\0' || path[plen] == '/';
 }
 
-#define SYSFS_CPU_PREFIX "/sys/devices/system/cpu"
+/* The whole sysfs view: the USB layer answers /sys, /sys/bus, /sys/class and
+ * everything under them (usb-sysfs.c), with /sys/devices/system/cpu carved out
+ * for the older CPU-topology stub. Every gate below -- open, stat, poll --
+ * reaches the whole view through SYSFS_PREFIX; the carve-out is about which
+ * module answers, not about what the filesystem can do.
+ */
+#define SYSFS_PREFIX "/sys"
+#define DEV_USB_PREFIX "/dev/bus"
 
 bool path_might_use_open_intercept(const char *path)
 {
@@ -49,7 +56,7 @@ bool path_might_use_open_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
         return true;
     if (!strcmp(path, "/etc/mtab"))
         return true;
@@ -70,6 +77,108 @@ bool path_might_use_open_intercept(const char *path)
         return true;
 
     return false;
+}
+
+/* The part of a guest /proc path that follows the process directory, or NULL
+ * when the path names no process directory at all: "/proc/self/stat" and
+ * "/proc/41/stat" both yield "stat", "/proc/self" yields "", and
+ * "/proc/meminfo" yields NULL.
+ *
+ * A "task/<tid>/" segment is stripped with the process directory it sits in, so
+ * "/proc/41/task/41/mounts" yields "mounts" too. Linux answers the thread
+ * spelling of these names the way it answers the process one, measured on 6.12
+ * over mounts, mountinfo, net/dev and stat.
+ */
+static const char *proc_pid_dir_suffix(const char *path)
+{
+    if (strncmp(path, "/proc/", 6) != 0)
+        return NULL;
+
+    const char *p = path + 6;
+    if (!strncmp(p, "self", 4) && (p[4] == '\0' || p[4] == '/')) {
+        p += 4;
+    } else if (!strncmp(p, "thread-self", 11) &&
+               (p[11] == '\0' || p[11] == '/')) {
+        p += 11;
+    } else {
+        const char *d = p;
+        while (*d >= '0' && *d <= '9')
+            d++;
+        if (d == p || (*d != '\0' && *d != '/'))
+            return NULL;
+        p = d;
+    }
+    if (*p == '/')
+        p++;
+
+    if (!strncmp(p, "task/", 5)) {
+        const char *d = p + 5;
+        const char *tid = d;
+        while (*d >= '0' && *d <= '9')
+            d++;
+        if (d != tid && (*d == '\0' || *d == '/'))
+            p = (*d == '/') ? d + 1 : d;
+    }
+    return p;
+}
+
+/* Whether Linux gives the file behind this intercepted guest path a poll
+ * method, which is the only thing epoll_ctl reads EPERM off. fstat cannot
+ * answer it: elfuse serves several intercepted trees from ordinary host files,
+ * so the host object describes elfuse's staging rather than the file the guest
+ * named, and the path is what still knows.
+ *
+ * The answer per family was measured against Linux 6.12 rather than reasoned
+ * from the file's contents, because the two do not track each other: a
+ * per-process procfs file is opened through proc_single_file_operations, which
+ * carries no poll, while every proc_create entry gets proc_reg_poll whether or
+ * not it has anything to report. /proc/<pid>/mounts and mountinfo are the
+ * exception that makes the split visible -- they go through mounts_operations
+ * so a guest can wait for the mount table to change, while mountstats next to
+ * them does not and is refused. The /proc/<pid>/net subtree is the other
+ * exception, measured on Linux rather than reached here: elfuse serves
+ * /proc/net but not yet the per-process spelling of it, so that arm is
+ * unreachable today and is present so it does not become wrong the day it is.
+ */
+bool path_intercept_poll_capable(const char *path)
+{
+    if (!path || path[0] != '/')
+        return false;
+
+    const char *pid_rel = proc_pid_dir_suffix(path);
+    if (pid_rel)
+        return !strcmp(pid_rel, "mounts") || !strcmp(pid_rel, "mountinfo") ||
+               !strncmp(pid_rel, "net/", 4);
+
+    /* sysfs attributes are pollable through kernfs, and /etc/mtab is a symlink
+     * onto the mount table. What is left of the intercept surface --
+     * /etc/passwd and /etc/group, the utmp files, most of /dev and the FUSE
+     * mounts -- is a plain file, a character device or a fifo, all of which the
+     * host object describes correctly, so the caller's fstat and kqueue probe
+     * answer for them.
+     *
+     * /dev/random is the exception, and it does not extend to the /dev/urandom
+     * beside it. random_fops carries .poll and urandom_fops does not, since a
+     * read from urandom never waits, so Linux 6.12 answers 0 for the first and
+     * EPERM for the second. macOS refuses a knote on both, which leaves the
+     * host object unable to tell them apart.
+     */
+    if (!strncmp(path, "/proc/", 6))
+        return true;
+
+    /* Every sysfs attribute, not the CPU subtree alone: pollability comes from
+     * kernfs_fop_poll, which sysfs_file_operations installs on all of them, so
+     * a real /sys answers epoll_ctl(ADD) with 0 for net/lo/mtu and for
+     * bus/usb/devices/1-1/idVendor alike (measured on 6.19). Naming one subtree
+     * made every attribute the USB layer added report EPERM, which is the
+     * answer for a file that cannot be polled at all -- and udev-style readers
+     * arm `uevent` before they read it.
+     */
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
+        return true;
+    if (!strcmp(path, "/dev/random"))
+        return true;
+    return !strcmp(path, "/etc/mtab");
 }
 
 bool path_might_use_stat_intercept(const char *path)
@@ -93,7 +202,9 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
+        return true;
+    if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
         return true;
 
     return false;
@@ -1054,6 +1165,30 @@ static int proc_seed_absolute_path(const char *path,
     return proc_apply_components(path, out, outsz, marks, marks_cap, depth);
 }
 
+/* Does this O_PATH descriptor name a directory?
+ *
+ * The stamped path is the FD_PATH identity: a synthetic entry's host_fd is only
+ * a backing placeholder, so the intercepts are asked first and the host fd is
+ * consulted only for descriptors they do not serve. The open's O_NOFOLLOW
+ * decides whether the descriptor refers to a symlink or to its target, exactly
+ * as it does for fstat.
+ *
+ * Undecidable cases answer true: leaving the walk as it was is the conservative
+ * outcome, whereas inventing an ENOTDIR would break a resolution that works.
+ */
+static bool proc_path_fd_is_dir(const fd_entry_t *snap)
+{
+    struct stat st;
+    bool follow = !(snap->linux_flags & LINUX_O_NOFOLLOW);
+    int intercepted = proc_intercept_stat_at(snap->proc_path, &st, follow);
+    if (intercepted == 0)
+        return S_ISDIR(st.st_mode);
+    if (intercepted == PROC_NOT_INTERCEPTED && snap->host_fd >= 0 &&
+        fstat(snap->host_fd, &st) == 0)
+        return S_ISDIR(st.st_mode);
+    return true;
+}
+
 int resolve_proc_dirfd_path(guest_fd_t dirfd,
                             const char *path,
                             char *out,
@@ -1062,10 +1197,32 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
     if (dirfd == LINUX_AT_FDCWD || !path || path[0] == '/')
         return 0;
 
+    /* FD_PATH joins FD_DIR: O_PATH directory descriptors are how systemd's
+     * chase() walks a path one openat per component, and a stamped O_PATH dirfd
+     * must keep resolving through the intercepts or the walk falls off the
+     * synthetic tree onto its host backing (and loses the stamp for every later
+     * component).
+     */
     fd_entry_t snap;
-    if (!fd_snapshot(dirfd, &snap) || snap.type != FD_DIR ||
+    if (!fd_snapshot(dirfd, &snap) ||
+        (snap.type != FD_DIR && snap.type != FD_PATH) ||
         snap.proc_path[0] == '\0')
         return 0;
+
+    /* Linux resolves a relative name against a dirfd only when the dirfd is a
+     * directory: openat() with an O_PATH descriptor on a regular file or on a
+     * symlink is ENOTDIR, decided before the name is looked up. FD_DIR is a
+     * directory by construction, so only FD_PATH has to be asked.
+     *
+     * The empty path is deliberately excluded: it is AT_EMPTY_PATH territory,
+     * where the descriptor names itself rather than a child, and fstatat() on
+     * an O_PATH fd of a regular file has to keep working.
+     */
+    if (snap.type == FD_PATH && path[0] != '\0' &&
+        !proc_path_fd_is_dir(&snap)) {
+        errno = ENOTDIR;
+        return -1;
+    }
 
     size_t marks[PROC_PATH_COMPONENTS_MAX];
     size_t depth;
@@ -1089,13 +1246,17 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
     if (proc_acquire_cwd_view(&view) < 0)
         return 0;
 
-    /* /dev/pts joins /proc here: both are served from host directories whose
-     * contents are not what the guest names, so a relative path measured
-     * against one has to be rebuilt as a guest path and re-offered to the
-     * intercepts. The component walk below is base-agnostic.
+    /* /dev/pts and the synthetic USB trees join /proc here: all are served from
+     * host directories whose contents are not what the guest names, so a
+     * relative path measured against one has to be rebuilt as a guest path and
+     * re-offered to the intercepts. Without the /sys and /dev/bus arms a cwd
+     * set by fchdir() onto a synthetic USB directory would resolve relative
+     * names straight against the scratch tree. The component walk below is
+     * base-agnostic.
      */
     int rc = 0;
-    if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8)) {
+    if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
+        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8)) {
         size_t marks[PROC_PATH_COMPONENTS_MAX];
         size_t depth;
         if (proc_seed_absolute_path(view.path, out, outsz, marks,
@@ -1126,6 +1287,62 @@ int resolve_proc_at_path(guest_fd_t dirfd,
         return rc;
 
     return resolve_proc_cwd_path(path, out, outsz);
+}
+
+/* Rebase a relative path against the host directory a descriptor points at,
+ * producing the guest-visible absolute spelling: F_GETPATH names where the
+ * directory lives on the host, path_host_to_guest strips the sysroot, and the
+ * component walk folds "." and "..".
+ *
+ * This exists for relative walkers (systemd's chase() opens "/", then "sys",
+ * then "bus", one openat per component) stepping from a host-backed directory
+ * into a synthetic subtree the host does not carry: the host openat fails
+ * ENOENT even though the guest path is served by an intercept. Callers rebase
+ * on that failure and re-offer the absolute path to the intercept gates.
+ *
+ * Returns 1 with out filled, 0 when the descriptor's path cannot be mapped (not
+ * an error: the caller keeps the host result).
+ */
+int path_rebase_hostdirfd(int host_dirfd,
+                          const char *rel,
+                          char *out,
+                          size_t outsz)
+{
+    if (!rel || rel[0] == '/' || rel[0] == '\0')
+        return 0;
+    char host_dir[LINUX_PATH_MAX];
+    if (fcntl(host_dirfd, F_GETPATH, host_dir) < 0)
+        return 0;
+
+    /* Only a descriptor inside the sysroot has a guest spelling. With a sysroot
+     * configured, path_host_to_guest passes a host path that is not under it
+     * through unchanged, so a dirfd on the host's /dev -- reachable through any
+     * sysroot symlink pointing out of the tree -- rebased to the guest-absolute
+     * "/dev", and the retry then handed the walk to the /dev/bus/usb intercept.
+     * The name the guest asked for lives outside the namespace the intercepts
+     * describe, so the ENOENT the host already gave is the answer; without a
+     * sysroot the guest root is the host root and every host path does have a
+     * guest spelling.
+     */
+    char sysroot[LINUX_PATH_MAX];
+    if (proc_sysroot_snapshot(sysroot, sizeof(sysroot))) {
+        size_t sl = strlen(sysroot);
+        if (strncmp(host_dir, sysroot, sl) != 0 ||
+            (host_dir[sl] != '\0' && host_dir[sl] != '/'))
+            return 0;
+    }
+
+    char guest_dir[LINUX_PATH_MAX];
+    if (path_host_to_guest(host_dir, guest_dir, sizeof(guest_dir)) < 0)
+        return 0;
+    size_t marks[PROC_PATH_COMPONENTS_MAX];
+    size_t depth;
+    if (proc_seed_absolute_path(guest_dir, out, outsz, marks, ARRAY_SIZE(marks),
+                                &depth) < 0 ||
+        proc_apply_components(rel, out, outsz, marks, ARRAY_SIZE(marks),
+                              &depth) < 0)
+        return 0;
+    return 1;
 }
 
 bool path_openat2_stays_beneath(const char *path, bool clamp_at_root)

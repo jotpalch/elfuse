@@ -19,7 +19,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4650U /* "ELFP" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4651U /* "ELFQ" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -116,8 +116,12 @@ typedef struct {
      * again: whether the description came from outside elfuse (the launcher's
      * stdio, or an alias of it) and whether elfuse owns its O_NONBLOCK. See
      * fd_alias_carried.
+     *
+     * path_poll_capable rides along for the same reason and cannot be rebuilt
+     * on the far side: the child holds the descriptor, not the guest path the
+     * parent classified it from.
      */
-    int32_t foreign_description, nonblock_owned;
+    int32_t foreign_description, nonblock_owned, path_poll_capable;
     char proc_path[FD_VIRTUAL_PATH_MAX];
 } ipc_fd_entry_t;
 
@@ -148,4 +152,6 @@ int fork_ipc_send_process_state(int ipc_sock,
                                 bool regions_tracker_stale_snapshot,
                                 const guest_region_t *preannounced_snapshot,
                                 uint32_t num_preannounced);
-int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig);
+int fork_ipc_recv_process_state(int ipc_fd,
+                                guest_t *g,
+                                signal_state_snapshot_t *sig);

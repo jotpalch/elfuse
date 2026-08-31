@@ -7,14 +7,14 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-skill-refs test-gdbstub test-coreutils test-busybox \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
         test-rosetta-cli test-rosetta-statics test-rosetta-failure-modes \
         test-rosetta-alpine test-rosetta-audit test-rosetta-jit \
         test-rosetta-glibc test-rosetta-madvise test-rosetta-msync \
-        test-rosetta-mremap test-rosetta-all bench-rosetta \
+        test-rosetta-mremap test-rosetta-all test-sharun bench-rosetta \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
@@ -36,10 +36,12 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
+        test-usb-desc-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
-        test-sysroot-root \
+        test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
+        test-usb-sysfs-overflow \
         test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
@@ -76,6 +78,12 @@ check-eintr-contract:
 check-lock-order:
 	@python3 scripts/check-lock-order.py --self-test
 	@python3 scripts/check-lock-order.py
+
+## Fail when an atomic access states no memory order
+check-atomics:
+	@echo "  ATOMICS src/"
+	@python3 scripts/check-atomics.py --self-test
+	@python3 scripts/check-atomics.py
 
 ## Verify every path, target, and section the skills name still resolves
 check-skill-refs:
@@ -138,6 +146,14 @@ check-tsan:
 # CI budget. "I/O subsystem" is included for its fd-table refcount/ABA races
 # (epoll-mt/aba/refcount, getdents-refcount) now that fd_entry_t.type is atomic;
 # the remaining compat sections (rseq, /proc, sockets) stay on the release lane.
+#
+# The USB tree is reached through CHECK_SHARED_LANES rather than through a
+# section here: it is not in tests/manifest.txt (it has no counterpart the
+# reference kernel can adjudicate, so test-matrix.sh does not register it, and
+# .ci/check-matrix-lists.sh rejects a manifest binary the matrix never runs).
+# It belongs on the sanitizer lane all the same -- the layer composes a dev_t
+# by shifting a major number, which is exactly the arithmetic UBSAN is there to
+# adjudicate, and nothing else on the lane builds that tree.
 SANITIZER_SECTIONS := Threading|Stress|Signal.*thread|Fork edge|CoW fork|Guard page|mremap|MAP_SHARED|madvise|futex|FD table race|Multithreaded|SysV shared|membarrier|I/O subsystem
 
 # One banner-plus-run pair, for a host unit binary run directly and for a
@@ -195,7 +211,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-teardown-live-vcpu-host test-stdio-nonblock-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
-        test-wakeup-pipe-host test-guest-env-host)
+        test-wakeup-pipe-host test-guest-env-host \
+        test-usb-desc-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -215,6 +232,10 @@ $(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
+$(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
+$(call run-lane,test-usb-sysfs,synthetic USB tree contract)
+$(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
+$(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -228,7 +249,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-skill-refs test-config \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-config \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
@@ -268,6 +289,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-launch-flags,launch flags)
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
+	$(call run-lane,test-sharun,sharun launcher and probe)
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
@@ -278,7 +300,7 @@ BENCH_GUARDRAIL_REQUIRE_STATIC := 0
 ifndef GUEST_TEST_BINARIES
   BENCH_GUARDRAIL_DEPS += $(BUILD_DIR)/bench-hot-guard
   BENCH_GUARDRAIL_REQUIRE_STATIC := 1
-  ifneq ($(wildcard $(LINUX_TOOLCHAIN)/aarch64-unknown-linux-gnu/sysroot/.),)
+  ifneq ($(CROSS_GLIBC_SYSROOT_PRESENT),)
     BENCH_GUARDRAIL_DEPS += $(BUILD_DIR)/bench-hot-guard-glibc
   endif
 endif
@@ -287,6 +309,7 @@ test-bench-guardrail: $(BENCH_GUARDRAIL_DEPS)
 	    BENCH_GUARDRAIL_DIR="$(TEST_DIR)" \
 	    BENCH_GUARDRAIL_REQUIRE_STATIC="$(BENCH_GUARDRAIL_REQUIRE_STATIC)" \
 	    LINUX_TOOLCHAIN="$(LINUX_TOOLCHAIN)" \
+	    GLIBC_SYSROOT="$(CROSS_GLIBC_SYSROOT)" \
 	    bash tests/test-bench-guardrail.sh
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
@@ -377,6 +400,7 @@ test-sysroot-symlink-escape: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-esc
 	ln -sf "$$secret_dir/secret.txt" "$$tmpdir/d1/abs-link"; \
 	ln -sf "$$secret_dir/secret.txt" "$$tmpdir/d2/abs-link"; \
 	ln -sf "../d2/abs-link" "$$tmpdir/d1/chain-link"; \
+	ln -sf /dev "$$tmpdir/d1/dev-bridge"; \
 	depth=$$(printf '%s' "$$tmpdir/d1" | tr -cd '/' | wc -c | tr -d ' '); \
 	relback=""; i=0; \
 	while [ "$$i" -lt "$$depth" ]; do relback="../$$relback"; i=$$((i + 1)); done; \
@@ -1206,6 +1230,22 @@ else
   BUSYBOX_DEPS :=
 endif
 
+# The probe is built only when the cross-glibc sysroot exists; without it the
+# lane still covers the launcher and reports the probe arm as skipped.
+# The launcher binaries are fetched by tests/fetch-sharun-bin.sh, not listed
+# here: a make prerequisite that cannot be downloaded is fatal, and this lane
+# runs inside "make check". Fetching from the script lets an unreachable
+# network degrade to a skip, the same way the glibc package already does.
+TEST_SHARUN_PROBE_DIR :=
+ifneq ($(CROSS_GLIBC_SYSROOT_PRESENT),)
+  TEST_SHARUN_PROBE_DIR := $(BUILD_DIR)
+endif
+
+## Run sharun and its probe under elfuse: the prebuilt launcher and the
+## cross-built probe always, plus a bundle assembled from those two.
+test-sharun: $(ELFUSE_BIN) $(TEST_SHARUN_PROBE_DIR:%=%/probe)
+	$(call RUN_OPTIONAL_SKIP77,FIXTURES_DIR="$(FIXTURES_DIR)" CROSS_COMPILE="$(CROSS_COMPILE)" SHARUN_FIXTURE_DIR="$(SHARUN_FIXTURE_DIR)" MATRIX_ROSETTA_TRANSLATOR="$(MATRIX_ROSETTA_TRANSLATOR)" ELFUSE_NO_ROSETTA="$(ELFUSE_NO_ROSETTA)" TEST_TIMEOUT="$(TEST_TIMEOUT)" bash tests/test-sharun.sh $(ELFUSE_BIN) $(TEST_SHARUN_PROBE_DIR),test-sharun)
+
 $(BUILD_DIR)/busybox: | $(BUILD_DIR)
 	@printf "$(BLUE)▸ Downloading$(RESET) busybox-static (arm64) from $(BUSYBOX_PACKAGE_PAGE)\n"
 	@tmpdir="$(BUILD_DIR)/busybox-static.tmp"; \
@@ -1507,9 +1547,44 @@ test-casefold-host: $(BUILD_DIR)/test-casefold-host
 test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 	$(BUILD_DIR)/test-casefold-walk-host
 
+## Assert the synthetic USB tree's contract and its two agreeing views
+# The device-dependent half only runs against whatever is attached, so the lane
+# prints the device count rather than letting an empty bus read as full cover.
+test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
+
+## The /sys ours/not-ours split and the fchdir/cwd containment need a populated
+## /sys behind the synthetic USB view, so this lane stages a sysroot skeleton
+## (a net address, a THP knob, a node list) and runs the guest against it with
+## the deterministic USB fixture so the /sys/bus/usb assertions have devices.
+test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	sysroot="$$tmpdir/sysroot"; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$sysroot/sys/class/net/eth0" \
+		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
+		"$$sysroot/sys/devices/system/node"; \
+	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
+	printf 'always [madvise] never\n' \
+		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
+	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-sysroot
+
+## The devnum cap needs more than 127 address-less devices on one bus, which
+## the overflow fixture injects through the real fallback path. No sysroot: the
+## whole model is synthetic here.
+test-usb-sysfs-overflow: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+	ELFUSE_USB_FIXTURE=overflow $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+
 ## Run the absock derived-name unit test natively on the host
 test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 	$(BUILD_DIR)/test-absock-names-host
+
+## Run the USB descriptor blob walk unit test natively on the host
+test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
+	$(BUILD_DIR)/test-usb-desc-host
 
 # Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
 # race detector, so check-sanitizer is where this lane has its full weight.

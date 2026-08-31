@@ -863,7 +863,8 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
         pthread_mutex_lock(&mmap_lock);
         return -LINUX_ENAMETOOLONG;
     }
-    exec_handoff.blocked_mask = current_thread ? current_thread->blocked : 0;
+    exec_handoff.blocked_mask =
+        current_thread ? thread_blocked_load(current_thread) : 0;
     pthread_mutex_unlock(&exec_handoff_lock);
 
     /* The leader may be parked in a blocking syscall. thread_stop_requested is

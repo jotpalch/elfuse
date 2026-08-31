@@ -598,6 +598,11 @@ static void fuse_notify_drain_fd_locked(int fd)
 {
     if (fd < 0)
         return;
+
+    /* The notify fd is elfuse's own O_NONBLOCK pipe, so this drain cannot park
+     * the caller under fuse_lock. Static analysis reads any read(2) between a
+     * lock and its unlock as a blocking call; this one ends on EAGAIN.
+     */
     uint8_t byte;
     while (read(fd, &byte, 1) > 0)
         ;

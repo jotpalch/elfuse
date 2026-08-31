@@ -141,6 +141,14 @@ static inline int path_component_copy(char *dst,
 
 bool path_might_use_open_intercept(const char *path);
 bool path_might_use_stat_intercept(const char *path);
+
+/* Whether Linux gives the file behind this intercepted path a poll method.
+ * epoll_ctl asks it because fstat describes elfuse's staging file rather than
+ * the file the guest named. Enumerates the same surface as
+ * path_might_use_open_intercept and belongs next to it: an intercept added to
+ * one without the other is a target answered from the wrong object.
+ */
+bool path_intercept_poll_capable(const char *path);
 int path_check_intercept_access(const struct stat *st, int mode, int flags);
 
 /* Resolve a guest path against dirfd into every spelling a syscall handler
@@ -253,6 +261,18 @@ int path_translate_dirent_name(bool dir_holds_escapes,
                                const char *host_name,
                                char *guest_name,
                                size_t guest_name_sz);
+
+/* Rebase a relative path against a host directory fd into the guest-visible
+ * absolute spelling (F_GETPATH + sysroot strip + dot-folding).
+ *
+ * Returns 1 with out filled, 0 when no mapping exists. See path.c for the
+ * chase() rationale.
+ */
+int path_rebase_hostdirfd(int host_dirfd,
+                          const char *rel,
+                          char *out,
+                          size_t outsz);
+
 int resolve_proc_at_path(guest_fd_t dirfd,
                          const char *path,
                          char *out,

@@ -211,7 +211,7 @@ static int translate_clockid(int linux_clockid)
             bool is_perthread = linux_clockid & LINUX_CPUCLOCK_PERTHREAD_MASK;
             int self_pid = (int) proc_get_pid();
             int self_tid =
-                current_thread ? (int) current_thread->guest_tid : self_pid;
+                current_thread ? (int) thread_tid(current_thread) : self_pid;
             int self_match = is_perthread ? self_tid : self_pid;
             if (encoded_id != 0 && encoded_id != self_match)
                 return -1; /* Foreign process/thread clocks unsupported */

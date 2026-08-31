@@ -754,6 +754,10 @@ run_unit_tests()
     test_check "$runner" "test-epoll-dup" "0 failed" "$bindir/test-epoll-dup"
     test_check "$runner" "test-epoll-refcount" "0 failed" \
         "$bindir/test-epoll-refcount"
+    test_check "$runner" "test-epoll-del-leak" "0 failed" \
+        "$bindir/test-epoll-del-leak"
+    test_check "$runner" "test-epoll-unsupported" "0 failed" \
+        "$bindir/test-epoll-unsupported"
     test_check "$runner" "test-timerfd" "0 failed" "$bindir/test-timerfd"
     test_rc "$runner" "test-eventfd-dup" 0 "$bindir/test-eventfd-dup"
     test_rc "$runner" "test-epoll-mt" 0 "$bindir/test-epoll-mt"
@@ -763,6 +767,7 @@ run_unit_tests()
     test_rc "$runner" "test-pty" 0 "$bindir/test-pty"
     test_rc "$runner" "test-ioctl-fioasync" 0 "$bindir/test-ioctl-fioasync"
     test_rc "$runner" "test-getdents-refcount" 0 "$bindir/test-getdents-refcount"
+    test_rc "$runner" "test-dir-fd-budget" 0 "$bindir/test-dir-fd-budget"
 
     printf "\n/proc and /dev\n"
     test_check "$runner" "test-proc" "0 failed" "$bindir/test-proc"

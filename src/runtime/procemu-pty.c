@@ -135,7 +135,19 @@ bool pty_slave_num_from_path(const char *path, uint32_t *out)
  *
  * Counters are atomic rather than mutex-guarded on purpose: a process that dies
  * holding a process-shared mutex would wedge every other process on this pty,
- * and macOS has no robust mutexes.
+ * and macOS has no robust mutexes. slave_count and seen are read together as
+ * one predicate by pty_slot_hung_up_locked, and they are written by other
+ * processes, so the two are sequentially consistent rather than relaxed.
+ * seq_cst puts every access to the pair in one total order, which is what makes
+ * "seen is set, so the count that goes with it is visible" hold: a reader that
+ * observes seen after a sibling set it also observes that sibling's increment.
+ * Under relaxed the two locations order independently and a reader can pair a
+ * fresh seen with a stale count, reporting HUP on a pty another process just
+ * opened a slave on.
+ *
+ * pty_keepalive_lock does not close this: it is per-process, and the writers
+ * that matter are in other processes. refs is different and stays relaxed on
+ * the way up, since the acquire fence on the drop to zero is what orders it.
  */
 typedef struct {
     _Atomic int32_t refs;        /* elfuse processes holding a keepalive */
@@ -203,7 +215,7 @@ static pthread_once_t pty_keepalive_once = PTHREAD_ONCE_INIT;
 __attribute__((format(printf, 1, 2))) static void pty_diag(const char *fmt, ...)
 {
     static _Atomic int diag_fd = -2; /* -2 unopened, -1 disabled */
-    int fd = atomic_load(&diag_fd);
+    int fd = atomic_load_explicit(&diag_fd, memory_order_acquire);
     if (fd == -2) {
         const char *path = getenv("ELFUSE_PTY_LOG");
         int opened = -1;
@@ -211,10 +223,12 @@ __attribute__((format(printf, 1, 2))) static void pty_diag(const char *fmt, ...)
             opened =
                 open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
         int expected = -2;
-        if (!atomic_compare_exchange_strong(&diag_fd, &expected, opened)) {
+        if (!atomic_compare_exchange_strong_explicit(
+                &diag_fd, &expected, opened, memory_order_release,
+                memory_order_acquire)) {
             if (opened >= 0)
                 close(opened);
-            fd = atomic_load(&diag_fd);
+            fd = atomic_load_explicit(&diag_fd, memory_order_acquire);
         } else {
             fd = opened;
         }
@@ -311,7 +325,7 @@ static pty_shared_t *pty_shared_attach(const char *slave_path, bool fresh)
         return NULL;
 
     pty_shared_t *sh = map;
-    atomic_fetch_add(&sh->refs, 1);
+    atomic_fetch_add_explicit(&sh->refs, 1, memory_order_relaxed);
     return sh;
 }
 
@@ -327,9 +341,16 @@ static void pty_shared_detach(pty_shared_t *sh,
     if (local_slave_count > 0) {
         pty_diag("pty: detach returns %d slave(s) path=%s", local_slave_count,
                  slave_path ? slave_path : "?");
-        atomic_fetch_sub(&sh->slave_count, local_slave_count);
+        atomic_fetch_sub_explicit(&sh->slave_count, local_slave_count,
+                                  memory_order_seq_cst);
     }
-    if (atomic_fetch_sub(&sh->refs, 1) == 1) {
+
+    /* Release on the drop, acquire before the unlink: the process that takes
+     * the count to zero must see every other participant's writes to the
+     * segment before it removes the name.
+     */
+    if (atomic_fetch_sub_explicit(&sh->refs, 1, memory_order_release) == 1) {
+        atomic_thread_fence(memory_order_acquire);
         char name[PTY_SHM_NAME_MAX];
         if (pty_shared_name(slave_path, name, sizeof(name)))
             shm_unlink(name);
@@ -416,7 +437,8 @@ static void pty_shared_mark_seen_locked(uint32_t pts)
 {
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
         if (pty_row_is_pts_locked(i, pts) && pty_keepalive_table[i].shared) {
-            atomic_store(&pty_keepalive_table[i].shared->seen, 1);
+            atomic_store_explicit(&pty_keepalive_table[i].shared->seen, 1,
+                                  memory_order_seq_cst);
             return;
         }
     }
@@ -461,8 +483,10 @@ static int pty_keepalive_clear_slot_locked(int slot)
          */
         if (!pty_keepalive_table[slot].shared &&
             pty_keepalive_table[heir].shared) {
-            atomic_fetch_add(&pty_keepalive_table[heir].shared->slave_count,
-                             pty_keepalive_table[slot].guest_slave_count);
+            atomic_fetch_add_explicit(
+                &pty_keepalive_table[heir].shared->slave_count,
+                pty_keepalive_table[slot].guest_slave_count,
+                memory_order_seq_cst);
         }
         pty_shared_mark_seen_locked(pty_keepalive_table[slot].linux_pts_num);
 
@@ -674,9 +698,12 @@ static int pty_keepalive_register_locked(int master_host_fd,
          */
         if (pty_keepalive_table[slot].shared &&
             pty_keepalive_table[slot].guest_slave_count > 0) {
-            atomic_fetch_add(&pty_keepalive_table[slot].shared->slave_count,
-                             pty_keepalive_table[slot].guest_slave_count);
-            atomic_store(&pty_keepalive_table[slot].shared->seen, 1);
+            atomic_fetch_add_explicit(
+                &pty_keepalive_table[slot].shared->slave_count,
+                pty_keepalive_table[slot].guest_slave_count,
+                memory_order_seq_cst);
+            atomic_store_explicit(&pty_keepalive_table[slot].shared->seen, 1,
+                                  memory_order_seq_cst);
         }
     }
     return PTY_REG_INSERTED;
@@ -930,16 +957,18 @@ static int pty_guest_slave_release_locked(int slave_host_fd)
         int k = pty_account_row_locked(pts_num, -1);
         if (k >= 0 && pty_keepalive_table[k].guest_slave_count > 0) {
             pty_keepalive_table[k].guest_slave_count--;
-            pty_diag(
-                "pty: -slave pts=%u hostfd=%d local=%d shared=%d", pts_num,
-                slave_host_fd, pty_keepalive_table[k].guest_slave_count,
-                pty_keepalive_table[k].shared
-                    ? atomic_load(&pty_keepalive_table[k].shared->slave_count) -
-                          1
-                    : -1);
+            pty_diag("pty: -slave pts=%u hostfd=%d local=%d shared=%d", pts_num,
+                     slave_host_fd, pty_keepalive_table[k].guest_slave_count,
+                     pty_keepalive_table[k].shared
+                         ? atomic_load_explicit(
+                               &pty_keepalive_table[k].shared->slave_count,
+                               memory_order_seq_cst) -
+                               1
+                         : -1);
             if (pty_keepalive_table[k].shared)
-                atomic_fetch_sub(&pty_keepalive_table[k].shared->slave_count,
-                                 1);
+                atomic_fetch_sub_explicit(
+                    &pty_keepalive_table[k].shared->slave_count, 1,
+                    memory_order_seq_cst);
 
             /* A master-less home with nothing left to account for can go now
              * rather than at process teardown.
@@ -989,14 +1018,18 @@ static void pty_guest_slave_record_locked(int slave_host_fd,
                 linux_pts_num, slave_host_fd, (int) bump_shared,
                 pty_keepalive_table[k].guest_slave_count,
                 pty_keepalive_table[k].shared
-                    ? atomic_load(&pty_keepalive_table[k].shared->slave_count) +
+                    ? atomic_load_explicit(
+                          &pty_keepalive_table[k].shared->slave_count,
+                          memory_order_seq_cst) +
                           (bump_shared ? 1 : 0)
                     : -1);
             if (pty_keepalive_table[k].shared) {
                 if (bump_shared)
-                    atomic_fetch_add(
-                        &pty_keepalive_table[k].shared->slave_count, 1);
-                atomic_store(&pty_keepalive_table[k].shared->seen, 1);
+                    atomic_fetch_add_explicit(
+                        &pty_keepalive_table[k].shared->slave_count, 1,
+                        memory_order_seq_cst);
+                atomic_store_explicit(&pty_keepalive_table[k].shared->seen, 1,
+                                      memory_order_seq_cst);
             }
         }
         break;
@@ -1059,7 +1092,9 @@ void proc_pty_fork_parent_note_inherited(void)
          */
         int k = pty_account_row_locked(pts_num, -1);
         if (k >= 0 && pty_keepalive_table[k].shared)
-            atomic_fetch_add(&pty_keepalive_table[k].shared->slave_count, 1);
+            atomic_fetch_add_explicit(
+                &pty_keepalive_table[k].shared->slave_count, 1,
+                memory_order_seq_cst);
     }
     pthread_mutex_unlock(&pty_keepalive_lock);
 }
@@ -1231,7 +1266,8 @@ static bool pty_slot_hung_up_locked(int slot)
     bool hung_up;
     if (sh) {
         hung_up =
-            atomic_load(&sh->seen) != 0 && atomic_load(&sh->slave_count) <= 0;
+            atomic_load_explicit(&sh->seen, memory_order_seq_cst) != 0 &&
+            atomic_load_explicit(&sh->slave_count, memory_order_seq_cst) <= 0;
     } else {
         /* No segment, so the counters are this process's own -- and they live
          * on the pty's accounting home, which for an aliased master is not this
@@ -1251,13 +1287,15 @@ static bool pty_slot_hung_up_locked(int slot)
      * the fact.
      */
     if (hung_up)
-        pty_diag("pty: HANGUP pts=%u seen=%d shared=%d local=%d/%d path=%s",
-                 pty_keepalive_table[slot].linux_pts_num,
-                 sh ? atomic_load(&sh->seen) : -1,
-                 sh ? atomic_load(&sh->slave_count) : -1,
-                 (int) pty_keepalive_table[slot].guest_slave_seen,
-                 pty_keepalive_table[slot].guest_slave_count,
-                 pty_keepalive_table[slot].slave_path);
+        pty_diag(
+            "pty: HANGUP pts=%u seen=%d shared=%d local=%d/%d path=%s",
+            pty_keepalive_table[slot].linux_pts_num,
+            sh ? atomic_load_explicit(&sh->seen, memory_order_seq_cst) : -1,
+            sh ? atomic_load_explicit(&sh->slave_count, memory_order_seq_cst)
+               : -1,
+            (int) pty_keepalive_table[slot].guest_slave_seen,
+            pty_keepalive_table[slot].guest_slave_count,
+            pty_keepalive_table[slot].slave_path);
     return hung_up;
 }
 

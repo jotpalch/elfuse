@@ -86,7 +86,8 @@ static int absock_dir_format(char *out, size_t out_sz, uint64_t namespace_id)
 
 static int absock_ensure_dir_locked(void)
 {
-    uint64_t namespace_id = atomic_load(&absock_namespace_id);
+    uint64_t namespace_id =
+        atomic_load_explicit(&absock_namespace_id, memory_order_relaxed);
 
     if (absock_dir_created) {
         struct stat st;
@@ -104,7 +105,8 @@ static int absock_ensure_dir_locked(void)
 
     if (namespace_id == 0) {
         namespace_id = (uint64_t) getpid();
-        atomic_store(&absock_namespace_id, namespace_id);
+        atomic_store_explicit(&absock_namespace_id, namespace_id,
+                              memory_order_relaxed);
     }
     absock_dir_format(absock_dir, sizeof(absock_dir), namespace_id);
 
@@ -130,7 +132,8 @@ static int absock_ensure_dir_locked(void)
 
 uint64_t absock_get_namespace_id(void)
 {
-    uint64_t namespace_id = atomic_load(&absock_namespace_id);
+    uint64_t namespace_id =
+        atomic_load_explicit(&absock_namespace_id, memory_order_relaxed);
     if (namespace_id == 0)
         return (uint64_t) getpid();
     return namespace_id;
@@ -140,7 +143,8 @@ void absock_set_namespace_id(uint64_t namespace_id)
 {
     if (namespace_id == 0)
         namespace_id = (uint64_t) getpid();
-    atomic_store(&absock_namespace_id, namespace_id);
+    atomic_store_explicit(&absock_namespace_id, namespace_id,
+                          memory_order_relaxed);
 }
 
 void absock_encode_name(const char *dir,

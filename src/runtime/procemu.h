@@ -42,7 +42,15 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz);
 /* Intercept stat/fstatat for /proc paths.
  * Returns 0 if stat was synthesized (mac_st filled), or -2 if not intercepted
  * (fall through to real fstatat).
+ *
+ * `follow` selects stat() vs lstat() semantics for a synthetic symlink leaf.
+ * The synthetic trees carry real symlinks (the USB `subsystem` links), and
+ * Linux reports the target's identity for a following stat, so a caller that is
+ * serving stat()/fstatat() without AT_SYMLINK_NOFOLLOW must pass true.
+ * proc_intercept_stat keeps the nofollow spelling for callers that name a
+ * specific object (an already-opened fd's stamp, a readlink probe).
  */
+int proc_intercept_stat_at(const char *path, struct stat *mac_st, bool follow);
 int proc_intercept_stat(const char *path, struct stat *mac_st);
 
 /* True when PATH names a live Unix98 pty slave (/dev/pts/N whose master is

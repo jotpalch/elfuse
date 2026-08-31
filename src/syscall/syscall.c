@@ -38,6 +38,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 #include "debug/log.h"
 #include "utils.h"
@@ -429,7 +430,7 @@ static int64_t sc_setsid(guest_t *g,
     return ret;
 }
 SC_FORWARD(sc_getsid,  proc_sys_getsid((int64_t) x0))
-SC_FORWARD(sc_gettid,  current_thread ? current_thread->guest_tid : proc_get_pid())
+SC_FORWARD(sc_gettid,  current_thread ? thread_tid(current_thread) : proc_get_pid())
 
 /* pidfd */
 SC_FORWARD(sc_pidfd_open,        sys_pidfd_open(g, (int64_t) x0, (unsigned int) x1))
@@ -897,7 +898,7 @@ static int64_t sc_membarrier(guest_t *g,
     case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
     case MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE:
         /* Issue full barrier on this thread, force context switch on others */
-        __sync_synchronize();
+        atomic_thread_fence(memory_order_seq_cst);
         thread_for_each(thread_force_exit_cb, NULL);
         return 0;
     case MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED:
@@ -968,7 +969,7 @@ static int64_t sc_set_tid_address(guest_t *g,
     (void) verbose;
     if (current_thread) {
         current_thread->clear_child_tid = x0;
-        return current_thread->guest_tid;
+        return thread_tid(current_thread);
     }
     return proc_get_pid();
 }
@@ -1490,7 +1491,7 @@ static int64_t sc_get_robust_list(guest_t *g,
     (void) verbose;
     int64_t target_pid = (int64_t) (int) x0;
     if (target_pid != 0 && target_pid != proc_get_pid() &&
-        (!current_thread || target_pid != current_thread->guest_tid))
+        (!current_thread || target_pid != thread_tid(current_thread)))
         return -LINUX_ESRCH;
     uint64_t head_val = current_thread ? current_thread->robust_list_head : 0;
     uint64_t len_val = 24;
@@ -2396,7 +2397,7 @@ static bool fast_scalar_syscall_result(int nr, uint64_t x0, int64_t *result)
         *result = proc_get_ppid();
         return true;
     case SYS_gettid:
-        *result = current_thread ? current_thread->guest_tid : proc_get_pid();
+        *result = current_thread ? thread_tid(current_thread) : proc_get_pid();
         return true;
     case SYS_getpgid:
         *result = ((int) x0 == 0 || (int) x0 == (int) proc_get_pid())

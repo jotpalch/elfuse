@@ -1,0 +1,49 @@
+# Pins for the sharun lane. Sourced as shell by tests/test-sharun.sh,
+# tests/fetch-glibc.sh, and tests/fetch-sharun-bin.sh.
+#
+# An upstream prebuilt release, not a source build. SHARUN_BIN_NAME names the
+# default-features build, which is what a user downloads; the -lite variant
+# would serve this lane too, since nothing here needs the lib4bin cargo feature
+# it drops, but the point is to run what users run. Refresh version and digest
+# together, and verify against a fresh download rather than trusting the release
+# page:
+#   curl -fLsS -o /tmp/sharun \
+#     "https://github.com/VHSgunzo/sharun/releases/download/$SHARUN_VERSION/$SHARUN_BIN_NAME"
+#   shasum -a 256 /tmp/sharun
+SHARUN_VERSION=v0.8.1
+
+# What "sharun --version" prints, whole. Arm 1 is the one arm with no skip, so a
+# mismatch reds the lane everywhere, and it compares against output this project
+# does not control. Pinned beside the digest so an upstream change in how the
+# version is rendered is a one-line edit here rather than a lane that cannot
+# pass. Measured from the pinned binary, not assumed.
+SHARUN_VERSION_OUTPUT=v0.8.1
+SHARUN_BIN_NAME=sharun-aarch64
+SHARUN_BIN_SHA256=36a0d16e9d6085e0f11a3e3f76727a0a14aee44ef8e626a76a99555f4da541dc
+# The x86_64 build of the same release, run through elfuse's Rosetta path. It
+# is a static-pie musl Rust binary, which is a shape the aarch64 lanes never
+# exercise. Verified with the same "curl then shasum" recipe above.
+SHARUN_BIN_X86_64=sharun-x86_64
+SHARUN_BIN_X86_64_SHA256=18d970f56eca2c527ffd3993b161b6bc340055129db14b394a77cb67d8bbfff9
+
+# The aarch64 glibc runtime the local bundle is assembled from, taken from
+# Debian's own build so no cross-libc or Linux host is needed. snapshot.debian.org
+# file URLs are permanent; a distribution pool URL is not, because the pool drops
+# a package as soon as a point release supersedes it.
+#
+# Must stay at glibc 2.33 or newer: sharun invokes the loader as
+# "ld.so ... --argv0 ...", which older loaders treat as a filename and die with
+# "--argv0: cannot open shared object file". Measured against a 2.28 sysroot.
+# The probe's runtime closure, and the whole of what the glibc runtime holds.
+# Named here because two scripts act on it: tests/fetch-glibc.sh copies these out
+# of the package, and tests/build-sharun-bundle.sh copies them into the bundle.
+# It used to be a glob in one and a list in the other, so the cache carried the
+# package's other twenty-odd modules, nothing consumed them, and every cache hit
+# re-hashed them. tests/build-sharun-bundle.sh's DT_NEEDED gate is what keeps
+# this honest: a fixture that grows a dependency fails there rather than
+# silently shipping without it.
+GLIBC_CLOSURE="ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0"
+
+GLIBC_VERSION=2.36-9+deb12u14
+GLIBC_DEB_URL=https://snapshot.debian.org/file/85af57bf1f9fa075163e51c99d9536154c21ab7e
+GLIBC_DEB_SHA256=01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4

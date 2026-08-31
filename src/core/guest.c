@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -168,7 +169,7 @@ static int desc_to_perms(uint64_t desc);
 static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 2 */
 
 /* Track whether the 80% warning has been emitted (avoid log spam) */
-static bool pt_pool_warned = false;
+static _Atomic bool pt_pool_warned = false;
 
 static size_t guest_host_page_size_cached(void)
 {
@@ -263,13 +264,14 @@ static uint64_t pt_alloc_page(guest_t *g)
     /* Warn at 80% pool usage so users can anticipate exhaustion */
     uint64_t used = gpa + PAGE_SIZE - g->pt_pool_base;
     uint64_t total = g->pt_pool_end - g->pt_pool_base;
-    if (!pt_pool_warned && used > (total * 4 / 5)) {
+    if (used > (total * 4 / 5) &&
+        !atomic_exchange_explicit(&pt_pool_warned, true,
+                                  memory_order_relaxed)) {
         log_debug(
             "guest: page table pool at %llu%% "
             "(%llu / %llu bytes)",
             (unsigned long long) (used * 100 / total),
             (unsigned long long) used, (unsigned long long) total);
-        pt_pool_warned = true;
     }
 
     /* Zero the page while still holding the lock so no other thread can observe
@@ -344,12 +346,14 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
  */
 static inline uint64_t pte_load_acquire(const uint64_t *entry)
 {
-    return __atomic_load_n(entry, __ATOMIC_ACQUIRE);
+    return atomic_load_explicit((const _Atomic uint64_t *) entry,
+                                memory_order_acquire);
 }
 
 static inline void pte_store_release(uint64_t *entry, uint64_t desc)
 {
-    __atomic_store_n(entry, desc, __ATOMIC_RELEASE);
+    atomic_store_explicit((_Atomic uint64_t *) entry, desc,
+                          memory_order_release);
 }
 
 /* Public API */
@@ -1900,7 +1904,7 @@ void guest_reset(guest_t *g)
     /* Reset allocation state */
     guest_pt_gen_bump(g);
     guest_tlb_flush();
-    __atomic_store_n(&pt_pool_warned, false, __ATOMIC_RELAXED);
+    atomic_store_explicit(&pt_pool_warned, false, memory_order_relaxed);
     g->pt_pool_next = g->pt_pool_base;
     g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = BRK_BASE_DEFAULT;

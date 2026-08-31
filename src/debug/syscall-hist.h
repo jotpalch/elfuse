@@ -44,7 +44,7 @@ uint64_t syscall_hist_now_ns(void);
 
 /* Record one syscall observation. nr is the Linux syscall number; ns is the
  * elapsed time inside the dispatcher. Called from every vCPU thread, so the
- * counters update under __atomic_fetch_add. No-op if disabled or frozen.
+ * counters update through C11 atomic fetch-add. No-op if disabled or frozen.
  */
 void syscall_hist_record(int nr, uint64_t ns);
 

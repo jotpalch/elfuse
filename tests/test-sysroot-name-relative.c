@@ -15,12 +15,13 @@
  * trees with openat(dirfd, name) throughout, and never build an absolute path
  * at all.
  *
- * Code under test: src/syscall/casefold-walk.c reached from
- * src/syscall/path.c's path_translate_at, for the case where the guest path
- * does not begin with '/'. A regression shows up as the same guest name
- * resolving to two different files depending on how it was spelled, so a create
- * through one spelling is invisible through the other, and an O_EXCL create of
- * a name that already exists succeeds instead of reporting EEXIST.
+ * Code under test: src/syscall/casefold-walk.c and the byte-exact resolver
+ * beside it in src/syscall/proc-state.c, both reached from src/syscall/path.c's
+ * path_translate_at, for the case where the guest path does not begin with '/'.
+ * A regression shows up as the same guest name resolving to two different files
+ * depending on how it was spelled, so a create through one spelling is
+ * invisible through the other, and an O_EXCL create of a name that already
+ * exists succeeds instead of reporting EEXIST.
  *
  * Run under --sysroot.
  */
@@ -274,6 +275,8 @@ static void section_trailing_slash(void)
  * because the two take different spellings on disk and the rule has to survive
  * either.
  */
+static void section_below_non_directory_at(void);
+
 static void section_below_non_directory(void)
 {
     char path[PATH_MAX];
@@ -309,10 +312,102 @@ static void section_below_non_directory(void)
     EXPECT_ERRNO(stat(path, &st), ENOTDIR, "should be ENOTDIR");
 
     /* The rule must not swallow a plain absent path, which still owes ENOENT.
+     * The two answers come from different findings -- ENOTDIR from a component
+     * that exists and is not a directory, ENOENT from one that does not exist
+     * at all -- so a resolver that cannot report which of the two it stopped on
+     * gives one answer for the other. Every case below was measured on Linux
+     * 6.19 (docker gcc:14) rather than reasoned from the rule.
+     *
+     * The absent arm is the one that fails dangerously, because the wrong errno
+     * is not the whole of it. A walk that gives up on an absent component and
+     * reports no spelling for where it stopped leaves the caller deciding from
+     * an unset one, and the syscall then answers for a path the guest never
+     * named: this suite caught it succeeding, and describing the sysroot root,
+     * for a name nothing holds. errno is cleared first for that reason -- a
+     * call that returns 0 leaves the previous assertion's errno behind, and the
+     * failure then reads as the wrong errno rather than as no failure at all.
      */
     TEST("an absent path below a real directory is still ENOENT");
     snprintf(path, sizeof(path), "%s/absent-dir/below", DIR_V);
+    errno = 0;
     EXPECT_ERRNO(stat(path, &st), ENOENT, "should be ENOENT");
+
+    TEST("open of an absent path below a real directory is ENOENT");
+    errno = 0;
+    EXPECT_ERRNO(open(path, O_RDONLY), ENOENT, "should be ENOENT");
+
+    TEST("the absent component named on its own is ENOENT");
+    snprintf(path, sizeof(path), "%s/absent-dir", DIR_V);
+    errno = 0;
+    EXPECT_ERRNO(stat(path, &st), ENOENT, "should be ENOENT");
+
+    /* A trailing slash turns the leaf into a directory reference, which is what
+     * flips the answer to ENOTDIR when the leaf exists as a file. It must not
+     * flip anything when nothing on the path exists.
+     */
+    TEST("an absent path with a trailing slash is ENOENT");
+    snprintf(path, sizeof(path), "%s/absent-dir/below/", DIR_V);
+    errno = 0;
+    EXPECT_ERRNO(stat(path, &st), ENOENT, "should be ENOENT");
+
+    TEST("two absent components deep is still ENOENT");
+    snprintf(path, sizeof(path), "%s/absent-dir/absent-two/below", DIR_V);
+    errno = 0;
+    EXPECT_ERRNO(stat(path, &st), ENOENT, "should be ENOENT");
+
+    section_below_non_directory_at();
+}
+
+/* The same split addressed through a descriptor rather than a path. Linux
+ * refuses a relative name against an O_PATH descriptor on a regular file with
+ * ENOTDIR before it looks the name up, while a descriptor on a real directory
+ * still owes ENOENT for a name that directory does not hold -- so neither
+ * answer can be derived from the other, and a rule that decides the first one
+ * early must not reach the second. Measured on Linux 6.19 alongside the path
+ * cases above.
+ */
+static void section_below_non_directory_at(void)
+{
+    struct stat st;
+    int filefd, dirfd;
+
+    TEST("O_PATH opens the regular file itself");
+    filefd = open(DIR_V "/notdirfile", O_PATH);
+    EXPECT_TRUE(filefd >= 0, "O_PATH open");
+
+    TEST("openat below an O_PATH regular file is ENOTDIR");
+    errno = 0;
+    EXPECT_ERRNO(openat(filefd, "below", O_RDONLY), ENOTDIR,
+                 "should be ENOTDIR");
+
+    TEST("fstatat below an O_PATH regular file is ENOTDIR");
+    errno = 0;
+    EXPECT_ERRNO(fstatat(filefd, "below", &st, 0), ENOTDIR,
+                 "should be ENOTDIR");
+
+    /* AT_EMPTY_PATH names the descriptor itself, not a child, so the rule above
+     * must not reach it.
+     */
+    TEST("fstatat of the O_PATH file itself still reports the file");
+    EXPECT_TRUE(
+        fstatat(filefd, "", &st, AT_EMPTY_PATH) == 0 && S_ISREG(st.st_mode),
+        "AT_EMPTY_PATH");
+    close(filefd);
+
+    TEST("O_PATH opens the real directory");
+    dirfd = open(DIR_V, O_PATH);
+    EXPECT_TRUE(dirfd >= 0, "O_PATH open");
+
+    TEST("an absent name under an O_PATH directory is ENOENT");
+    errno = 0;
+    EXPECT_ERRNO(fstatat(dirfd, "absent-dir/below", &st, 0), ENOENT,
+                 "should be ENOENT");
+
+    TEST("openat an absent name under an O_PATH directory is ENOENT");
+    errno = 0;
+    EXPECT_ERRNO(openat(dirfd, "absent-dir/below", O_RDONLY), ENOENT,
+                 "should be ENOENT");
+    close(dirfd);
 }
 
 int main(int argc, char **argv)

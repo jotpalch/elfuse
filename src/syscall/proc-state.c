@@ -444,12 +444,12 @@ bool proc_sysroot_snapshot(char *out, size_t outsz)
 
 void proc_set_sysroot_casefold(bool enabled)
 {
-    atomic_store(&sysroot_casefold, enabled);
+    atomic_store_explicit(&sysroot_casefold, enabled, memory_order_relaxed);
 }
 
 bool proc_sysroot_casefold_enabled(void)
 {
-    return atomic_load(&sysroot_casefold);
+    return atomic_load_explicit(&sysroot_casefold, memory_order_relaxed);
 }
 
 /* True when realpath(3) failed because the path stopped resolving rather than
@@ -916,10 +916,15 @@ static casefold_verdict_t resolve_through_links(const char *sr,
  * finally named. Reports whether a link was actually crossed, because the
  * host-fallback decision downstream is different for a path the guest typed and
  * one a link handed it; shared by both resolvers so the two cannot drift.
+ *
+ * An empty spelling means the walk reported none, and the caller keeps the path
+ * it already had. Callers seed the buffer empty for that reason: the return
+ * value is read on every verdict, so a walk that exits without publishing a
+ * spelling must not leave the decision reading uninitialized stack.
  */
 static bool rebase_after_link(const char **path, const char *followed)
 {
-    if (!strcmp(*path, followed))
+    if (followed[0] == '\0' || !strcmp(*path, followed))
         return false;
     *path = followed;
     return true;
@@ -949,6 +954,17 @@ static casefold_verdict_t resolve_byte_exact_through_links(
         size_t guest_len = 0;
         bool found_link = false;
 
+        /* Publish the spelling this iteration resolves before resolving it. The
+         * caller reads it on every verdict, and the two absent returns in the
+         * component loop below exit without reaching the fall-through that used
+         * to be the only writer -- an absent intermediate component left them
+         * reporting whatever the caller's stack happened to hold, which rebased
+         * resolution onto a path the guest never named.
+         */
+        if (str_copy_trunc(guest_out, cur, guest_outsz) >= guest_outsz) {
+            errno = ENAMETOOLONG;
+            return CASEFOLD_ERROR;
+        }
         if (snprintf(buf, bufsz, "%s%s", sr, cur) >= (int) bufsz) {
             errno = ENAMETOOLONG;
             return CASEFOLD_ERROR;
@@ -1024,10 +1040,6 @@ static casefold_verdict_t resolve_byte_exact_through_links(
         if (found_link)
             continue;
 
-        if (str_copy_trunc(guest_out, cur, guest_outsz) >= guest_outsz) {
-            errno = ENAMETOOLONG;
-            return CASEFOLD_ERROR;
-        }
         if (snprintf(buf, bufsz, "%s%s", sr, cur) >= (int) bufsz) {
             errno = ENAMETOOLONG;
             return CASEFOLD_ERROR;
@@ -1073,7 +1085,12 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     bool followed_link = false;
     bool followed_relative_link = false;
     bool walk_typed_all = false;
+
+    /* One byte, not a 4 KiB zero-fill: only the leading NUL is read, and these
+     * resolvers run on every absolute path the guest names.
+     */
     char followed[LINUX_PATH_MAX];
+    followed[0] = '\0';
     if (casefold_active()) {
         casefold_walk_t walk;
         casefold_verdict_t verdict = resolve_through_links(
@@ -1269,7 +1286,12 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      */
     bool followed_link = false;
     bool followed_relative_link = false;
+
+    /* One byte, not a 4 KiB zero-fill: only the leading NUL is read, and these
+     * resolvers run on every absolute path the guest names.
+     */
     char followed[LINUX_PATH_MAX];
+    followed[0] = '\0';
     if (casefold_active()) {
         casefold_walk_t walk;
 

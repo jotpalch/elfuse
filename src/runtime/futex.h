@@ -27,7 +27,6 @@ void futex_init(void);
  */
 void futex_interrupt_request(void);
 void futex_interrupt_clear(void);
-int futex_interrupt_pending(void);
 int futex_interrupt_consume(void);
 
 /* Main futex syscall entry point. op: futex operation (FUTEX_WAIT, FUTEX_WAKE,

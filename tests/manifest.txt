@@ -26,8 +26,12 @@
 # which is a superset: it runs every one of these binaries too (via
 # elfuse-aarch64 mode), plus everything that used to be duplicated here.
 # Don't add a portable/cross-checkable test here; add it to test-matrix.sh
-# instead. Only add a test here if it is genuinely elfuse-internal, or if a
-# SANITIZER_SECTIONS section needs it.
+# instead. Only add a test here if it is genuinely elfuse-internal, if a
+# SANITIZER_SECTIONS section needs it, or if it needs a host_nofile
+# annotation: that annotation has no other home, and test-matrix.sh reads it
+# from this file for its own elfuse lane, so a cross-checkable test that only
+# means anything under a specific host descriptor limit is listed here as well
+# as there. test-dir-fd-budget is the one such entry today.
 
 [section] Assembly tests
 test-hello
@@ -73,12 +77,14 @@ test-epoll-aba
 test-epoll-close
 test-epoll-dup
 test-epoll-refcount
+test-epoll-del-leak
 test-timerfd
 test-large-io-boundary
 test-ioctl-cloexec
 test-pty
 test-ioctl-fioasync
 test-getdents-refcount
+test-dir-fd-budget # host_nofile=elfuse-minimum
 test-dev-shm-paths
 test-fcntl-flags
 test-socket-shortwrite

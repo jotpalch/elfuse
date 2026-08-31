@@ -341,7 +341,7 @@ int fork_child_main(int ipc_fd,
      */
     proc_pty_adopt_inherited_slaves();
 
-    signal_state_t sig;
+    signal_state_snapshot_t sig;
     if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
         log_error("fork-child: failed to receive process state");
 
@@ -774,7 +774,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
 
     /* Inherit parent's signal mask (POSIX: clone inherits blocked mask) */
     if (current_thread)
-        thread_blocked_store(t, current_thread->blocked);
+        thread_blocked_store(t, thread_blocked_load(current_thread));
 
     /* Allocate per-thread EL1 stack (records both sp and slot in t). */
     uint64_t child_sp_el1 = thread_alloc_sp_el1(g, t);
@@ -927,7 +927,7 @@ static void *thread_create_and_run(void *arg)
     hv_return_t r = hv_vcpu_create(&vcpu, &vexit, NULL);
     if (r != HV_SUCCESS) {
         log_error("thread tid=%lld: hv_vcpu_create failed: %d",
-                  (long long) t->guest_tid, (int) r);
+                  (long long) thread_tid(t), (int) r);
         pthread_mutex_lock(&startup->lock);
         startup->startup_rc = -LINUX_EIO;
         startup->ready = true;
@@ -971,14 +971,14 @@ static void *thread_create_and_run(void *arg)
      * startup handshake can roll back cleanly rather than tearing down the
      * whole process on a transient HVF failure here.
      */
-#define WORKER_HV(call)                                           \
-    do {                                                          \
-        hv_return_t _r = (call);                                  \
-        if (_r != HV_SUCCESS) {                                   \
-            log_error("thread tid=%lld: %s failed: %d",           \
-                      (long long) t->guest_tid, #call, (int) _r); \
-            goto startup_failed;                                  \
-        }                                                         \
+#define WORKER_HV(call)                                            \
+    do {                                                           \
+        hv_return_t _r = (call);                                   \
+        if (_r != HV_SUCCESS) {                                    \
+            log_error("thread tid=%lld: %s failed: %d",            \
+                      (long long) thread_tid(t), #call, (int) _r); \
+            goto startup_failed;                                   \
+        }                                                          \
     } while (0)
 
     /* Copy system registers from parent (shared page tables, same MMU config)
@@ -996,7 +996,7 @@ static void *thread_create_and_run(void *arg)
      * this vCPU empty. CONTEXTIDR_EL1 holds the per-thread tid that the gettid
      * shim fast path returns.
      */
-    if (shim_globals_install_per_vcpu(vcpu, tca->guest, t->guest_tid) < 0)
+    if (shim_globals_install_per_vcpu(vcpu, tca->guest, thread_tid(t)) < 0)
         goto startup_failed;
 
     /* MMU already on, so set SCTLR with M=1 directly (page tables exist) */
@@ -1092,7 +1092,7 @@ startup_ok:
      */
     thread_fork_barrier_check();
 
-    log_debug("thread tid=%lld starting on vCPU", (long long) t->guest_tid);
+    log_debug("thread tid=%lld starting on vCPU", (long long) thread_tid(t));
 
     vcpu_run_loop(vcpu, vexit, g, verbose, 0, NULL);
 
@@ -1121,7 +1121,7 @@ startup_ok:
             log_warn(
                 "thread tid=%lld clear_child_tid "
                 "write failed (gva=0x%llx)",
-                (long long) t->guest_tid,
+                (long long) thread_tid(t),
                 (unsigned long long) t->clear_child_tid);
         }
     }
@@ -1129,7 +1129,7 @@ startup_ok:
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
-    log_debug("thread tid=%lld exiting", (long long) t->guest_tid);
+    log_debug("thread tid=%lld exiting", (long long) thread_tid(t));
 
     /* Destroy the vCPU on its owning thread while still holding the lock, and
      * only then clear vcpu_valid. thread_destroy_all_vcpus scans under the same
@@ -1196,14 +1196,14 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
 
     /* Mark as VM-clone child (waitable via wait4, not CLONE_THREAD) */
     t->is_vm_clone = true;
-    t->parent_tid = current_thread ? current_thread->guest_tid : 0;
+    t->parent_tid = current_thread ? thread_tid(current_thread) : 0;
     t->exit_signal = (int) (flags & 0xFF); /* Low byte = exit signal */
     if (t->exit_signal == 0)
         t->exit_signal = LINUX_SIGCHLD;
 
     /* Inherit parent's signal mask */
     if (current_thread)
-        thread_blocked_store(t, current_thread->blocked);
+        thread_blocked_store(t, thread_blocked_load(current_thread));
 
     /* Allocate per-thread EL1 stack (records both sp and slot in t). */
     uint64_t child_sp_el1 = thread_alloc_sp_el1(g, t);
@@ -1319,7 +1319,7 @@ static void *vm_clone_thread_run(void *arg)
     hv_return_t r = hv_vcpu_create(&vcpu, &vexit, NULL);
     if (r != HV_SUCCESS) {
         log_error("vm_clone tid=%lld: hv_vcpu_create failed: %d",
-                  (long long) t->guest_tid, (int) r);
+                  (long long) thread_tid(t), (int) r);
         free(tca);
         vm_clone_report_bringup_failure(t);
         return NULL;
@@ -1355,7 +1355,7 @@ static void *vm_clone_thread_run(void *arg)
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, tca->sctlr));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, tca->child_stack));
-    if (shim_globals_install_per_vcpu(vcpu, tca->guest, t->guest_tid) < 0) {
+    if (shim_globals_install_per_vcpu(vcpu, tca->guest, thread_tid(t)) < 0) {
         free(tca);
         vm_clone_report_bringup_failure(t);
         return NULL;
@@ -1389,7 +1389,7 @@ static void *vm_clone_thread_run(void *arg)
     current_thread = t;
     thread_fork_barrier_check();
 
-    log_debug("vm_clone tid=%lld starting on vCPU", (long long) t->guest_tid);
+    log_debug("vm_clone tid=%lld starting on vCPU", (long long) thread_tid(t));
 
     int wait_status = 0;
     int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0, &wait_status);
@@ -1408,7 +1408,7 @@ static void *vm_clone_thread_run(void *arg)
             log_warn(
                 "vm_clone tid=%lld clear_child_tid "
                 "write failed (gva=0x%llx)",
-                (long long) t->guest_tid,
+                (long long) thread_tid(t),
                 (unsigned long long) t->clear_child_tid);
         }
     }
@@ -1416,7 +1416,7 @@ static void *vm_clone_thread_run(void *arg)
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
-    log_debug("vm_clone tid=%lld exiting (code=%d)", (long long) t->guest_tid,
+    log_debug("vm_clone tid=%lld exiting (code=%d)", (long long) thread_tid(t),
               exit_code);
 
     /* Destroy the vCPU and publish exit status in one critical section, destroy

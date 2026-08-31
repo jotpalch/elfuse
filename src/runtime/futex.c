@@ -106,7 +106,7 @@ static _Atomic int futex_interrupt_requested = 0;
  * re-check preserves Linux's -EAGAIN race semantics.
  *
  * The wait quantum is capped at 100 ms so proc_exit_group_requested() and
- * futex_interrupt_pending() get noticed promptly without a process-wide
+ * futex_interrupt_consume() get noticed promptly without a process-wide
  * broadcast channel. EINTR is only returned when an actual deliverable signal
  * is queued for this thread (confirmed under sig_lock via signal_pending(), not
  * the atomic hint, so that rt_sigprocmask masking the queued signal cannot
@@ -138,7 +138,7 @@ typedef struct futex_waiter {
     uint64_t uaddr;            /* Guest VA being waited on */
     uint32_t bitset;           /* For WAIT_BITSET matching */
     pthread_cond_t cond;       /* Signalled by WAKE to unblock this waiter */
-    int woken;                 /* Set to 1 by WAKE before signalling */
+    _Atomic int woken;         /* Set to 1 by WAKE before signalling */
     struct futex_waiter *next; /* Next waiter in same bucket */
     pthread_mutex_t *group_lock;
     pthread_cond_t *group_cond;
@@ -205,7 +205,7 @@ static void futex_wake_waiter_locked(futex_waiter_t **pp)
 {
     futex_waiter_t *w = *pp;
     *pp = w->next; /* unlink before signaling */
-    __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&w->woken, 1, memory_order_release);
     pthread_cond_signal(&w->cond);
     futex_waiter_notify_group(w);
 }
@@ -224,7 +224,9 @@ static void futex_wake_waiter_locked(futex_waiter_t **pp)
 static bool futex_word_load(const uint32_t *word, uint32_t *out)
 {
     bool faulted;
-    HOST_SIGBUS_GUARD(faulted, *out = __atomic_load_n(word, __ATOMIC_SEQ_CST));
+    HOST_SIGBUS_GUARD(
+        faulted, *out = atomic_load_explicit((const _Atomic uint32_t *) word,
+                                             memory_order_seq_cst));
     return !faulted;
 }
 
@@ -236,9 +238,9 @@ static bool futex_word_cas(uint32_t *word,
                            bool *swapped)
 {
     bool faulted, won;
-    HOST_SIGBUS_GUARD(faulted, won = __atomic_compare_exchange_n(
-                                   word, expected, desired, /*weak=*/0,
-                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    HOST_SIGBUS_GUARD(faulted, won = atomic_compare_exchange_strong_explicit(
+                                   (_Atomic uint32_t *) word, expected, desired,
+                                   memory_order_seq_cst, memory_order_seq_cst));
     if (faulted)
         return false;
     if (swapped)
@@ -304,17 +306,12 @@ void futex_init(void)
 
 void futex_interrupt_request(void)
 {
-    atomic_store(&futex_interrupt_requested, 1);
+    atomic_store_explicit(&futex_interrupt_requested, 1, memory_order_release);
 }
 
 void futex_interrupt_clear(void)
 {
-    atomic_store(&futex_interrupt_requested, 0);
-}
-
-int futex_interrupt_pending(void)
-{
-    return atomic_load(&futex_interrupt_requested);
+    atomic_store_explicit(&futex_interrupt_requested, 0, memory_order_relaxed);
 }
 
 /* Test-and-clear: returns 1 if the interrupt request was pending and atomically
@@ -329,8 +326,9 @@ int futex_interrupt_pending(void)
 int futex_interrupt_consume(void)
 {
     int expected = 1;
-    return atomic_compare_exchange_strong(&futex_interrupt_requested, &expected,
-                                          0);
+    return atomic_compare_exchange_strong_explicit(
+        &futex_interrupt_requested, &expected, 0, memory_order_acquire,
+        memory_order_relaxed);
 }
 
 /* Cap on guest-supplied tv_sec. The cap exists purely so the int64_t / time_t
@@ -488,11 +486,11 @@ static uint32_t futex_os_sync_wake_n(const guest_t *g,
  *
  * The pre-check is required: the kernel API silently returns rc>=0 when the
  * value already differs at entry, indistinguishable from a real wakeup. Linux
- * returns -EAGAIN in that case, so an explicit __atomic_load_n bridges the
- * contract gap.
+ * returns -EAGAIN in that case, so an explicit atomic load bridges the contract
+ * gap.
  *
  * Quantum is bounded by FUTEX_OS_SYNC_POLL_CAP_NS so proc_exit_group_requested
- * and futex_interrupt_pending get observed without a global wake-everyone
+ * and futex_interrupt_consume get observed without a global wake-everyone
  * broadcast channel. ETIMEDOUT, EINTR, EFAULT, and ENOMEM are all transient per
  * Apple's docs; each must run the flag check before re-arming. EINVAL would
  * indicate a programmer error here (size != 4/8 or bad flags), so it surfaces
@@ -725,7 +723,7 @@ static int64_t futex_wait(guest_t *g,
     /* Wait until woken or timeout */
     int ret = 0;
 
-    while (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE)) {
+    while (!atomic_load_explicit(&waiter.woken, memory_order_acquire)) {
         if (has_timeout) {
             /* Sleep in bounded quanta rather than to the guest deadline: a
              * worker parked here for a long guest timeout (JVM parkNanos,
@@ -745,7 +743,7 @@ static int64_t futex_wait(guest_t *g,
                 break;
             }
 
-            if (__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE))
+            if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
                 break;
 
             /* Mirror the no-timeout branch's itimer/queued-signal re-check
@@ -761,7 +759,7 @@ static int64_t futex_wait(guest_t *g,
             bool sig_ready = signal_pending() != 0;
             pthread_mutex_lock(&b->lock);
 
-            if (__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE))
+            if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
                 break;
 
             if (sig_ready) {
@@ -796,7 +794,7 @@ static int64_t futex_wait(guest_t *g,
         bool sig_ready = signal_pending() != 0;
         pthread_mutex_lock(&b->lock);
 
-        if (__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE))
+        if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
             break;
 
         /* Return EINTR only when a real deliverable signal is queued for this
@@ -819,7 +817,7 @@ static int64_t futex_wait(guest_t *g,
      * releasing the old bucket lock and acquiring the new one, another requeue
      * can move the waiter again. Loop until the waiter is found and dequeued.
      */
-    if (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE)) {
+    if (!atomic_load_explicit(&waiter.woken, memory_order_acquire)) {
         for (;;) {
             unsigned dequeue_idx = futex_hash(waiter.uaddr);
             futex_bucket_t *b_dequeue = &buckets[dequeue_idx];
@@ -850,7 +848,7 @@ static int64_t futex_wait(guest_t *g,
     pthread_mutex_unlock(&b->lock);
     pthread_cond_destroy(&waiter.cond);
 
-    if (__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE))
+    if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
         return 0;
 
     /* Plain FUTEX_WAIT counts its timeout from the call, so part of it is spent
@@ -1235,7 +1233,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
     if (!word)
         return -LINUX_EFAULT;
 
-    uint32_t tid = current_thread ? (uint32_t) current_thread->guest_tid
+    uint32_t tid = current_thread ? (uint32_t) thread_tid(current_thread)
                                   : (uint32_t) proc_get_pid();
 
     /* Build deadline (if timeout specified, it's absolute CLOCK_REALTIME) */
@@ -1342,7 +1340,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
         b->head = &waiter;
 
         bool owner_died = false;
-        while (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE)) {
+        while (!atomic_load_explicit(&waiter.woken, memory_order_acquire)) {
             if (has_timeout) {
                 /* Bounded quanta for the same teardown-reachability reason as
                  * futex_wait: never sleep to a distant guest deadline.
@@ -1351,7 +1349,8 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                 bool expired = !futex_quantum_deadline(&deadline, &quantum);
                 if (!expired) {
                     pthread_cond_timedwait(&waiter.cond, &b->lock, &quantum);
-                    if (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE) &&
+                    if (!atomic_load_explicit(&waiter.woken,
+                                              memory_order_acquire) &&
                         thread_stop_requested()) {
                         /* Mirror the no-timeout exit_group path below. */
                         bucket_unlink_locked(b, &waiter);
@@ -1372,14 +1371,16 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                     bool sig_ready = signal_pending() != 0;
                     pthread_mutex_lock(&b->lock);
 
-                    if (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE) &&
+                    if (!atomic_load_explicit(&waiter.woken,
+                                              memory_order_acquire) &&
                         sig_ready) {
                         bucket_unlink_locked(b, &waiter);
                         pthread_mutex_unlock(&b->lock);
                         pthread_cond_destroy(&waiter.cond);
                         return -LINUX_EINTR;
                     }
-                } else if (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE)) {
+                } else if (!atomic_load_explicit(&waiter.woken,
+                                                 memory_order_acquire)) {
                     /* Timeout: dequeue and return */
                     bucket_unlink_locked(b, &waiter);
                     /* Only clear WAITERS bit if no waiters for this address */
@@ -1424,7 +1425,8 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                 bool sig_ready = signal_pending() != 0;
                 pthread_mutex_lock(&b->lock);
 
-                if (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE) &&
+                if (!atomic_load_explicit(&waiter.woken,
+                                          memory_order_acquire) &&
                     sig_ready) {
                     bucket_unlink_locked(b, &waiter);
                     pthread_mutex_unlock(&b->lock);
@@ -1499,7 +1501,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
     if (!word)
         return -LINUX_EFAULT;
 
-    uint32_t tid = current_thread ? (uint32_t) current_thread->guest_tid
+    uint32_t tid = current_thread ? (uint32_t) thread_tid(current_thread)
                                   : (uint32_t) proc_get_pid();
 
     uint32_t expected = 0;
@@ -1520,7 +1522,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
  */
 static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
 {
-    uint32_t tid = current_thread ? (uint32_t) current_thread->guest_tid
+    uint32_t tid = current_thread ? (uint32_t) thread_tid(current_thread)
                                   : (uint32_t) proc_get_pid();
 
     /* Linux futex_unlock_pi() reads the word and rejects a non-owner with
@@ -1529,7 +1531,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
      * you do not own returns -EPERM even for an unaligned uaddr. Match that
      * ordering. The word may be unaligned here, so read it with
      * guest_read_small (boundary-safe, and avoids the aligned-atomic-load fault
-     * an unaligned __atomic_load_n would take on the arm64 host).
+     * an unaligned atomic load would take on the arm64 host).
      */
     uint32_t cur;
     if (guest_read_small(g, uaddr, &cur, sizeof(cur)) != 0)
@@ -1663,7 +1665,7 @@ int futex_wake_one(guest_t *g, uint64_t uaddr)
  */
 static void waitv_unlink(futex_waiter_t *w)
 {
-    if (__atomic_load_n(&w->woken, __ATOMIC_ACQUIRE))
+    if (atomic_load_explicit(&w->woken, memory_order_acquire))
         return;
     for (;;) {
         unsigned idx = futex_hash(w->uaddr);
@@ -1677,7 +1679,7 @@ static void waitv_unlink(futex_waiter_t *w)
                 break;
             }
         }
-        bool was_woken = __atomic_load_n(&w->woken, __ATOMIC_ACQUIRE);
+        bool was_woken = atomic_load_explicit(&w->woken, memory_order_acquire);
         pthread_mutex_unlock(&b->lock);
         if (found || was_woken)
             return;
@@ -1880,7 +1882,7 @@ int64_t sys_futex_waitv(guest_t *g,
         futex_waiter_t *w = &waiters[i];
         w->uaddr = uaddr;
         w->bitset = FUTEX_BITSET_MATCH_ANY;
-        w->woken = 0;
+        atomic_store_explicit(&w->woken, 0, memory_order_relaxed);
         w->next = b->head;
         w->group_lock = &shared.lock;
         w->group_cond = &shared.cond;
@@ -1903,7 +1905,7 @@ int64_t sys_futex_waitv(guest_t *g,
     pthread_mutex_lock(&shared.lock);
     for (;;) {
         for (uint32_t i = 0; i < nr_futexes; i++) {
-            if (__atomic_load_n(&waiters[i].woken, __ATOMIC_ACQUIRE)) {
+            if (atomic_load_explicit(&waiters[i].woken, memory_order_acquire)) {
                 result_idx = (int) i;
                 break;
             }
@@ -1941,7 +1943,8 @@ int64_t sys_futex_waitv(guest_t *g,
                  * been signalled yet on this thread but the woken flag is set.
                  */
                 for (uint32_t i = 0; i < nr_futexes; i++) {
-                    if (__atomic_load_n(&waiters[i].woken, __ATOMIC_ACQUIRE)) {
+                    if (atomic_load_explicit(&waiters[i].woken,
+                                             memory_order_acquire)) {
                         result_idx = (int) i;
                         break;
                     }
@@ -2059,7 +2062,7 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             0) {
             /* Only act if this thread owns the lock */
             uint32_t owner = futex_val & FUTEX_TID_MASK;
-            if (owner == (uint32_t) t->guest_tid) {
+            if (owner == (uint32_t) thread_tid(t)) {
                 /* Set FUTEX_OWNER_DIED and clear TID */
                 uint32_t new_val =
                     (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
@@ -2103,7 +2106,7 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
         if (guest_read_small(g, futex_gva, &futex_val, sizeof(futex_val)) ==
             0) {
             uint32_t owner = futex_val & FUTEX_TID_MASK;
-            if (owner == (uint32_t) t->guest_tid) {
+            if (owner == (uint32_t) thread_tid(t)) {
                 uint32_t new_val =
                     (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
                 if (guest_write_small(g, futex_gva, &new_val, sizeof(new_val)) <

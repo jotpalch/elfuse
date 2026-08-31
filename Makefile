@@ -35,6 +35,8 @@ SRCS := \
     runtime/fork-state.c \
     runtime/procemu.c \
     runtime/procemu-pty.c \
+    runtime/usb-sysfs.c \
+    runtime/usb-desc.c \
     runtime/proctitle.c \
     syscall/syscall.c \
     syscall/fdtable.c \
@@ -83,7 +85,7 @@ OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
-HVF_LDFLAGS := -framework Hypervisor -arch arm64
+HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -arch arm64
 
 # Generated headers under build/ that must exist before compiling sources that
 # include them.
@@ -266,6 +268,14 @@ $(BUILD_DIR)/test-dynamic-array-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the USB descriptor walk host unit test (native macOS binary)
+# usb-desc.o is a pure leaf translation unit (byte bookkeeping, no IOKit and no
+# I/O), so the test links the code under test and nothing else.
+$(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
+		$(BUILD_DIR)/runtime/usb-desc.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the guest environment merge host test (native macOS binary)
 # guest-env.o's only dependency is the log macro, which the test stubs.
 $(BUILD_DIR)/test-guest-env-host: $(BUILD_DIR)/test-guest-env-host.o \
@@ -283,6 +293,34 @@ $(BUILD_DIR)/test-stdio-nonblock-host: tests/test-stdio-nonblock-host.c | $(BUIL
 
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
+
+# Before the "ifndef GUEST_TEST_BINARIES" block below, and outside it. Two
+# rules name this stamp: the glibc benchmark inside that block and the sharun
+# fixtures outside it. Defined inside, a prebuilt-guest-binaries build left it
+# empty and the fixtures took a blank prerequisite; defined after the block, the
+# benchmark took one. Ahead of both is the only spot that serves both.
+#
+# The identity is in the stamp's name, not its contents, so a switched toolchain
+# names a file that does not exist and the fixtures rebuild on the ordinary
+# missing-prerequisite rule. Writing the identity into a fixed name instead
+# needs a phony prerequisite to re-run a comparison on every build, and that
+# also makes "make -n" report a rebuild a real build does not do, because a dry
+# run assumes the recipe wrote the file.
+#
+# A real target, not a write while the makefile is read: the FLAVOR stamp in
+# mk/common.mk is written at parse time, which it can be because nothing names
+# it as a prerequisite, whereas a parse-time write here would happen before
+# "make clean test-sharun" runs clean and leave the fixtures naming a
+# prerequisite that no longer exists and has no rule to recreate it.
+CROSS_GLIBC_STAMP := $(BUILD_DIR)/.sharun-toolchain-$(CROSS_GLIBC_ID_HASH)
+$(CROSS_GLIBC_STAMP): | $(BUILD_DIR)
+
+	# Exactly one stamp exists at a time. Leaving the old ones behind means
+	# switching back to a toolchain used earlier finds its stamp still there and
+	# older than the fixtures the other toolchain built, so make calls them up to
+	# date and the lane runs binaries linked against the wrong runtime.
+	$(Q)rm -f $(BUILD_DIR)/.sharun-toolchain-*
+	$(Q)touch $@
 
 ifndef GUEST_TEST_BINARIES
 $(BUILD_DIR)/test-hello: tests/hello.S tests/simple.ld | $(BUILD_DIR)
@@ -506,17 +544,18 @@ $(BUILD_DIR)/bench-hot-guard: tests/bench-hot-guard.c | $(BUILD_DIR)
 # suite). Linked without -static so glibc resolves time / urandom
 # syscalls through the vDSO trampoline -- which is exactly what the
 # guardrail script verifies against the 50 ns / 200 ns ceilings.
-ifneq ($(wildcard $(LINUX_TOOLCHAIN)/aarch64-unknown-linux-gnu/sysroot/.),)
+ifneq ($(CROSS_GLIBC_SYSROOT_PRESENT),)
 # -DGUARD_USE_LIBC_CG switches the bench's clock_gettime case from a
 # direct vDSO trampoline call to the libc wrapper, so the dynamic-glibc
 # build measures glibc's actual routing decision. A regression in the
 # NT_GNU_ABI_TAG note or LINUX_2.6.39 versioning would push this
 # measurement from ~7 ns up to SVC time (~2000 ns) and fail the
 # guardrail.
-$(BUILD_DIR)/bench-hot-guard-glibc: tests/bench-hot-guard.c | $(BUILD_DIR)
+$(BUILD_DIR)/bench-hot-guard-glibc: tests/bench-hot-guard.c \
+		$(CROSS_GLIBC_STAMP) | $(BUILD_DIR)
 	@echo "  CROSS   $< (dynamic glibc)"
-	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -DGUARD_USE_LIBC_CG=1 -O2 \
-		-o $@ $< -lpthread
+	$(Q)$(CROSS_COMPILE)gcc --sysroot=$(CROSS_GLIBC_SYSROOT) \
+		-D_GNU_SOURCE -DGUARD_USE_LIBC_CG=1 -O2 -o $@ $< -lpthread
 endif
 
 endif
@@ -525,6 +564,40 @@ endif
 $(BUILD_DIR)/test-mremap-tail-emfile: tests/test-mremap-tail-emfile.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $<
+
+# Deliberately outside the "ifndef GUEST_TEST_BINARIES" block that ends above:
+# mk/tests.mk makes build/probe a prerequisite of test-sharun whenever a cross
+# glibc is present, regardless of GUEST_TEST_BINARIES, so a rule hidden by that
+# guard would leave the lane with no way to build what it requires.
+#
+# The sharun probe and its two DSOs, for test-sharun. Dynamic on purpose:
+# the point is the loader path (DT_NEEDED, dlopen, $$ORIGIN rpath), so a static
+# link would test nothing. Built only when the cross-glibc toolchain ships its
+# own sysroot, same guard as bench-hot-guard-glibc above.
+#
+# All three land in $(BUILD_DIR) together so the probe's $$ORIGIN rpath finds
+# libprobe.so at load time and libprobe-dlopen.so at dlopen time, with no
+# LD_LIBRARY_PATH. libprobe-dlopen.so is deliberately not linked into the probe,
+# so it can only arrive through dlopen.
+ifneq ($(CROSS_GLIBC_SYSROOT_PRESENT),)
+# Which toolchain and sysroot the fixtures below were built against. Make
+# compares timestamps, and neither of those is a file, so a probe built against
+# one glibc looks up to date after a switch to another and the lane then runs it
+# against a sysroot it was never linked for.
+#
+$(BUILD_DIR)/libprobe.so $(BUILD_DIR)/libprobe-dlopen.so: \
+		$(BUILD_DIR)/lib%.so: tests/fixtures/sharun/%-lib.c \
+		$(CROSS_GLIBC_STAMP) | $(BUILD_DIR)
+	@echo "  CROSS   $< (shared)"
+	$(Q)$(CROSS_COMPILE)gcc --sysroot=$(CROSS_GLIBC_SYSROOT) -fPIC -shared -o $@ $<
+
+$(BUILD_DIR)/probe: tests/fixtures/sharun/probe.c \
+		$(BUILD_DIR)/libprobe.so $(BUILD_DIR)/libprobe-dlopen.so \
+		$(CROSS_GLIBC_STAMP) | $(BUILD_DIR)
+	@echo "  CROSS   $< (dynamic glibc)"
+	$(Q)$(CROSS_COMPILE)gcc --sysroot=$(CROSS_GLIBC_SYSROOT) -o $@ $< \
+		-L$(BUILD_DIR) -lprobe -ldl -lm -pthread -Wl,-rpath,'$$ORIGIN'
+endif
 
 include mk/tests.mk
 include mk/lint.mk
