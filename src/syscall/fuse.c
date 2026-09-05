@@ -862,8 +862,7 @@ static int fuse_emit_forget_multi_locked(fuse_session_t *session,
 
 static int fuse_node_ref_drop_locked(fuse_session_t *session,
                                      uint64_t nodeid,
-                                     uint64_t nlookup,
-                                     bool emit_forget)
+                                     uint64_t nlookup)
 {
     if (nodeid == FUSE_ROOT_ID || nlookup == 0)
         return 0;
@@ -886,8 +885,6 @@ static int fuse_node_ref_drop_locked(fuse_session_t *session,
     } else {
         session->node_refs[idx].nlookup -= nlookup;
     }
-    if (!emit_forget)
-        return 0;
     fuse_forget_one_t one = {.nodeid = nodeid, .nlookup = nlookup};
     return fuse_emit_forget_multi_locked(session, &one, 1);
 }
@@ -1190,11 +1187,11 @@ static int fuse_walk_path_locked(fuse_session_t *session,
              * matching FORGET would leak that reference.
              */
             if (held_lookup != 0)
-                (void) fuse_node_ref_drop_locked(session, held_lookup, 1, true);
+                (void) fuse_node_ref_drop_locked(session, held_lookup, 1);
             return rc;
         }
         if (held_lookup != 0) {
-            rc = fuse_node_ref_drop_locked(session, held_lookup, 1, true);
+            rc = fuse_node_ref_drop_locked(session, held_lookup, 1);
             if (rc < 0) {
                 /* The previous component's drop already updated the local ref
                  * table but failed to queue its FUSE_FORGET. The just-acquired
@@ -1205,8 +1202,7 @@ static int fuse_walk_path_locked(fuse_session_t *session,
                  * caller still gets the original error and the session teardown
                  * FORGET sweep will reconcile any residual daemon-side count.
                  */
-                (void) fuse_node_ref_drop_locked(session, entry.nodeid, 1,
-                                                 true);
+                (void) fuse_node_ref_drop_locked(session, entry.nodeid, 1);
                 return rc;
             }
         }
@@ -1219,7 +1215,7 @@ static int fuse_walk_path_locked(fuse_session_t *session,
     }
 
     if (!retain_final_lookup && held_lookup != 0) {
-        int rc = fuse_node_ref_drop_locked(session, held_lookup, 1, true);
+        int rc = fuse_node_ref_drop_locked(session, held_lookup, 1);
         if (rc < 0)
             return rc;
     }
@@ -1355,7 +1351,7 @@ static int fuse_release_common_locked(fuse_session_t *session,
      * Without this, every successful O_PATH close leaks one reference.
      */
     if (linux_flags & LINUX_O_PATH)
-        return fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        return fuse_node_ref_drop_locked(session, nodeid, 1);
 
     fuse_release_in_t in = {
         .fh = fh,
@@ -1363,7 +1359,7 @@ static int fuse_release_common_locked(fuse_session_t *session,
     };
     int rc = fuse_request_locked(session, dir ? FUSE_RELEASEDIR : FUSE_RELEASE,
                                  nodeid, &in, sizeof(in), NULL, NULL);
-    int forget_rc = fuse_node_ref_drop_locked(session, nodeid, 1, true);
+    int forget_rc = fuse_node_ref_drop_locked(session, nodeid, 1);
     if (rc < 0)
         return rc;
     return forget_rc;
@@ -1927,7 +1923,7 @@ int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
         return rc;
     if (S_ISDIR(attr.mode)) {
         pthread_mutex_lock(&session->lock);
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -1950,7 +1946,7 @@ int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
         if (rc == 0 && rel_rc < 0)
             rc = rel_rc;
     } else {
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
     }
     pthread_mutex_unlock(&session->lock);
 
@@ -2050,7 +2046,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     bool want_dir = (linux_flags & LINUX_O_DIRECTORY) || S_ISDIR(attr.mode);
     bool path_only = (linux_flags & LINUX_O_PATH) != 0;
     if ((linux_flags & LINUX_O_DIRECTORY) && !S_ISDIR(attr.mode)) {
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -2064,7 +2060,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
      * file opens until FUSE write support exists for FD_FUSE_FILE.
      */
     if (!want_dir && !path_only && (linux_flags & 3) != LINUX_O_RDONLY) {
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -2075,7 +2071,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     int guest_fd =
         fd_alloc(want_dir ? FD_FUSE_DIR : FD_FUSE_FILE, -1, fuse_fd_cleanup);
     if (guest_fd < 0) {
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -2089,7 +2085,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     pthread_mutex_unlock(&fuse_lock);
     if (!file) {
         fd_mark_closed(guest_fd);
-        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -2103,7 +2099,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         rc = fuse_open_common_locked(session, nodeid, linux_flags, want_dir,
                                      &out);
         if (rc < 0) {
-            (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+            (void) fuse_node_ref_drop_locked(session, nodeid, 1);
             pthread_mutex_unlock(&session->lock);
             pthread_mutex_lock(&fuse_lock);
             fuse_file_put_locked(file); /* releases the open-fd ref */

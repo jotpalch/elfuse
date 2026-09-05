@@ -267,6 +267,11 @@ void gdb_rsp_reset(gdb_rsp_ctx_t *ctx)
     ctx->no_ack_mode = false;
 }
 
+bool gdb_rsp_pending(const gdb_rsp_ctx_t *ctx)
+{
+    return ctx->read_pos < ctx->read_len;
+}
+
 void gdb_rsp_set_noack(gdb_rsp_ctx_t *ctx, bool enabled)
 {
     ctx->no_ack_mode = enabled;
@@ -299,7 +304,7 @@ int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
     bool overflow = false;
 
     while (1) {
-        if (ctx->read_pos >= ctx->read_len) {
+        if (!gdb_rsp_pending(ctx)) {
             ssize_t n = read(fd, ctx->read_buf, GDB_RSP_READ_BUF_SIZE);
             if (n <= 0) {
                 if (n < 0 && errno == EINTR)
@@ -310,7 +315,7 @@ int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
             ctx->read_len = (size_t) n;
         }
 
-        while (ctx->read_pos < ctx->read_len) {
+        while (gdb_rsp_pending(ctx)) {
             uint8_t c = ctx->read_buf[ctx->read_pos++];
 
             if (state == 0 && (c == '+' || c == '-'))

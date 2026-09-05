@@ -13,25 +13,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 int main(void)
 {
-    const char *path = "/tmp/elfuse-roundtrip-test.bin";
+    char path[] = "/tmp/elfuse-roundtrip-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        perror("mkstemp");
+        return 1;
+    }
+
     const int N = 1000;
 
     /* Generate test data: array of squares */
     int *data = malloc(N * sizeof(int));
     if (!data) {
         perror("malloc");
+        close(fd);
+        remove(path);
         return 1;
     }
     for (int i = 0; i < N; i++)
         data[i] = i * i;
 
     /* Write */
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = fdopen(fd, "wb");
     if (!fp) {
-        perror("fopen(w)");
+        perror("fdopen(w)");
+        close(fd);
+        remove(path);
         return 1;
     }
     size_t nw = fwrite(data, sizeof(int), N, fp);

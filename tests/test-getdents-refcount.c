@@ -41,6 +41,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -56,7 +57,10 @@ static _Atomic int shared_fd = -1;
 static _Atomic int sibling_stop = 0;
 static char sibling_stack[32768] __attribute__((aligned(16)));
 
-#define STRESS_DIR "/tmp/test-getdents-refcount.d"
+/* Private to this run: a shared directory would have a concurrent run adding
+ * entries to the one this test is scanning.
+ */
+static char stress_dir[64];
 #define STRESS_FILE_COUNT 800
 
 /* Populate a directory with enough entries that a single getdents64() call
@@ -65,11 +69,12 @@ static char sibling_stack[32768] __attribute__((aligned(16)));
  */
 static int make_stress_dir(void)
 {
-    if (mkdir(STRESS_DIR, 0755) < 0 && errno != EEXIST)
+    snprintf(stress_dir, sizeof(stress_dir), "/tmp/elfuse-getdents-XXXXXX");
+    if (!mkdtemp(stress_dir))
         return -1;
     for (int i = 0; i < STRESS_FILE_COUNT; i++) {
         char path[128];
-        snprintf(path, sizeof(path), STRESS_DIR "/f%d", i);
+        snprintf(path, sizeof(path), "%s/f%d", stress_dir, i);
         int fd = open(path, O_CREAT | O_WRONLY, 0644);
         if (fd < 0)
             return -1;
@@ -127,7 +132,7 @@ int main(void)
     const int iterations = 4000;
     int completed = 0;
     for (int i = 0; i < iterations; i++) {
-        int fd = open(STRESS_DIR, O_RDONLY | O_DIRECTORY);
+        int fd = open(stress_dir, O_RDONLY | O_DIRECTORY);
         if (fd < 0)
             break;
 
@@ -152,7 +157,7 @@ int main(void)
              * without a close() syscall on fd itself -- the second chokepoint
              * dir_stream_release() must also cover.
              */
-            int replacement = open(STRESS_DIR, O_RDONLY | O_DIRECTORY);
+            int replacement = open(stress_dir, O_RDONLY | O_DIRECTORY);
             if (replacement >= 0) {
                 shared_fd = -1;
                 dup3(replacement, fd, 0);
@@ -174,7 +179,7 @@ int main(void)
      */
     TEST("getdents64 still functional after churn");
     {
-        int fd = open(STRESS_DIR, O_RDONLY | O_DIRECTORY);
+        int fd = open(stress_dir, O_RDONLY | O_DIRECTORY);
         int seen = 0;
         bool ok = fd >= 0;
         if (ok) {
@@ -201,6 +206,16 @@ int main(void)
         } ts = {0, 10000000}; /* 10ms */
         raw_syscall6(__NR_futex, (long) &child_tid, 0 /* FUTEX_WAIT */,
                      child_tid, (long) &ts, 0, 0);
+    }
+
+    /* 800 entries plus the directory. */
+    if (stress_dir[0]) {
+        for (int i = 0; i < STRESS_FILE_COUNT; i++) {
+            char path[128];
+            snprintf(path, sizeof(path), "%s/f%d", stress_dir, i);
+            unlink(path);
+        }
+        rmdir(stress_dir);
     }
 
     SUMMARY("test-getdents-refcount");

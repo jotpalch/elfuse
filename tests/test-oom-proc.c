@@ -75,7 +75,6 @@ static void run_oom_copy_test(const char *label,
                               oom_copy_fn copy)
 {
     TEST(label);
-    unlink(dst);
     reset_oom_score_adj();
 
     int in_fd = open("/proc/self/oom_adj", O_RDONLY);
@@ -123,11 +122,26 @@ int main(void)
         "test-oom-proc: synthetic oom proc source sendfile/copy_file_range "
         "interception\n");
 
+    char sendfile_dst[] = "/tmp/elfuse-oom-sendfile-XXXXXX";
+    char cfr_dst[] = "/tmp/elfuse-oom-cfr-XXXXXX";
+    int seed = mkstemp(sendfile_dst);
+    if (seed < 0) {
+        perror("mkstemp");
+        return 1;
+    }
+    close(seed);
+    seed = mkstemp(cfr_dst);
+    if (seed < 0) {
+        perror("mkstemp");
+        unlink(sendfile_dst);
+        return 1;
+    }
+    close(seed);
+
     run_oom_copy_test("sendfile rereads synthetic oom proc source",
-                      "/tmp/elfuse-test-proc-sendfile.txt", copy_via_sendfile);
+                      sendfile_dst, copy_via_sendfile);
     run_oom_copy_test("copy_file_range rereads synthetic oom proc source",
-                      "/tmp/elfuse-test-proc-cfr.txt",
-                      copy_via_copy_file_range);
+                      cfr_dst, copy_via_copy_file_range);
 
     SUMMARY("test-oom-proc");
     return fails > 0 ? 1 : 0;

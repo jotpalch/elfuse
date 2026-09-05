@@ -14,6 +14,7 @@
  */
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -79,10 +80,10 @@ static void test_file_roundtrip(void)
 {
     TEST("writev->readv file roundtrip");
 
-    const char *path = "/tmp/elfuse-test-writev.txt";
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char path[] = "/tmp/elfuse-writev-XXXXXX";
+    int fd = mkstemp(path);
     if (fd < 0) {
-        FAIL("open");
+        FAIL("mkstemp");
         return;
     }
 
@@ -239,10 +240,10 @@ static void test_pwritev2_append(void)
 {
     TEST("pwritev2 RWF_APPEND EOF");
 
-    const char *path = "/tmp/elfuse-test-pwritev2-append.txt";
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char path[] = "/tmp/elfuse-pwritev2-app-XXXXXX";
+    int fd = mkstemp(path);
     if (fd < 0) {
-        FAIL("open");
+        FAIL("mkstemp");
         return;
     }
 
@@ -296,10 +297,10 @@ static void test_pwritev2_append_zero_iovcnt(void)
 {
     TEST("pwritev2 RWF_APPEND zero iovcnt");
 
-    const char *path = "/tmp/elfuse-test-pwritev2-append-zero.txt";
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char path[] = "/tmp/elfuse-pwritev2-appz-XXXXXX";
+    int fd = mkstemp(path);
     if (fd < 0) {
-        FAIL("open");
+        FAIL("mkstemp");
         return;
     }
 
@@ -359,8 +360,8 @@ static long vec_zero_syscall(int op, int fd, long off, long flags)
 
 static void test_zero_iovcnt_validation(void)
 {
-    const char *path = "/tmp/elfuse-test-zero-iovcnt.txt";
-    int rw = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char path[] = "/tmp/elfuse-zero-iovcnt-XXXXXX";
+    int rw = mkstemp(path);
     int ro = open(path, O_RDONLY);
     int wo = open(path, O_WRONLY);
     int opath = open(path, O_PATH);

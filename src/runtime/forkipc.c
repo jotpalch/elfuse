@@ -958,11 +958,10 @@ static void *thread_create_and_run(void *arg)
 
     /* A PTRACE_INTERRUPT that raced this bring-up (arrived before the handle
      * was published) recorded a pending request it could not deliver via
-     * hv_vcpus_exit. Consume it under the same lock and self-kick below so the
-     * first hv_vcpu_run returns CANCELED into the ptrace-stop path.
+     * hv_vcpus_exit. Preserve that owed stop and self-kick below so the first
+     * hv_vcpu_run returns CANCELED into the ptrace-stop path.
      */
     bool ptrace_interrupt = t->ptrace_interrupt_pending;
-    t->ptrace_interrupt_pending = false;
     pthread_mutex_unlock(tlock);
     if (ptrace_interrupt)
         hv_vcpus_exit(&vcpu, 1);
@@ -1107,10 +1106,11 @@ startup_ok:
      * how pthread_join works in musl: the joining thread does FUTEX_WAIT on
      * this address until it becomes 0.
      *
-     * Drain any deferred munmap of this thread's stack before waking the
-     * joiner: the parent may reuse the freed VA as soon as it returns from
-     * pthread_join, and reuse must not race with the deferred unmap.
+     * Drain deferred stack munmaps before the store, not merely before the
+     * wake: a joiner polling the tid never reaches FUTEX_WAIT, so ordering the
+     * drain against the wake alone lets it reuse the VA while still mapped.
      */
+    mem_cleanup_deferred_stack_unmaps(g, t);
     bool wake_ctid = false;
     if (t->clear_child_tid != 0) {
         uint32_t zero = 0;
@@ -1125,7 +1125,6 @@ startup_ok:
                 (unsigned long long) t->clear_child_tid);
         }
     }
-    mem_cleanup_deferred_stack_unmaps(g, t);
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
@@ -1143,15 +1142,12 @@ startup_ok:
     thread_deactivate(t);
 
     /* When all CLONE_THREAD workers have exited and only the main thread
-     * remains, interrupt its futex_wait. In real Linux, child exit delivers
-     * SIGCHLD which interrupts futex_wait with -EINTR. elfuse simulates this
-     * through the futex interrupt API.
+     * remains, nudge it so anything parked on host state re-checks. No EINTR
+     * goes with it: clone(2) sends no signal for a CLONE_THREAD exit, so a
+     * sibling's wait is not interrupted and its timeout is what ends it.
      */
     if (thread_active_count() == 1) {
-        log_debug(
-            "last worker exited, interrupting "
-            "main thread futex_wait/poll");
-        futex_interrupt_request();
+        log_debug("last worker exited, waking main thread");
         wakeup_pipe_signal();
         thread_interrupt_all();
     }
@@ -1339,7 +1335,6 @@ static void *vm_clone_thread_run(void *arg)
      * thread_create_and_run. vm-clone children are the usual ptrace targets.
      */
     bool ptrace_interrupt = t->ptrace_interrupt_pending;
-    t->ptrace_interrupt_pending = false;
     pthread_mutex_unlock(tlock);
     if (ptrace_interrupt)
         hv_vcpus_exit(&vcpu, 1);
@@ -1394,10 +1389,10 @@ static void *vm_clone_thread_run(void *arg)
     int wait_status = 0;
     int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0, &wait_status);
 
-    /* CLONE_CHILD_CLEARTID cleanup. Same ordering as thread_entry: drain
-     * deferred stack munmaps before waking the joiner so the parent does not
-     * reuse the VA before it is released.
+    /* CLONE_CHILD_CLEARTID cleanup. Same ordering as thread_entry: drain before
+     * the store, so a joiner that never blocks cannot reuse the VA early.
      */
+    mem_cleanup_deferred_stack_unmaps(g, t);
     bool wake_ctid = false;
     if (t->clear_child_tid != 0) {
         uint32_t zero = 0;
@@ -1412,7 +1407,6 @@ static void *vm_clone_thread_run(void *arg)
                 (unsigned long long) t->clear_child_tid);
         }
     }
-    mem_cleanup_deferred_stack_unmaps(g, t);
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 

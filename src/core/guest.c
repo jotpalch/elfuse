@@ -224,7 +224,7 @@ static void guest_region_clip_overlay(guest_region_t *r)
  * underflow path is unreachable, but the explicit check guards future
  * configurations and any IPC restore that bypasses size selection.
  */
-static int compute_infra_layout(guest_t *g)
+static bool compute_infra_layout(guest_t *g)
 {
     if (g->interp_base < INFRA_RESERVE) {
         log_error(
@@ -232,14 +232,14 @@ static int compute_infra_layout(guest_t *g)
             "guest_size too small",
             (unsigned long long) g->interp_base,
             (unsigned long long) INFRA_RESERVE);
-        return -1;
+        return false;
     }
     uint64_t infra_base = g->interp_base - INFRA_RESERVE;
     g->pt_pool_base = infra_base + INFRA_PT_POOL_OFF;
     g->pt_pool_end = infra_base + INFRA_PT_POOL_END_OFF;
     g->shim_base = infra_base + INFRA_SHIM_OFF;
     g->shim_data_base = infra_base + INFRA_SHIM_DATA_OFF;
-    return 0;
+    return true;
 }
 
 /* Allocate a zeroed 4KiB page from the page table pool.
@@ -501,7 +501,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
         g->interp_base = try_size - 0x100000000ULL;
         g->mmap_limit = try_size - 0x200000000ULL;
         g->overflow_ipa_next = try_size;
-        if (compute_infra_layout(g) < 0)
+        if (!compute_infra_layout(g))
             continue;
         g->pt_pool_next = g->pt_pool_base;
 
@@ -604,7 +604,7 @@ int guest_init_from_shm(guest_t *g,
     g->interp_base = size - 0x100000000ULL;
     g->mmap_limit = size - 0x200000000ULL;
     g->overflow_ipa_next = size;
-    if (compute_infra_layout(g) < 0) {
+    if (!compute_infra_layout(g)) {
         /* Layout computation may reject a malformed header (impossible
          * guest_size / ipa_bits combination) before the mapping is set up;
          * close the inherited shm fd here so the caller's contract -- this

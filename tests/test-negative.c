@@ -11,6 +11,7 @@
  */
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <setjmp.h>
@@ -487,8 +488,8 @@ static void test_einval(void)
 
     TEST("open(O_PATH) metadata-only fd");
     {
-        const char *path = "/tmp/elfuse-negative-opath";
-        int wfd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        char path[] = "/tmp/elfuse-negative-opath-XXXXXX";
+        int wfd = mkstemp(path);
         if (wfd < 0) {
             FAIL("create test file failed");
         } else {

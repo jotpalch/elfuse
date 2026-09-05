@@ -71,6 +71,7 @@ SRCS := \
     syscall/net-absock.c \
     syscall/net-sockopt.c \
     syscall/netlink.c \
+    syscall/usbdev.c \
     syscall/sysvipc.c \
     debug/crashreport.c \
     debug/gdbstub.c \
@@ -196,6 +197,12 @@ $(BUILD_DIR)/test-shebang-host: $(BUILD_DIR)/test-shebang-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the ELF header validation host test (native macOS binary)
+$(BUILD_DIR)/test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host.o \
+		$(BUILD_DIR)/core/elf.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the teardown live-worker accounting host unit test (native macOS binary)
 # Links the in-tree thread.o so the real thread_destroy_all_vcpus logic runs.
 # It drives only the worker branches (main vCPU passed as not-valid), so no
@@ -204,6 +211,12 @@ $(BUILD_DIR)/test-shebang-host: $(BUILD_DIR)/test-shebang-host.o \
 $(BUILD_DIR)/test-teardown-live-vcpu-host: \
 		$(BUILD_DIR)/test-teardown-live-vcpu-host.o \
 		$(BUILD_DIR)/runtime/thread.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
+
+## Build the buffered GDB session host regression
+$(BUILD_DIR)/test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host.o \
+		$(BUILD_DIR)/debug/gdbstub-reg.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
 
@@ -340,9 +353,35 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
 
+# test-usbdev-ioctl churns open/read/close on one usbdevfs node from four
+# threads, so a close and a sibling's open contend for the same fd number.
+$(BUILD_DIR)/test-usbdev-ioctl: tests/test-usbdev-ioctl.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-eventfd-semaphore-contended races two blocking readers on one eventfd.
 $(BUILD_DIR)/test-eventfd-semaphore-contended: \
 		tests/test-eventfd-semaphore-contended.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-signal-in-shim aims a stream of signals at threads contending for one
+# mutex, so the kick lands while a vCPU is inside the EL1 shim.
+$(BUILD_DIR)/test-signal-in-shim: tests/test-signal-in-shim.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-dir-union-fd-reuse closes the walked directory fd from a second thread
+# while the first is inside the widened union backing-lookup window.
+$(BUILD_DIR)/test-dir-union-fd-reuse: \
+		tests/test-dir-union-fd-reuse.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-fstatfs-fd-identity replaces the slot from a second thread while the
+# first is inside the widened fd-identity window.
+$(BUILD_DIR)/test-fstatfs-fd-identity: \
+		tests/test-fstatfs-fd-identity.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
@@ -490,6 +529,32 @@ $(BUILD_DIR)/test-shim-urandom-toctou: tests/test-shim-urandom-toctou.c | $(BUIL
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-futex-requeue-account parks a waiter, requeues it, and parks another, so
+# it needs threads.
+$(BUILD_DIR)/test-futex-requeue-account: tests/test-futex-requeue-account.c \
+    | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-futex-wake-nowaiter races a waker against a waiter to prove the EL1 wake
+# path never answers 0 for an address that still has one, so it needs a thread.
+$(BUILD_DIR)/test-futex-wake-nowaiter: tests/test-futex-wake-nowaiter.c \
+    | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-shim-futex-fast spawns a waker thread for the matching-word case, which
+# is the one branch of the futex fast path that must decline and block.
+$(BUILD_DIR)/test-shim-futex-fast: tests/test-shim-futex-fast.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-shim-futex-toctou races mprotect(PROT_NONE) against the futex EL1 ldtr
+# to exercise its data abort recovery slot. Needs pthreads.
+$(BUILD_DIR)/test-shim-futex-toctou: tests/test-shim-futex-toctou.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-fuse-basic runs a guest daemon thread and consumer in one process
 $(BUILD_DIR)/test-fuse-basic: tests/test-fuse-basic.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
@@ -537,6 +602,32 @@ $(BUILD_DIR)/test-lowbase-mem-300000: tests/test-lowbase-mem.c | $(BUILD_DIR)
 $(BUILD_DIR)/bench-hot-guard: tests/bench-hot-guard.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# bench-futex-contend is the workload that decides what the futex fast paths are
+# worth: contended mutexes plus a condvar handoff, which is what glibc and musl
+# locking actually issue. It is what showed that a wake with no waiter is 59.8
+# percent of futex calls there while the wait fast path fires not once, the
+# reverse of what a two-thread ping-pong suggests. Run by hand, not a gate.
+$(BUILD_DIR)/bench-futex-contend: tests/bench-futex-contend.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+.PHONY: bench-futex-contend
+bench-futex-contend: $(ELFUSE_BIN) $(BUILD_DIR)/bench-futex-contend
+	$(Q)ELFUSE_SHIM_STATS=1 $(ELFUSE_BIN) $(BUILD_DIR)/bench-futex-contend
+
+# bench-futex is the comprehensive futex bench: uncontended fast-path rows plus
+# threaded wake/wait handoff, so it links -lpthread like bench-hot-guard above.
+# Run by hand (make bench-futex); it is not a gate, because handoff latency is a
+# host-scheduler measurement and would flake as one. The rows that can be gated
+# live in bench-hot-guard instead.
+$(BUILD_DIR)/bench-futex: tests/bench-futex.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+.PHONY: bench-futex
+bench-futex: $(ELFUSE_BIN) $(BUILD_DIR)/bench-futex
+	$(Q)$(ELFUSE_BIN) $(BUILD_DIR)/bench-futex
 
 # bench-hot-guard-glibc is the dynamic-glibc twin of bench-hot-guard.
 # Built only when the cross-glibc toolchain ships its own sysroot
@@ -604,3 +695,4 @@ include mk/lint.mk
 include mk/verify.mk
 include mk/format.mk
 include mk/help.mk
+include mk/oci.mk

@@ -15,7 +15,7 @@
 
 #include "core/elf.h"
 #include "core/guest.h"
-#include "syscall/linux-limits.h"
+#include "linux-limits.h"
 
 typedef struct {
     elf_info_t elf_info;

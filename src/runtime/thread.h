@@ -170,11 +170,22 @@ typedef struct thread_entry {
     int ptrace_waiters;          /* Tracers currently blocked on ptrace_cond */
     bool ptrace_cleanup_pending; /* Destroy condvars after last waiter leaves */
     int ptrace_cont_sig;         /* Signal to inject on resume (0=none) */
-    bool ptrace_interrupt_pending;    /* PTRACE_INTERRUPT arrived while the vCPU
-                                       * was still in bring-up (!vcpu_valid), so
-                                       * it could not be delivered via
-                                       * hv_vcpus_exit; the worker self-kicks at
-                                       * publish to deliver it. Under thread_lock.
+    bool ptrace_interrupt_pending;    /* A ptrace-stop is owed to this thread.
+                                       * Set by every PTRACE_INTERRUPT, not only
+                                       * the bring-up race it started as: the
+                                       * kick alone is not enough, because it can
+                                       * land while the vCPU is at EL1 in the
+                                       * shim, where the live registers are shim
+                                       * scratch and a stop would show the tracer
+                                       * those instead of the guest's. Consumed
+                                       * in the HVC #5 epilogue, which then
+                                       * either stops in place or routes the
+                                       * stop through HVC #13, or by the
+                                       * canceled-exit handler once it has
+                                       * established EL0. A vCPU
+                                       * still in bring-up (!vcpu_valid) cannot
+                                       * be kicked at all and self-kicks at
+                                       * publish. Under thread_lock.
                                        */
     linux_user_pt_regs_t ptrace_regs; /* snapshot for cross-thread access */
     bool ptrace_regs_dirty;           /* Tracer modified registers */
@@ -355,6 +366,11 @@ uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t);
  * thread table lock during iteration.
  */
 void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
+
+/* True when a tracee that can still consume one owes a PTRACE_INTERRUPT stop.
+ * An exited vm-clone is not one of those. Caller holds thread_lock.
+ */
+bool thread_ptrace_interrupt_pending_locked(void);
 
 /* Count active VM-clone threads (is_vm_clone && !vm_exited). Used to detect
  * when the last VM-clone child exits.
@@ -550,6 +566,10 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                            int options);
 
 /* Get the thread table mutex (needed for ptrace wait blocking). */
+/*@
+  ensures \valid(\result);
+  assigns \nothing;
+ */
 pthread_mutex_t *thread_get_lock(void);
 
 /* Snapshot every active guest stack range overlapping [start, end), then record

@@ -94,6 +94,122 @@ LOGS = ROOT / "build" / "verify-mutants"
 # "function" names the proved function the mutation breaks; it is what the
 # coverage summary at the end counts, not decoration.
 MUTATIONS = [
+    # ---- verify-netlink ---------------------------------------------------
+    (
+        "netlink",
+        "src/proved/netlink.h",
+        "netlink_align_up",
+        "do not round up (the walk lands on a misaligned header)",
+        "    uint64_t padded = len + (NETLINK_ALIGNTO - 1);\n"
+        "    return padded - padded % NETLINK_ALIGNTO;\n",
+        "    return len;\n",
+    ),
+    (
+        "netlink",
+        "src/proved/netlink.h",
+        "netlink_rta_bounds",
+        "drop the lower guard (data_len underflows below the header)",
+        "    if (rta_len < RTA_HDRLEN || rta_len > total - off)\n",
+        "    if (rta_len > total - off)\n",
+    ),
+    (
+        "netlink",
+        "src/proved/netlink.h",
+        "netlink_msg_span",
+        "span the raw length (the next message starts misaligned)",
+        "    *span = netlink_align_up(nlmsg_len);\n",
+        "    *span = nlmsg_len;\n",
+    ),
+    (
+        "netlink",
+        "src/proved/netlink.h",
+        "netlink_attr_extent",
+        "drop the wire-field guard (the 16-bit total wraps)",
+        "    if (datalen > NETLINK_ATTR_LEN_MAX - RTA_HDRLEN)\n        return 0;\n\n",
+        "",
+    ),
+    # ---- verify-futexhash -------------------------------------------------
+    (
+        "futexhash",
+        "src/proved/futexhash.h",
+        "futex_bucket_index",
+        "drop the reduction (the index can run off the end of the table)",
+        "    return (uint32_t) (mixed % (uint64_t) nbuckets);\n",
+        "    return (uint32_t) mixed;\n",
+    ),
+    (
+        "futexhash",
+        "src/proved/futexhash.h",
+        "futex_bucket_index",
+        "reduce by one too few (the index can reach nbuckets, one off the end)",
+        "    return (uint32_t) (mixed % (uint64_t) nbuckets);\n",
+        "    return (uint32_t) (mixed % ((uint64_t) nbuckets + 1));\n",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_valid_capped",
+        "drop the ceiling (a capped caller then accepts what it cannot convert)",
+        "    return timespec_valid(sec, nsec) && sec <= cap;\n",
+        "    return timespec_valid(sec, nsec);\n",
+    ),
+    # ---- verify-futexdeadline ----------------------------------------------
+    (
+        "futexdeadline",
+        "src/runtime/futex.c",
+        "futex_remaining_ns",
+        "drop the cap (the quantum then exceeds what the caller asked for)",
+        "    return rem < cap_ns ? rem : cap_ns;\n",
+        "    return rem;\n",
+    ),
+    (
+        "futexdeadline",
+        "src/runtime/futex.c",
+        "futex_quantum_deadline",
+        "drop the saturating add (now + rem overflows near INT64_MAX)",
+        "    int64_t at_ns = now_ns > INT64_MAX - add ? INT64_MAX : now_ns + add;\n",
+        "    int64_t at_ns = now_ns + add;\n",
+    ),
+    (
+        "futexdeadline",
+        "src/runtime/futex.c",
+        "linux_timespec_is_valid",
+        "drop both bounds (a full-second nsec and an over-cap tv_sec get through)",
+        "    return timespec_valid_capped(lts->tv_sec, lts->tv_nsec,\n"
+        "                                 FUTEX_TIMESPEC_SEC_MAX);\n",
+        "    return lts->tv_sec >= 0 && lts->tv_nsec >= 0;\n",
+    ),
+    # ---- verify-futexop ----------------------------------------------------
+    (
+        "futexop",
+        "src/proved/futexop.h",
+        "futex_op_sign_extend12",
+        "restore the signed-shift form (UB for every operand at or above 0x800)",
+        "    uint32_t v = raw % FUTEX_OP_ARG_SPANU;\n"
+        "    if (v < FUTEX_OP_ARG_SIGN)\n"
+        "        return (int32_t) v;\n"
+        "    return (int32_t) v - FUTEX_OP_ARG_SPAN;\n",
+        "    int r = (int) (raw % FUTEX_OP_ARG_SPANU);\n"
+        "    return (int32_t) ((r << 20) >> 20);\n",
+    ),
+    (
+        "futexop",
+        "src/proved/futexop.h",
+        "futex_op_sign_extend12",
+        "drop the extension (the operand stays unsigned, so no value is negative)",
+        "    if (v < FUTEX_OP_ARG_SIGN)\n"
+        "        return (int32_t) v;\n"
+        "    return (int32_t) v - FUTEX_OP_ARG_SPAN;\n",
+        "    return (int32_t) v;\n",
+    ),
+    (
+        "futexop",
+        "src/proved/futexop.h",
+        "futex_op_shift_arg_mask",
+        "drop the mask (a negative operand reaches the shift: undefined)",
+        "    return (int32_t) ((uint32_t) arg % 32u);\n",
+        "    return arg;\n",
+    ),
     # ---- verify-align ------------------------------------------------------
     (
         "align",
@@ -537,6 +653,30 @@ MUTATIONS = [
         "drop the guest_size clamp (segment maps outside the slab)",
         "    if (memsz > guest_size || gpa > guest_size - memsz)",
         "    if (memsz > guest_size)",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_read_interp",
+        "drop the interp_path ceiling (the pread runs past the buffer)",
+        "    if (len < 2 || len >= sizeof(info->interp_path)) {",
+        "    if (len < 2) {",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_record_load",
+        "drop the segment-table ceiling (the write runs past segments[])",
+        "    if (*seg_count >= ELF_MAX_SEGMENTS) {",
+        "    if (false) {",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_check_placement",
+        "drop the loop variant (the placement sweep is no longer finite)",
+        "      loop variant info->num_segments - i;",
+        "      loop variant 0;",
     ),
     (
         "gva",

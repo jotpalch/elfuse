@@ -1104,9 +1104,40 @@ static int check_devices(void)
         EXPECT_TRUE(open(node, O_RDONLY | O_DIRECTORY) < 0 && errno == ENOTDIR,
                     "O_DIRECTORY on a char device");
 
-        TEST("a writable open of the node is EACCES");
-        EXPECT_TRUE(open(node, O_RDWR) < 0 && errno == EACCES,
-                    "O_RDWR on the node");
+        /* The usbdevfs fd now serves writable opens, and it has to keep the
+         * one-blob invariant: reading it must still return exactly what the
+         * descriptors attribute does, or the two views have drifted apart the
+         * moment a second generator appeared.
+         */
+        TEST("a writable open of the node serves the same blob");
+        int wfd = na > 0 ? open(node, O_RDWR) : -1;
+        if (wfd < 0) {
+            FAIL("O_RDWR on the node");
+        } else {
+            /* One byte over the attribute's length, so a node serving more than
+             * the attribute does is a failure rather than a prefix that
+             * silently compares equal.
+             */
+            size_t cap = (size_t) na + 1;
+            unsigned char *w = malloc(cap);
+            ssize_t nw = 0;
+            if (!w) {
+                FAIL("malloc");
+            } else {
+                while ((size_t) nw < cap) {
+                    ssize_t r = read(wfd, w + nw, cap - (size_t) nw);
+                    if (r < 0 && errno == EINTR)
+                        continue;
+                    if (r <= 0)
+                        break;
+                    nw += r;
+                }
+                EXPECT_TRUE(nw == na && memcmp(w, a, (size_t) na) == 0,
+                            "usbdevfs fd read matches descriptors");
+                free(w);
+            }
+            close(wfd);
+        }
 
         free(a);
         free(b);

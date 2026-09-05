@@ -338,6 +338,11 @@ int64_t proc_get_fg_pgrp(void)
     return guest_fg_pgrp;
 }
 
+int proc_get_ctty(void)
+{
+    return guest_has_ctty;
+}
+
 void proc_set_session(int64_t sid, int64_t pgid)
 {
     guest_sid = sid;

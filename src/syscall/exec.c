@@ -48,6 +48,7 @@
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
+
 /* Force HVF to commit the sysreg/GPR writes that sys_execve performs after a
  * guest_reset before vcpu_run resumes. HVF defers writes until the next
  * register-touch on the owning thread, and a stale read here is harmless. Use
@@ -137,6 +138,25 @@ static void exec_republish_shim_globals_or_die(hv_vcpu_t vcpu,
     shim_globals_rebuild_urandom_bitmap();
     shim_globals_refill_urandom_ring(g);
     shim_globals_recompute_attention(g);
+
+    /* The ptrace lane is not part of the recompute above, which owns only the
+     * signal lane, so shim_globals_init's memset is otherwise the last word on
+     * it. Restate it from the live thread table instead of inheriting a zero.
+     *
+     * No test covers this and none can today, which is worth saying plainly
+     * rather than leaving as an apparent gap: after a successful execve no
+     * tracer is left to observe the lane. thread_exec_de_thread has removed
+     * every CLONE_THREAD sibling, and an execve with a live CLONE_VM child is
+     * refused with ENOSYS well before this point, so the scan can only answer
+     * false and the memset already wrote that. What this buys is that the
+     * post-exec value is stated where the other lanes are stated, instead of
+     * being a consequence of a memset elsewhere continuing to be correct. It
+     * starts carrying weight the moment a tracer can outlive an exec.
+     */
+    pthread_mutex_t *tlock = thread_get_lock();
+    pthread_mutex_lock(tlock);
+    shim_globals_ptrace_attention(g, thread_ptrace_interrupt_pending_locked());
+    pthread_mutex_unlock(tlock);
 }
 
 /* Release the buffers and temporary host-side files that sys_execve allocates
@@ -319,7 +339,7 @@ static int read_string_array(guest_t *g,
         if (ptr == 0)
             break;
         count++;
-        if (count > 131072)
+        if (count > ELFUSE_MAX_ARG_STRINGS)
             return -2;
     }
 
@@ -344,17 +364,17 @@ static int read_string_array(guest_t *g,
             return -1;
         }
 
-        int rc = guest_read_str(g, ptr, temp_str, 131072);
+        int rc = guest_read_str(g, ptr, temp_str, LINUX_MAX_ARG_STRLEN);
         if (rc < 0) {
             size_t temp_len = strlen(temp_str);
             free(argv);
             free(buf);
-            return (temp_len >= 131072 - 1) ? -2 : -1;
+            return (temp_len >= LINUX_MAX_ARG_STRLEN - 1) ? -2 : -1;
         }
 
         size_t len = (size_t) rc;
 
-        if (*running_bytes + len + 1 > 2048 * 1024) {
+        if (*running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
             free(argv);
             free(buf);
             return -2;
@@ -673,25 +693,22 @@ static int64_t exec_preload_interp(const guest_t *g,
         return -LINUX_ENOEXEC;
     }
 
-    if (interp->info.e_machine != EM_AARCH64) {
-        log_error("execve: interpreter has unsupported machine type %u: %s",
-                  interp->info.e_machine, interp->resolved);
+    if (!elf_interp_is_loadable(&interp->info, interp->resolved))
         return -LINUX_ENOEXEC;
-    }
 
-    /* Bound the interpreter's extent here, the same way the executable's is
-     * bounded above. Without this the only thing that rejects an over-large
+    /* Settle the interpreter's placement here, the same way the executable's is
+     * settled above. Without this the only thing that rejects a badly placed
      * interpreter is elf_map_segments_fd, which runs after the point of no
      * return where the sole remaining option is exit(128). A guest able to
      * write its own sysroot could kill elfuse on demand by patching a PT_LOAD
      * in ld-musl; Linux returns ENOEXEC and the caller survives.
      */
-    if (interp->info.load_max > UINT64_MAX - g->interp_base ||
-        interp->info.load_max + g->interp_base > g->guest_size) {
-        log_error("execve: interpreter extends beyond guest memory: %s",
-                  interp->resolved);
+    uint64_t infra_lo, infra_hi;
+    guest_infra_window(g, &infra_lo, &infra_hi);
+    if (!elf_check_placement(&interp->info, interp->resolved, g->guest_size,
+                             (elf_window_t) {0, g->interp_base}, infra_lo,
+                             infra_hi))
         return -LINUX_ENOEXEC;
-    }
     return 0;
 }
 
@@ -1358,7 +1375,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     interp.fd = -1;
 
 
-    char *temp_str = malloc(131072);
+    char *temp_str = malloc(LINUX_MAX_ARG_STRLEN);
     if (!temp_str) {
         err = -LINUX_ENOMEM;
         goto fail;
@@ -1518,7 +1535,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
          * original-argv[1:]]
          */
         int prefix = (has_arg ? 2 : 1) + 1;
-        if (argc + prefix - 1 > 131072) {
+        if (argc + prefix - 1 > ELFUSE_MAX_ARG_STRINGS) {
             err = -LINUX_E2BIG;
             goto fail;
         }
@@ -1549,7 +1566,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         int prefix_end = ni - (argc > 1 ? argc - 1 : 0);
         for (int i = 0; i < prefix_end; i++) {
             size_t len = strlen(new_argv[i]);
-            if (running_bytes + len + 1 > 2048 * 1024) {
+            if (running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
                 free(new_argv);
                 err = -LINUX_E2BIG;
                 goto fail;
@@ -1709,29 +1726,29 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      */
     uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
 
-    /* Validate that the ELF fits within the guest address space.
+    /* Settle where the image lands before anything is torn down. The mapper
+     * takes the same per-segment decision, so passing here means the map after
+     * the point of no return cannot refuse the image and force exit(128). A
+     * segment ending at exactly UINT64_MAX is part of that: elf_load_fd records
+     * it (the extent does not wrap), and adding the load base to it does, which
+     * is what elf_check_placement catches.
      *
-     * load_max can be exactly UINT64_MAX: elf_load_fd rejects a PT_LOAD whose
-     * p_vaddr + p_memsz wraps, but a segment ending precisely at UINT64_MAX
-     * does not wrap and is recorded. Adding the load base to that truncates to
-     * a small value which passes the bound below, and the load then fails
-     * inside elf_map_segments_fd, which is past the point of no return where
-     * the only option left is exit(128). Reject it here, where execve can still
-     * return an error.
+     * Not for a Rosetta target: elfuse never maps that image, the translator
+     * reads it itself, so elf_load_base describes no mapping elfuse will make.
+     * The parse-time rejections in elf_load_fd still apply to it, and should:
+     * those judge whether the file is a well-formed ELF, which the translator
+     * needs as much as elfuse does. The forbidden window for the executable
+     * runs from the reserve to the top of the slab, not just across the
+     * reserve. Everything from interp_base up belongs to the interpreter and
+     * the runtime, so an ET_EXEC with a PT_LOAD above it would otherwise be
+     * accepted here and then have the interpreter mapped straight over it.
      */
-    if (elf_info.load_max > UINT64_MAX - elf_load_base) {
-        log_error("execve: ELF load extent overflows the address space for %s",
-                  path);
-        err = -LINUX_ENOEXEC;
-        goto fail;
-    }
-    uint64_t elf_end = elf_info.load_max + elf_load_base;
-    if (elf_end > g->guest_size) {
-        log_error(
-            "execve: ELF extends beyond guest address space "
-            "(0x%llx > 0x%llx) for %s",
-            (unsigned long long) elf_end, (unsigned long long) g->guest_size,
-            path);
+    uint64_t pre_infra_lo, pre_infra_hi;
+    guest_infra_window(g, &pre_infra_lo, &pre_infra_hi);
+    if (!target_is_rosetta &&
+        !elf_check_placement(&elf_info, path, g->guest_size,
+                             (elf_window_t) {0, elf_load_base}, pre_infra_lo,
+                             g->guest_size)) {
         err = -LINUX_ENOEXEC;
         goto fail;
     }
@@ -2000,11 +2017,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     }
 
     /* Load the executable image that was validated before guest_reset(). */
-    uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
-    uint64_t infra_hi = g->interp_base;
+    uint64_t infra_lo, infra_hi;
+    guest_infra_window(g, &infra_lo, &infra_hi);
     if (elf_map_segments_fd(&elf_info, exec_fd, path_host, g->host_base,
                             g->guest_size, (elf_window_t) {0, elf_load_base},
-                            infra_lo, infra_hi) < 0) {
+                            infra_lo, g->guest_size) < 0) {
         log_fatal(
             "execve failed after point of no return: "
             "failed to map ELF segments for %s",

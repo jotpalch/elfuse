@@ -16,8 +16,11 @@
 #     . "$(dirname "${BASH_SOURCE[0]}")/lib/bash-compat.sh"
 #
 # Provides:
-#   epoch_us            -- print current wall-clock time in microseconds
-#   bash_compat_require -- abort with a helpful message if BASH is too old
+#   epoch_us                  -- print current wall-clock time in microseconds
+#   bash_compat_require       -- abort with a helpful message if BASH is too old
+#   test_host_is_busy         -- true when the host is too loaded for timing
+#   test_host_busy_mark       -- record that verdict as a timed region starts
+#   test_host_busy_since_mark -- true when busy at the mark or busy now
 #
 # Conventions for portable bash:
 #   - Do not expand "${array[@]}" when the array may be empty under set -u
@@ -113,8 +116,9 @@ else
 fi
 
 # True when this machine is too loaded for a wall-clock measurement to mean
-# anything. Shared so the throughput guardrail and the per-test watchdog agree
-# on what "busy" is rather than drifting apart.
+# anything. One threshold for every caller, directly here for the throughput
+# guardrail and through the mark pair below for the watchdogs, so they cannot
+# drift apart on what "busy" means.
 #
 # The threshold is deliberately generous: below it, a timing failure is the code
 # and gets reported; above it, the number is measuring the neighbours. Observed
@@ -122,9 +126,42 @@ fi
 # ran 2 to 3 times slower and tripped several bounds at once.
 test_host_is_busy()
 {
-    local load ncpu
-    load=$(sysctl -n vm.loadavg 2> /dev/null | awk '{print $2}')
-    ncpu=$(sysctl -n hw.ncpu 2> /dev/null)
-    [ -n "$load" ] && [ -n "$ncpu" ] || return 1
-    awk -v l="$load" -v n="$ncpu" 'BEGIN { exit !(l > n * 0.6) }'
+    sysctl -n vm.loadavg hw.ncpu 2> /dev/null \
+        | awk 'NR == 1 { l = $2 } NR == 2 { n = $1 }
+               END { exit !(NR == 2 && n > 0 && l > n * 0.6) }'
+}
+
+# Asking only "is the host busy now" after a watchdog fires misses contention
+# that was already easing when the run began: the reading is a 1-minute average,
+# so a spike ending near the start of the test has decayed out of it by the time
+# the test gives up. Mark the load as the timed region starts and let the check
+# afterwards accept either end.
+#
+# Two readings cover the window and a third taken mid-run would add nothing. The
+# average decays with a 60s time constant, so a spike must end roughly 40s
+# before a reading to fall under the threshold, which inside a 60s watchdog puts
+# it at or before the mark. One brief enough to hide from both readings is too
+# brief to have eaten the run's headroom.
+#
+# Its own pair rather than a change to test_host_is_busy: the throughput
+# guardrail wants the instantaneous reading, and one predicate cannot mean both.
+
+# Set by test_host_busy_mark, read by test_host_busy_since_mark.
+test_host_busy_at_mark=0
+
+test_host_busy_mark()
+{
+    # if/else rather than "test_host_is_busy && x=1", so the status returned is
+    # an assignment's and never the predicate's: this must return 0 on an idle
+    # host, including inside the set -e regions the callers run under.
+    if test_host_is_busy; then
+        test_host_busy_at_mark=1
+    else
+        test_host_busy_at_mark=0
+    fi
+}
+
+test_host_busy_since_mark()
+{
+    [ "$test_host_busy_at_mark" -eq 1 ] || test_host_is_busy
 }

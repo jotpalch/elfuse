@@ -66,6 +66,7 @@
 #include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 #include "syscall/sys.h"
+#include "syscall/usbdev.h"
 #include "syscall/sysvipc.h"
 #include "proved/timespec.h"
 
@@ -115,6 +116,7 @@ void syscall_init(void)
     inotify_init();
     netlink_init();
     fuse_init();
+    usbdev_init();
     pidfd_init();
     io_init();
     fd_register_cleanup(FD_URANDOM, urandom_fd_cleanup);
@@ -1825,8 +1827,8 @@ static int64_t sc_capget(guest_t *g,
     uint32_t hdr[2];
     if (guest_read_small(g, x0, hdr, sizeof(hdr)) < 0)
         return -LINUX_EFAULT;
-    if (hdr[0] != 0x20080522) {
-        hdr[0] = 0x20080522;
+    if (hdr[0] != LINUX_CAPABILITY_VERSION_3) {
+        hdr[0] = LINUX_CAPABILITY_VERSION_3;
         guest_write_small(g, x0, hdr, sizeof(hdr));
         return -LINUX_EINVAL;
     }
@@ -2484,6 +2486,7 @@ static _Thread_local struct {
     bool forbidden;       /* a wait consumed part of a guest deadline */
     uint64_t elr_rewound; /* what the arm wrote, so cancel can recognize it */
     uint64_t elr_after_svc;
+    uint64_t nr; /* syscall the arm was for; see syscall_dispatch */
     int64_t result;
 } cpu_restart_req;
 
@@ -2497,9 +2500,13 @@ bool syscall_is_restarted(void)
     return cpu_restart_req.restarted;
 }
 
-void syscall_restart_arm(hv_vcpu_t vcpu, uint64_t elr_after_svc, int64_t result)
+void syscall_restart_arm(hv_vcpu_t vcpu,
+                         uint64_t elr_after_svc,
+                         uint64_t nr,
+                         int64_t result)
 {
     cpu_restart_req.armed = true;
+    cpu_restart_req.nr = nr;
     cpu_restart_req.elr_after_svc = elr_after_svc;
     cpu_restart_req.elr_rewound = elr_after_svc - 4;
     cpu_restart_req.result = result;
@@ -2521,6 +2528,13 @@ void syscall_restart_cancel(hv_vcpu_t vcpu)
     if (elr != cpu_restart_req.elr_rewound)
         return;
 
+    /* No syscall-number witness here, unlike the dispatch test. By the time a
+     * cancel runs, X8 is the TLBI wire value the epilogue wrote rather than the
+     * syscall number, so comparing it would refuse every cancel and strand the
+     * rewind. tests/test-exec-handoff.c covers it: the "signal delivered on top
+     * of a handoff" case fails outright when this reads X8.
+     */
+
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,
                         cpu_restart_req.elr_after_svc);
     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) cpu_restart_req.result);
@@ -2530,23 +2544,49 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
 {
     uint64_t x0, x1, x2, x3, x4, x5, x8;
 
-    /* A restart that survived to here was taken, and ELR_EL1 proves it: on SVC
-     * entry it is the address after the instruction, which matches only if this
-     * is the same SVC the arm rewound to. Anything that moved on in between --
-     * a cancel, or a handed-off execve that succeeded and reloaded the image --
-     * fails the compare and reads as a fresh call. Read only when armed, so the
-     * common path pays nothing for it.
+    /* A restart that survived to here was taken, and ELR_EL1 plus the syscall
+     * number prove it: on SVC entry ELR is the address after the instruction,
+     * which matches only if this is the same SVC the arm rewound to. Anything
+     * that moved on in between (a cancel, or a handed-off execve that succeeded
+     * and reloaded the image) fails the compare and reads as a fresh call. ELR
+     * is read only when armed, and the number is the X8 the dispatch reads
+     * anyway, so the common path pays nothing.
+     *
+     * The number is checked too, because ELR alone is not a witness once a
+     * syscall can be answered without reaching here. An EL1 fast path serves a
+     * rewound SVC entirely in the shim, so this record survives into a later
+     * call; musl funnels every cancellable syscall through one svc in
+     * __syscall_cp_asm, so that later call arrives at the same ELR and would
+     * read as the restart. It is a real sequence: park in an untimed
+     * FUTEX_WAIT, take a leader-work EINTR, have the handed-off execve fail,
+     * then have futex_wait_fast answer the re-executed SVC with EAGAIN, and
+     * connect() at net.c is the reader that would swallow a genuine EISCONN.
+     *
+     * The shim restores X8 from its saved frame, so a rewound SVC re-executes
+     * the same syscall. Requiring the number to match therefore admits only the
+     * call the arm was for.
+     *
+     * That leaves one standing obligation on future work: no syscall served by
+     * an EL1 fast path may read syscall_is_restarted(). A stale record can
+     * outlive its arm (any fast path prolongs it, not just the futex one), and
+     * the number match is what keeps it from being read as a restart of an
+     * unrelated call. Today the two readers are sys_connect and the netlink
+     * receive, neither of which has a fast path. A fast path added to either,
+     * or a restart-reading branch added to a syscall that has one, needs a
+     * per-vCPU gate forcing the rewound SVC through the HVC instead.
      */
     cpu_restart_req.forbidden = false;
     cpu_restart_req.restarted = false;
+    hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
     if (cpu_restart_req.armed) {
         uint64_t entry_elr = 0;
         cpu_restart_req.armed = false;
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &entry_elr);
-        cpu_restart_req.restarted = entry_elr == cpu_restart_req.elr_after_svc;
+        cpu_restart_req.restarted =
+            entry_elr == cpu_restart_req.elr_after_svc &&
+            x8 == cpu_restart_req.nr;
     }
 
-    hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
     x0 = 0;
     x1 = 0;
     x2 = 0;
@@ -2848,7 +2888,7 @@ fast_done:
             uint64_t elr = 0;
             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
             if (elr >= 4) {
-                syscall_restart_arm(vcpu, elr, result);
+                syscall_restart_arm(vcpu, elr, x8, result);
                 restart_armed = true;
             }
         }

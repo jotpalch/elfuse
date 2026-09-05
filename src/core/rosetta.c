@@ -237,14 +237,15 @@ int rosetta_prepare(guest_t *g,
      */
     uint64_t guest_base;
     if (g->rosetta_guest_base == 0) {
-        uint64_t rosetta_limit = g->interp_base - INFRA_RESERVE;
+        uint64_t rosetta_limit, infra_top;
+        guest_infra_window(g, &rosetta_limit, &infra_top);
         if (g->interp_base < INFRA_RESERVE || rosetta_limit < size) {
             log_error(
                 "rosetta: primary buffer too small for rosetta image "
                 "(%llu MiB) below infra reserve [0x%llx,0x%llx)",
                 (unsigned long long) (size >> 20),
                 (unsigned long long) rosetta_limit,
-                (unsigned long long) g->interp_base);
+                (unsigned long long) infra_top);
             return -1;
         }
         guest_base = ALIGN_2MIB_DOWN(rosetta_limit - size);
@@ -261,8 +262,8 @@ int rosetta_prepare(guest_t *g,
          * the image lands at guest_base. Passing the pair rather than a
          * pre-subtracted base keeps the arithmetic free of wraparound.
          */
-        uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
-        uint64_t infra_hi = g->interp_base;
+        uint64_t infra_lo, infra_hi;
+        guest_infra_window(g, &infra_lo, &infra_hi);
         if (elf_map_segments(ri, ROSETTA_PATH, g->host_base, g->guest_size,
                              (elf_window_t) {va_base, guest_base}, infra_lo,
                              infra_hi) < 0) {
@@ -311,8 +312,8 @@ int rosetta_prepare(guest_t *g,
          * be rebuilt. Segments get reloaded in place.
          */
         guest_base = g->rosetta_guest_base;
-        uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
-        uint64_t infra_hi = g->interp_base;
+        uint64_t infra_lo, infra_hi;
+        guest_infra_window(g, &infra_lo, &infra_hi);
         if (elf_map_segments(ri, ROSETTA_PATH, g->host_base, g->guest_size,
                              (elf_window_t) {va_base, guest_base}, infra_lo,
                              infra_hi) < 0) {

@@ -106,6 +106,7 @@ Key files:
 | `src/syscall/time.c` | clocks, timers, `setitimer`, clock-ID translation |
 | `src/syscall/sys.c` | `uname`, `sysinfo`, `getrandom`, `prlimit64` |
 | `src/syscall/net.c`, `net-abi.c`, `net-absock.c`, `net-msg.c`, `net-sockopt.c`, `netlink.c` | sockets, SCM_RIGHTS, abstract Unix sockets, netlink |
+| `src/syscall/usbdev.c` | usbdevfs fds over IOKit (see [USB Device Passthrough](#usb-device-passthrough)) |
 | `src/syscall/translate.c` | errno and shared `AT_*` flag translation |
 | `src/syscall/proc.c` | vCPU run loop, `wait4`, ptrace coordination, HVC #6 routing |
 | `src/syscall/exec.c` | `execve`: ELF reload, interpreter resolve, vCPU restart |
@@ -354,6 +355,7 @@ aligned address from the `Rt` register); HVF traps DC ZVA via `HCR_EL2.TDZ=1`.
 | #10 | BRK from EL0 | SIGTRAP delivery / ptrace-stop; GPRs in frame |
 | #11 | EL0 fault | SIGSEGV/SIGILL delivery; GPRs in frame |
 | #12 | EL0 system-instruction trap | cache maintenance logging (DC CVAU, IC IVAU, …) and `MSR TPIDR_EL0` emulation |
+| #13 | Ptrace interrupt | the shim restores the saved SVC frame before this stop, so ptrace snapshots architectural registers |
 
 ### Critical Vector-Entry Rule
 
@@ -604,6 +606,7 @@ waiter enqueue, so the compare-and-wait is a single critical section.
 | FUSE (sessions, file/dir state) | global `fuse_lock` + per-session `session->lock` | `src/syscall/fuse.c` |
 | Sysroot snapshot | `pthread_mutex` | `src/syscall/proc-state.c` |
 | Synthetic USB tree (scratch dirs + device model) | `usb_lock` (leaf) | `src/runtime/usb-sysfs.c` |
+| usbdevfs fd side table | `usbdev_table_lock` + per-entry lock | `src/syscall/usbdev.c` |
 
 Lock ordering is documented inline in those files
 (`mmap_lock` is order 1, `fd_lock` is order 3, `sfd_lock` is order 5a)
@@ -790,7 +793,12 @@ In `src/syscall/proc.c`:
 - `PTRACE_SEIZE` -- attach without stopping; sets `ptraced = 1`.
 - `PTRACE_CONT` -- resume the stopped tracee, optionally injecting a signal.
 - `PTRACE_INTERRUPT` -- force the tracee into ptrace-stop via
-  `hv_vcpus_exit()`.
+  `hv_vcpus_exit()`. A stop taken on a syscall return whose tail restores the
+  saved SVC frame goes through HVC #13, so ptrace snapshots the architectural
+  GPR set rather than shim scratch. The tails that rebuild EL0 state instead
+  (`X8 = 2`) already hold that set live, so the host stops on them directly;
+  an `execve` re-entry leaves the stop owed for the new image's first
+  syscall.
 - `PTRACE_GETREGSET` / `PTRACE_SETREGSET` (`NT_PRSTATUS`) -- read or write
   the tracee's register snapshot. Writes are applied on resume.
 
@@ -851,6 +859,172 @@ Key shape:
 Validation lives in `make test-fuse-alpine`, which exercises
 `/dev/fuse` plus `mount("fuse")` against the staged Alpine musl
 sysroot fixture.
+
+## USB Device Passthrough
+
+`src/syscall/usbdev.c` implements the usbdevfs character device
+(`/dev/bus/usb/BBB/DDD`) on top of IOKit's `IOUSBDeviceInterface650` and
+`IOUSBInterfaceInterface800` plugin interfaces, so Linux USB tools drive
+real devices attached to the Mac. macOS arbitrates that access per IOKit
+object and dynamically: `USBInterfaceOpen` refuses an interface exactly while
+some driver holds that interface open, and grants it while that driver is
+idle. An interface bound to an idle Apple class driver therefore does open --
+the ESP32-S3's CDC data interface opens whenever nothing holds
+`/dev/cu.usbmodem1101` and refuses while something does -- so the layer
+attempts the open and maps what IOKit answers rather than deciding from the
+presence of a bound driver.
+
+The fd model: opening a node constructs a typed `FD_USBDEV` fd. The open
+consults the model, not the hardware: `stat`, `access` and an `O_PATH` open
+of the same name are all answered from the model, so requiring a live IOKit
+service here would make a plain `O_RDONLY` the one entry point that reported
+`ENODEV` for a node the other three describe. The service is resolved on
+first use instead, and every operation that needs the wire reports `ENODEV`
+when it is not there.
+
+Per-fd state (the IOKit device handle, claimed interfaces, and the
+endpoint-to-pipe map) lives in a side table keyed by the guest fd and the fd
+generation, so a concurrently closed and reallocated guest fd cannot reach
+another open's state. A lookup pins its entry under `usbdev_table_lock` and
+then takes the per-entry lock with the table lock released: taking the two
+nested meant a thread blocked on one fd's transfer held the table lock on
+every other thread's behalf, and one transfer with usbdevfs's documented
+"unlimited" `timeout == 0` wedged every usbdevfs fd in the process,
+`close()` included. Teardown runs from the fd-cleanup hook, which is handed
+a bare fd number after the fd-table slot is already free, so a sibling
+thread's open can already hold the same number; among the entries that
+answer to it the closing one is the one with the smaller generation, since
+`fd_alloc` stamps a globally monotonic counter. `fd_alloc` also publishes the
+guest fd before the side table can bind it, so a close landing in that window
+would find no entry to tear down; the open rereads the fd's generation once its
+entry is findable and retires the entry itself if the close has already been
+and gone.
+
+That leaves two windows around the bind, and the entry keeps one identity
+across both. Before the bind its `guest_fd` is still -1, so a close finds
+nothing; after it, the entry is findable and therefore also freeable, so a
+close can reap it, the last unref can free the slot, and a sibling open can
+bind its own live fd there before the recheck runs. The generation is the one
+`fd_alloc_from` reports from inside the allocating `fd_lock` section, not a
+later read of the slot -- read back after the slot was publishable it is
+whatever the number carries by then, which in the first window is a reopening
+thread's stamp, and two entries then hold the same pair. And the retire path
+claims the whole tuple the caller allocated (used and alive, this fd number,
+this generation) rather than testing that the slot is not dead, which in the
+second window claims the sibling's entry instead. The tuple is sufficient
+because slot storage is static, so the read is always defined; all four fields
+are written and read under `usbdev_table_lock`, so they are read as one value;
+and `fd_next_generation` is globally monotonic, so each entry carries its own
+allocation's stamp and no two live entries can present the same pair.
+
+The entry's host fd is a pipe read end reserved for readiness signaling.
+`read()` serves the descriptors blob at a per-open file position,
+byte-identical to the sysfs `descriptors` attribute; `SEEK_END` is `EINVAL`,
+as on Linux usbfs; `fstat` reports a character device, major 189, answered from
+the entry's own identity ahead of the `/dev/bus` path stamp, the way a FUSE
+descriptor is answered by the layer that owns it. The whole
+write family -- `write`, `writev`, `pwrite`, `pwritev` -- is `EBADF` without
+`FMODE_WRITE` and `EINVAL` otherwise, the order `vfs_write` checks
+`FMODE_WRITE` and then `FMODE_CAN_WRITE`; none of them may fall through to
+the readiness pipe behind the fd. The two capability bits are derived once,
+the way `OPEN_FMODE` derives them -- `(flags + 1) & O_ACCMODE`, not a
+comparison against `O_RDONLY` -- and the four gates that need them (read,
+pread, the write family, and the ioctl surface) read that. Access mode 3 is
+the case the comparison gets wrong: `open(2)` takes it and `ACC_MODE(3)` asks
+this 0666 node for read plus write, which it grants, so Linux hands back a
+descriptor carrying neither `FMODE_READ` nor `FMODE_WRITE` and refuses
+everything on it. `dup` of the fd is refused with `EBADF`
+(the side table is keyed by the guest fd and IOKit plugin handles are
+process-local).
+
+The ioctl surface at this layer: `CLAIMINTERFACE` / `RELEASEINTERFACE`,
+`SETINTERFACE`, `SETCONFIGURATION`, `CLEAR_HALT` / `RESETEP`, `GETDRIVER`,
+`GET_CAPABILITIES`, `GET_SPEED`, `CONNECTINFO`, `DISCONNECT_CLAIM`,
+`USBDEVFS_IOCTL` `DISCONNECT` / `CONNECT`, and the synchronous `CONTROL`
+and `BULK` transfers, which bounce guest data through host buffers around
+`DeviceRequestTO` and `ReadPipeTO` / `WritePipeTO`. The transfers here are
+synchronous: the guest thread blocks in the ioctl for the duration of the
+request.
+
+errno fidelity is the design rule, because libusb and friends branch on
+exact values, and so is the *order* the answers are decided in, which is just
+as observable: `check_ctrlrecip` runs before the `wLength` cap and
+`findintfep` before the transfer-length checks, so a request naming an
+endpoint or interface the device does not have is `ENOENT` however long it
+is. The reserved-bit test on an endpoint address lives in the one lookup
+`BULK`, `CLEAR_HALT`, `RESETEP` and the control endpoint recipient all go
+through, so the four cannot disagree about it. The interface-number bound is
+64, `8 * sizeof(unsigned long)` as in `claimintf`; between 64 and 32 an
+interface is merely absent, which is a question about the device.
+
+Every argument that comes off the wire is bounded where it enters, not only
+where it is used. `bInterfaceNumber` is a device-supplied byte with the whole
+0..255 range behind it, and the endpoint-owner lookup reports it back as the
+`EINVAL` `checkintf` reports rather than handing a 64-entry array an index of
+200. An endpoint address arrives as a 32-bit word and is tested as one, since
+narrowing it to a byte first resolves the transfer to an endpoint the caller
+did not name; the control path is the exception Linux itself makes, masking
+`wIndex` to its low byte before the lookup. An altsetting above 255 matches no
+`bAlternateSetting` and is `EINVAL`, after the implicit claim, the order
+`proc_setintf` decides them in.
+
+The other half of errno fidelity is that a failure keeps the errno of whatever
+failed. `ENODEV` from the model, meaning nothing answers to this address,
+becomes the `ENOENT` open(2) owes for a name with nothing behind it; every
+other failure on the open path -- an allocation, a scratch-tree `mkdir`, a
+pipe the host would not give -- reports itself, so a host out of memory is not
+described to the guest as a missing node.
+
+Every ioctl needs `FMODE_WRITE` and is `EPERM` without it (Linux's gate in
+`devio.c`). `FIONBIO` and `FIOASYNC` are the exception, because they are not
+part of this file's ioctl set at all: `do_vfs_ioctl` answers both for every
+file before it reaches `f_op->unlocked_ioctl`, so they never meet that gate.
+They are answered where `FIOCLEX` and `FIONCLEX` already are. `FIONBIO` edits
+only the guest flag word, the way `F_SETFL` does -- the readiness pipe behind
+the fd stays nonblocking whatever the guest asks -- and always reports 0.
+`FIOASYNC` reports 0 when the requested `FASYNC` state already holds and
+`ENOTTY` when it would change, because `usbdev_file_operations` declares no
+`.fasync`.
+
+Transfer memory is one allowance for everything in flight, not a per-call
+size cap: Linux charges `len + sizeof(struct urb)` against a module-global
+`usbfs_memory_mb` (16 MB) and refunds it when the transfer settles, so a
+request of exactly the allowance never fits and concurrent transfers across
+different fds contend for the same total. An atomic counter carries it here,
+charged where Linux charges it and refunded on every exit including the error
+arms. A claim that IOKit answers `kIOReturnExclusiveAccess` is `EBUSY`,
+what Linux reports for an interface held by a kernel driver. `GETDRIVER`
+names the bound Apple driver, or `usbfs` for an interface any usbfs fd on
+this device holds, or reports `ENODATA`; a user-client child is not a driver,
+so another usbfs consumer's `USBInterfaceOpen` is not reported as one.
+Transfer errors map per `devio.c`: a stall is `EPIPE`, a timeout
+`ETIMEDOUT`, a vanished device `ENODEV`. `kIOReturnAborted` maps to `EINTR`
+with `syscall_restart_forbid()`, because the transfer was already on the wire
+and a dispatcher restart would send it twice.
+
+Known gaps at this stage, each printed as an XFAIL by
+`tests/test-usbdev-ioctl.c` rather than only written down here:
+
+- `GET_CAPABILITIES` reports 0. Every capability bit names part of the
+  SUBMITURB/REAPURB machinery, which answers `ENOTTY` here.
+- No disconnect gate. Linux answers `ENODEV` for every ioctl once the device
+  is gone; the answers served from the open-time model (`GET_SPEED`,
+  `CONNECTINFO`, `GET_CAPABILITIES`, `read()`) still report it. Noticing the
+  disconnect needs an IOKit termination notification on a run loop, which is
+  the async stage's machinery.
+- Two ioctls on one fd serialize, because the entry lock is held across the
+  blocking transfer. Linux drops the device lock around the URB wait.
+- `GETDRIVER` reports the IOKit class name (`AppleUSBACMControl`) where Linux
+  reports the driver's name (`cdc_acm`), and `DISCONNECT_CLAIM`'s name filters
+  compare against it.
+- `RESET` clears the claimed pipes' stalls and reports success instead of
+  re-enumerating the port, which would destroy the handles.
+- A short bulk OUT is `EIO`: `WritePipeTO` reports no length, and reporting
+  the requested count would spell a partial write as a complete one.
+- The side table holds 32 open fds per process and reports `ENOMEM` past
+  that; Linux allocates a `usb_dev_state` per open and has no such limit.
+- `USBDEVFS_IOCTL DISCONNECT` of an interface another usbfs fd holds is
+  `EBUSY`; Linux releases that claim and answers 0.
 
 ## procfs And Device Emulation
 
@@ -980,9 +1154,8 @@ falls back to a usbfs directory scan.
 The `/dev/bus/usb/BBB/DDD` nodes are 0444 placeholder files on disk (the
 `/dev/pts` placeholder pattern); the stat intercept reports them as
 character devices, major 189, minor `(bus - 1) * 128 + (dev - 1)`, and the
-open intercept diverts an open away from the placeholder. Opening a node
-serves the shared descriptors blob read-only; a writable open reports
-`EACCES`.
+open intercept diverts an open away from the placeholder into the usbdevfs
+fd constructor (see [USB Device Passthrough](#usb-device-passthrough)).
 
 One layout deviation is deliberate: the `/sys/bus/usb/devices` entries are
 real directories, not symlinks into `/sys/devices/...`, so `realpath()` of
@@ -1036,6 +1209,136 @@ that string on Linux and shows nothing here.
 
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 `src/syscall/fs.c`, `src/syscall/proc-state.c`, `src/runtime/usb-sysfs.c`.
+
+### Ownership Of `/sys` And `/dev/bus` Names
+
+The layer synthesizes exactly one subtree on each side, `/sys/bus/usb` and
+`/dev/bus/usb`, on top of a `/sys` and a `/dev/bus` that a sysroot supplies.
+Which of the two answers a name is one decision, taken once in
+`classify_and_normalize`, and every entry point -- `open`, `stat`, `lstat`,
+`readlink`, `access`, `getdents64`, `statfs`, `chdir` -- answers from it.
+An entry point that re-derives the decision is how four regressions arrived,
+each one a shadow: the layer claiming a name it does not serve and reporting
+`ENOENT` for a file the sysroot really has.
+
+The classes and who answers them:
+
+| Class | Path | Answered by |
+|-------|------|-------------|
+| `USB_PATH_SYS` | `/sys[/suffix]` | the layer, if the folded suffix resolves in the scratch tree; otherwise the backing, unless the suffix is under `bus/usb`, where an absence is authoritative |
+| `USB_PATH_DEV_BUS` | `/dev/bus` | both: a union listing, synthetic `usb` plus the backing's names |
+| `USB_PATH_DEV_USB` | `/dev/bus/usb` | the layer |
+| `USB_PATH_DEV_BUSNUM` | `/dev/bus/usb/BBB` | the layer |
+| `USB_PATH_DEV_NODE` | `/dev/bus/usb/BBB/DDD` | the layer |
+| `USB_PATH_DEV_NODE_SUB` | a node used as a directory | the layer (`ENOTDIR` once the node exists) |
+| `USB_PATH_DEV_ABSENT` | under `/dev/bus/usb`, no such device | the layer, `ENOENT` |
+| `USB_PATH_DEV_FOREIGN` | under `/dev/bus`, a bus we do not model | the backing |
+| `USB_PATH_NONE` | anything else, and a name that folds above its root | the backing |
+
+Only `PROC_NOT_INTERCEPTED` means "ask the backing". A name the layer claims
+and then fails to serve is an answer, not a fall-through: taking the failure
+for one let `access(2)`, and then `statfs(2)`, answer from the backing while
+`open` and `stat` reported `ENOENT` for the same path.
+
+`.` and `..` are folded lexically before ownership is decided, on both halves.
+The fold is the ours/not-ours gate and nothing else -- the served path is built
+by `usb_sys_resolve_suffix`, which resolves symlinks and applies each `..` to
+what the previous component resolved to, the way the kernel does, so
+`<dev>/subsystem/..` names `/sys/bus`. Deciding ownership on the guest's
+spelling instead splits the two halves apart in both directions:
+`/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
+and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
+A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
+
+### Filesystem Identity Of A Descriptor
+
+Two questions have one answer here: what `statfs` reports for a name, and what
+`fstatfs` reports for a descriptor opened by that name. systemd's `sd-device`
+gates every enumerated syspath on `fstatfs(fd) == SYSFS_MAGIC` and libusb gates
+on `statfs("/sys")`, so a build where the two disagree is one where a device
+enumerates through one library and not the other.
+
+The rules:
+
+- `/sys`, whichever side served it, reports `SYSFS_MAGIC` (`0x62656572`). That
+  covers the scratch-dir backed names, where the host `fstatfs` would leak the
+  `/tmp` filesystem's magic, and the ones that fell through to a sysroot's own
+  `/sys`, where it would leak the sysroot's.
+- `/dev/bus` reports devtmpfs, on both entry points.
+- `..` is folded and a relative name is resolved against the cwd before either
+  entry point decides, so the two cannot be handed different spellings of one
+  object.
+
+A descriptor's identity comes from the virtual path stamped on its slot when
+this layer served the open, and from the descriptor's own host path mapped back
+through the sysroot when there is no stamp -- a fall-through open stamps
+nothing, which is exactly the case that used to make `statfs("/sys/class")`
+report `SYSFS_MAGIC` while `fstatfs` on the fd it had just opened reported the
+sysroot's filesystem.
+
+`fstat` answers from the stamp for `O_PATH` descriptors and for `/sys` and
+`/dev/bus` names, because the object behind a `/dev/bus/usb/BBB/DDD` node is a
+placeholder file: libusb `fstat`s the node it just opened and refuses anything
+that is not a character device, so the descriptor has to report the character
+device the path side described. `/proc` stays `O_PATH`-only there: its
+descriptors are real host files whose contents are the answer, and stamping
+their type would misdescribe the object the guest is reading.
+
+The stamp and the descriptor are read in one `fd_lock` window
+(`host_fd_ref_open_entry`). They are two facts about one open file description,
+and read separately a close and reopen between them gives the stamp of one and
+the descriptor of another.
+
+### Union Directory Listings
+
+A directory that exists on both sides -- `/sys`, `/dev/bus` -- lists the union.
+`sys_getdents64` walks the synthetic (primary) stream first and then the names
+drained out of the backing; the drain opens the backing directory and closes it
+before returning, so elfuse keeps its promise of one host descriptor per guest
+fd and a union directory costs no more than a plain one.
+
+What the guest is told when part of the listing cannot be delivered is the
+contract that matters, because the failure mode is silent: a listing that lost
+a name and still ends at `0` is an end-of-directory the guest cannot tell from
+a real one, and having read it, it never asks again.
+
+- A failure that costs the stream names it can never produce again -- a drain
+  that failed part-way, a primary `readdir` that stopped -- is recorded in
+  `listing_errno`. It is sticky: every later call on that fd fails the same
+  way. Linux has no case that re-delivers an error on a directory stream, so
+  there is no shape to copy; clearing it would put the next call back on the
+  silent path, and the stream has nothing truthful left to return.
+- Linux's two-part shape is followed for reporting one: a call that has already
+  written entries returns their count and leaves the error for the next call; a
+  call that has written nothing returns `-1` with the errno.
+- A buffer too small to hold one entry is `EINVAL`, not `0`. Measured on Linux
+  over a directory holding a twelve-byte name: `getdents64` with 8- and
+  16-byte buffers returns `EINVAL` immediately, and with 24 bytes it delivers
+  the names that fit and then reports.
+- No exit from the walk may consume an entry without putting it back. The
+  entry-does-not-fit path and the guest-write fault path both rewind the
+  primary with `seekdir`; the backing side rewinds by not advancing its cursor.
+- A host name too long for Linux `NAME_MAX` is skipped, and the rest of the
+  stream is delivered. This is an elfuse compatibility policy with no Linux
+  counterpart: Linux enforces `NAME_MAX` at the filesystem layer, so no
+  oversize entry ever reaches `getdents64` there. macOS APFS accepts them, and
+  aborting the stream truncated `ls` / `find` listings against APFS trees.
+
+`dir_stream_t` is the wrapper around the `DIR*`. It is refcounted and carries
+its own lock, so an in-flight `getdents64` pins it against a sibling's
+`close()`; `dup`, `dup2` and `F_DUPFD` share one wrapper rather than opening a
+second, which is what makes two guest fds on one open file description share
+one position and one union state. A forked child's inherited fds share one
+wrapper per inherited open file description for the same reason. The wrapper
+owns the descriptor it was opened on -- only `closedir()` gives it back -- so
+an alias names the descriptor the shared wrapper holds and the redundant one is
+closed.
+
+A stream built for an inherited descriptor has `backing_private` set: the
+primary is shared with the parent through the description and must be read, and
+the backing belongs to whichever stream first ran out of primary and must not
+be drained twice. `docs/testing.md` records the one state this cannot deliver
+whole.
 
 ### Limits Of The IOKit Mapping
 

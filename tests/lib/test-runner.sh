@@ -158,6 +158,7 @@ run()
     local start_us end_us elapsed_us limit_us
     hang_sample_arm "$tool" "$TEST_TIMEOUT" \
         "${BUILD_DIR:-build}/test-timeouts/$(basename "$tool")-hang.txt"
+    test_host_busy_mark
     start_us=$(epoch_us)
     if output=$(timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} \
         "$(test_tool_path "$tool")" "$@" 2>&1); then
@@ -183,7 +184,7 @@ run()
     # every attempt, so a second one still fails. The retry samples to its own
     # file so the first attempt's stack, taken in the state that produced the
     # timeout, survives.
-    if [ "$harness_timed_out" -eq 1 ] && test_host_is_busy; then
+    if [ "$harness_timed_out" -eq 1 ] && test_host_busy_since_mark; then
 
         # Informational, not a verdict: the test has not been decided yet, so
         # this must not advance the skip counter the summary reports.
@@ -263,7 +264,7 @@ run_check()
         test_report fail "$tool" " (exit rc=$rc)"
         test_excerpt "$output"
         fail=$((fail + 1))
-    elif printf "%s\n" "$output" | grep -qE "$pattern"; then
+    elif grep -qE "$pattern" <<< "$output"; then
         test_report ok "$tool"
         pass=$((pass + 1))
     else
@@ -323,7 +324,7 @@ run_pipe()
         test_report fail "$tool" " (exit rc=$rc)"
         test_excerpt "$output"
         fail=$((fail + 1))
-    elif printf "%s\n" "$output" | grep -qE "$pattern"; then
+    elif grep -qE "$pattern" <<< "$output"; then
         test_report ok "$tool"
         pass=$((pass + 1))
     else

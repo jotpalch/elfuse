@@ -24,11 +24,11 @@
  * canonicalizes to itself, which libusb (opens attrs relative to the entry) and
  * nusb (canonicalize() of the entry path) both tolerate.
  *
- * Stage-1 open contract for /dev/bus/usb/BBB/DDD: O_RDONLY returns a synthetic
- * host fd holding the descriptors blob (matching the usbfs read() view,
- * devio.c:311-390); O_RDWR/O_WRONLY fails with EACCES. TEMPORARY: stage 2
- * replaces this constructor with a typed FD_USBDEV fd whose read() serves the
- * same blob via usb_sysfs_descriptors_dup and whose ioctl set talks to IOKit.
+ * /dev/bus/usb/BBB/DDD opens: since stage 2, every non-O_PATH open is served by
+ * the typed FD_USBDEV constructor (syscall/usbdev.c) before this intercept
+ * runs; the node branch here only backs O_PATH opens with a synthetic blob fd
+ * (the FD_PATH + stat-stamp path). The blob it serves and the FD_USBDEV read()
+ * view are the same bytes (usb_sysfs_descriptors_dup).
  */
 
 #include <ctype.h>
@@ -297,6 +297,16 @@ typedef struct {
     unsigned vid;
     unsigned pid;
     unsigned nifaces;
+
+    /* bInterfaceNumber of the first interface; each further one counts up from
+     * it. Normally 0, so the numbers are 0, 1, ... and match the array
+     * positions. The knob exists because bInterfaceNumber is a device-supplied
+     * byte with the whole 0..255 range behind it while the consumers of it are
+     * sized for far fewer, and no device anyone can plug in declares a large
+     * one, so without a fixture that can emit one there is no way to assert
+     * what happens when a device does.
+     */
+    unsigned ifnum_base;
 } usb_fixture_spec_t;
 
 /* The number of interface descriptors is the only thing that varies the blob
@@ -306,7 +316,7 @@ typedef struct {
 static size_t usb_fixture_blob_len(unsigned nifaces)
 {
     return USB_DEVICE_DESC_LEN + USB_CONFIG_DESC_LEN +
-           (size_t) nifaces * USB_INTERFACE_DESC_LEN;
+           (size_t) nifaces * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
 }
 
 /* Fill @d from @s, writing the device, configuration and interface descriptors
@@ -337,7 +347,8 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     snprintf(d->name, sizeof(d->name), "%d-%d", s->busnum, s->port);
 
     size_t cfg_total =
-        USB_CONFIG_DESC_LEN + (size_t) s->nifaces * USB_INTERFACE_DESC_LEN;
+        USB_CONFIG_DESC_LEN +
+        (size_t) s->nifaces * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
     build_device_descriptor(d, blob);
     uint8_t *c = blob + USB_DEVICE_DESC_LEN;
     c[0] = USB_CONFIG_DESC_LEN;
@@ -351,16 +362,34 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     c[8] = 50;                   /* bMaxPower: 100 mA */
     for (unsigned i = 0; i < s->nifaces; i++) {
         uint8_t *q =
-            c + USB_CONFIG_DESC_LEN + (size_t) i * USB_INTERFACE_DESC_LEN;
+            c + USB_CONFIG_DESC_LEN +
+            (size_t) i * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
         q[0] = USB_INTERFACE_DESC_LEN;
         q[1] = USB_DT_INTERFACE;
-        q[2] = (uint8_t) i; /* bInterfaceNumber */
-        q[3] = 0;           /* bAlternateSetting */
-        q[4] = 1;           /* bNumEndpoints */
-        q[5] = 0xff;        /* bInterfaceClass: vendor-specific */
+        unsigned ifnum = s->ifnum_base + i;
+        q[2] = (uint8_t) ifnum; /* bInterfaceNumber */
+        q[3] = 0;               /* bAlternateSetting */
+        q[4] = 1;               /* bNumEndpoints */
+        q[5] = 0xff;            /* bInterfaceClass: vendor-specific */
         q[6] = 0x00;
         q[7] = 0x00;
         q[8] = 0;
+
+        /* The endpoint the interface descriptor above says it has. Without it
+         * the blob was self-contradictory, and every endpoint-addressed
+         * usbdevfs path (BULK, CLEAR_HALT, RESETEP, the control endpoint
+         * recipient) had nothing to resolve against, so the fixture could not
+         * reach the code that decides between "no such endpoint" and "bad
+         * argument". Bulk IN, one per interface: 0x81, 0x82, ...
+         */
+        uint8_t *e = q + USB_INTERFACE_DESC_LEN;
+        e[0] = USB_ENDPOINT_DESC_LEN;
+        e[1] = USB_DT_ENDPOINT;
+        e[2] = (uint8_t) (0x81 + i); /* bEndpointAddress: bulk IN */
+        e[3] = 0x02;                 /* bmAttributes: bulk */
+        e[4] = 0x40;                 /* wMaxPacketSize: 64 */
+        e[5] = 0x00;
+        e[6] = 0; /* bInterval */
     }
 }
 
@@ -378,6 +407,14 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
  * regression fixture for the devnum cap -- without the cap bus1's 129th device
  * takes devnum 129 and shares minor 128 with bus2's first, so the cap must drop
  * everything past devnum 127.
+ *
+ * ELFUSE_USB_FIXTURE=badifnum: the default set plus /dev/bus/usb/001/002, whose
+ * one interface declares bInterfaceNumber 200 and carries endpoint 0x81. It is
+ * a malformed descriptor only in the sense that no sane device emits one: every
+ * byte is well formed and the range is the field's own, which is why nothing
+ * short of a fixture reaches the paths that index by that number. Added as a
+ * separate mode rather than to the default set so the lanes that walk the tree
+ * keep the device list they were written against.
  */
 static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
 {
@@ -385,15 +422,18 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
     int n = 0;
     if (mode && !strcmp(mode, "overflow")) {
         for (int port = 1; port <= 129 && n < cap; port++)
-            specs[n++] = (usb_fixture_spec_t) {1, port, 0, 0x1d6b, 0x0002, 1};
+            specs[n++] =
+                (usb_fixture_spec_t) {1, port, 0, 0x1d6b, 0x0002, 1, 0};
         if (n < cap)
-            specs[n++] = (usb_fixture_spec_t) {2, 1, 0, 0x2109, 0x0100, 1};
+            specs[n++] = (usb_fixture_spec_t) {2, 1, 0, 0x2109, 0x0100, 1, 0};
         return n;
     }
     if (n < cap)
-        specs[n++] = (usb_fixture_spec_t) {1, 1, 1, 0x1d6b, 0x0002, 2};
+        specs[n++] = (usb_fixture_spec_t) {1, 1, 1, 0x1d6b, 0x0002, 2, 0};
     if (n < cap)
-        specs[n++] = (usb_fixture_spec_t) {2, 1, 1, 0x2109, 0x0100, 1};
+        specs[n++] = (usb_fixture_spec_t) {2, 1, 1, 0x2109, 0x0100, 1, 0};
+    if (mode && !strcmp(mode, "badifnum") && n < cap)
+        specs[n++] = (usb_fixture_spec_t) {1, 2, 2, 0x1d6b, 0x0002, 1, 200};
     return n;
 }
 
@@ -1048,7 +1088,8 @@ typedef enum {
     USB_PATH_DEV_BUSNUM,   /* /dev/bus/usb/BBB    */
     USB_PATH_DEV_NODE,     /* /dev/bus/usb/BBB/DDD */
     USB_PATH_DEV_NODE_SUB, /* the node used as a directory: BBB/DDD/ or /x */
-    USB_PATH_DEV_ABSENT,   /* under /dev/bus but nothing we model */
+    USB_PATH_DEV_ABSENT,   /* under /dev/bus/usb but no such device */
+    USB_PATH_DEV_FOREIGN,  /* under /dev/bus but on no bus we model */
     USB_PATH_SYS,          /* /sys[/suffix] (whole sysfs view) */
 } usb_path_kind_t;
 
@@ -1094,7 +1135,7 @@ static usb_path_kind_t classify_path(const char *path,
     if (!*p)
         return USB_PATH_DEV_BUS;
     if (strncmp(p, "usb", 3) != 0 || (p[3] != '\0' && p[3] != '/'))
-        return USB_PATH_DEV_ABSENT;
+        return USB_PATH_DEV_FOREIGN;
     p = skip_slashes(p + 3);
     if (!*p)
         return USB_PATH_DEV_USB;
@@ -1286,6 +1327,7 @@ static void usb_canon_path(usb_path_kind_t kind,
         snprintf(out, outsz, "/dev/bus/usb/%03d/%03d", bus, dev);
         break;
     case USB_PATH_DEV_ABSENT:
+    case USB_PATH_DEV_FOREIGN:
     case USB_PATH_NONE:
         str_copy_trunc(out, "/dev/bus", outsz);
         break;
@@ -1325,10 +1367,15 @@ static void fill_synth_chardev(struct stat *st,
 {
     memset(st, 0, sizeof(*st));
 
-    /* 0664 rather than udev's root:root 0660 policy: the single-user guest must
-     * be able to open its own device nodes.
+    /* 0666 rather than udev's root:root 0660 policy: the single-user guest must
+     * be able to open its own device nodes, which is what a desktop Linux
+     * spells as a uaccess ACL for the seat owner. The owner reported below is
+     * the host user, and the guest's own uid need not equal it, so 0664 left
+     * access(W_OK) answering EACCES for a node that open(O_RDWR) then served --
+     * the two entry points onto one permission question disagreeing. Stage 1
+     * had no writable open to disagree with; stage 2 does.
      */
-    st->st_mode = S_IFCHR | 0664;
+    st->st_mode = S_IFCHR | 0666;
     st->st_nlink = 1;
     st->st_dev = USB_SYNTH_DEV;
     st->st_ino = usb_synth_ino(canon);
@@ -1378,13 +1425,24 @@ static int usb_blob_fd(const usb_dev_t *d)
 
 /* intercept entry points */
 
-/* Shared entry-point preamble: classify, and for the /sys view apply the
- * ours/not-ours fold before any lock is taken.
+/* Shared entry-point preamble: fold the name, then decide whose it is, before
+ * any lock is taken. Both halves fold; see the /dev/bus arm below and
+ * usb_suffix_normalize for what the fold is and is not.
  *
- * *sfx_out receives the suffix as the guest spelled it -- unfolded, because
- * usb_sys_resolve_suffix has to see the '..' in their original positions to
- * order them against the symlinks they follow. `norm` holds the folded
- * spelling, which is used only to decide whether the name is ours at all.
+ * *sfx_out receives the /sys suffix as the guest spelled it -- unfolded,
+ * because usb_sys_resolve_suffix has to see the '..' in their original
+ * positions to order them against the symlinks they follow. `norm` holds the
+ * folded spelling, which decides only whether the name is ours.
+ *
+ * Every name whose spelling alone settles ownership is settled here, so that no
+ * entry point re-derives it: a /sys name that folds above /sys, a /dev/bus name
+ * that folds above /dev/bus, and a /dev/bus name on a bus we do not model all
+ * leave as USB_PATH_NONE, and every caller reports PROC_NOT_INTERCEPTED. See
+ * docs/internals.md, "Ownership Of `/sys` And `/dev/bus` Names", for why a name
+ * we do not serve must fall through rather than answer ENOENT.
+ *
+ * The one ours/not-ours question this cannot answer is the /sys name that has
+ * to be resolved first; usb_resolve_or_disown owns that half.
  *
  * Returns the kind, or USB_PATH_NONE when the folded path is not ours; *err_out
  * non-zero means classify itself failed (ENAMETOOLONG) and the caller must
@@ -1399,7 +1457,53 @@ static usb_path_kind_t classify_and_normalize(const char *path,
                                               int *err_out)
 {
     *err_out = 0;
+
+    /* Fold the /dev/bus suffix before classify_path reads it, so both halves of
+     * the layer reach ownership the same way. The /sys half has always folded
+     * first and decided after; the /dev half used to classify the guest's
+     * spelling as written, and a '..' crossing the boundary then went wrong in
+     * both directions. /dev/bus/usb/../other/f reached parse_ddd's failure arm
+     * and came back USB_PATH_DEV_ABSENT, so the layer claimed the name and
+     * answered ENOENT for a file the sysroot really has;
+     * /dev/bus/other/../usb/001/002 classified as USB_PATH_DEV_FOREIGN, fell
+     * through, and missed the synthetic node because no sysroot carries a
+     * /dev/bus/usb. Both spellings are matrix columns now (dev-fold-out and
+     * dev-fold-in).
+     *
+     * The fold is lexical, and that is the right walk here: every component of
+     * /dev/bus this layer serves is a plain directory it materialized itself,
+     * so there is no symlink for a kernel-order walk to resolve differently.
+     * The result is written into `norm`, which the /sys arm below would use for
+     * its own folded suffix -- the two never both run -- and classify_path's
+     * sys_suffix_out is only set on the /sys arm, so it keeps pointing into
+     * live storage either way.
+     *
+     * A suffix that folds away above /dev/bus leaves as USB_PATH_NONE, the same
+     * answer the /sys arm gives a name that climbs above /sys: the layer serves
+     * nothing there and the caller reports PROC_NOT_INTERCEPTED.
+     */
+    if (path_prefix_match(path, "/dev/bus", 8)) {
+        char folded[LINUX_PATH_MAX];
+        int frc = usb_suffix_normalize(skip_slashes(path + 8), folded,
+                                       sizeof(folded));
+        if (frc < 0) {
+            *err_out = ENAMETOOLONG;
+            return USB_PATH_NONE;
+        }
+        if (frc == 0)
+            return USB_PATH_NONE; /* climbed above /dev/bus; not ours */
+        int n = folded[0] ? snprintf(norm, normsz, "/dev/bus/%s", folded)
+                          : snprintf(norm, normsz, "/dev/bus");
+        if (n < 0 || (size_t) n >= normsz) {
+            *err_out = ENAMETOOLONG;
+            return USB_PATH_NONE;
+        }
+        path = norm;
+    }
+
     usb_path_kind_t kind = classify_path(path, bus_out, dev_out, sfx_out);
+    if (kind == USB_PATH_DEV_FOREIGN)
+        return USB_PATH_NONE; /* another bus's /dev/bus subtree; not ours */
     if (kind != USB_PATH_SYS)
         return kind;
     int rc = usb_suffix_normalize(*sfx_out, norm, normsz);
@@ -1415,30 +1519,20 @@ static usb_path_kind_t classify_and_normalize(const char *path,
 /* Resolve a host path inside the sysfs scratch tree and prove the result is
  * still inside it, so the caller can open it with symlinks followed.
  *
- * Why following is safe here, and why O_NOFOLLOW was the wrong belt: the links
- * this tree carries are ours, written by emit_* with fixed relative targets,
- * and the tree is read-only to the guest (every mutating open under /sys is
- * refused before this point, and no mkdir/symlink/rename intercept reaches it),
- * so the procemu.c rationale "do not follow symlinks the guest created inside
- * the scratch dir" has nothing to bite on. What replaces it is a positive check
- * rather than a blanket refusal.
+ * Following is safe because the links are ours -- emit_* writes them with fixed
+ * relative targets into a tree the guest cannot write -- so procemu.c's "do not
+ * follow symlinks the guest created" has nothing to bite on, and a positive
+ * containment check replaces the blanket refusal.
  *
- * The escape guarantee, unchanged: the suffix reaching us has already had '.'
- * and '..' folded lexically by usb_suffix_normalize, so host_path is
- * usb_sys_dir followed by plain components and cannot climb out on its own; a
- * symlink is therefore the only way out, and realpath() resolves every one of
- * them -- in the leaf and in each intermediate component alike -- before we
- * test the fully canonical result against the canonical root. A path that
- * resolved outside is reported as absent instead of opened. The open then still
- * passes O_NOFOLLOW: the resolved leaf is by construction not a symlink, so the
- * flag changes nothing on the intended path and closes the swap window on the
- * final component only -- open(2) re-walks by the resolved path string, not
- * against a root fd retained from realpath(), so a symlink spun into an
- * intermediate directory between the resolve and the open would still be
- * followed. That residual TOCTOU is not reachable here: a sysrooted guest
- * cannot name the host scratch tree to plant such a link, and a sysroot-less
- * guest already has the host filesystem. Closing it for real would mean an
- * fd-relative reopen the read-only tree does not justify.
+ * The escape guarantee: the suffix arrives lexically folded, so host_path
+ * cannot climb out on its own and a symlink is the only way out; realpath()
+ * resolves every one of them, leaf and intermediate alike, and the canonical
+ * result is tested against the canonical root. A path that resolved outside is
+ * reported absent. The open still passes O_NOFOLLOW, which closes the swap
+ * window on the final component; a symlink spun into an intermediate directory
+ * between the resolve and the open would still be followed, and that residual
+ * TOCTOU is unreachable -- a sysrooted guest cannot name the host scratch tree
+ * to plant one, and a sysroot-less guest already has the host filesystem.
  *
  * Returns 0 with `out` filled, or -1 with errno set (realpath's errno, or
  * ENOENT for a path that resolved outside the tree).
@@ -1478,17 +1572,14 @@ static int usb_sys_resolve(const char *host_path, char *out, size_t outsz)
  *
  * realpath() performs the whole walk -- symlinks in the leaf and in every
  * intermediate component, and '..' in kernel order -- and its canonical result
- * is then tested against the canonical root. That containment test is the sole
- * escape authority: nothing above it is trusted to have kept the path inside,
- * which is why the raw, unfolded suffix can be handed to it safely.
+ * is tested against the canonical root. That containment test is the sole
+ * escape authority, which is why the raw, unfolded suffix is safe to hand it.
  *
  * `nofollow` keeps the semantics O_NOFOLLOW and lstat need: everything up to
- * the final component is resolved and contained as above, and the leaf is then
- * appended without being followed, so a symlink leaf stays a symlink -- and
- * contained again afterwards, because the append is the one step that happens
- * after a containment test. A '.' or '..' leaf is not held back at all: it
- * cannot be a symlink, so nothing is protected by withholding it, and it is the
- * one leaf whose reattachment can move the name (see below).
+ * the final component is resolved and contained, and the leaf is appended
+ * without being followed and contained again afterwards. A '.' or '..' leaf is
+ * not held back -- it cannot be a symlink, and it is the one leaf whose
+ * reattachment can move the name (see below).
  *
  * *canon_out receives the resolved location as a /sys-relative suffix, so the
  * synthetic identity is keyed on the object rather than on the spelling.
@@ -1576,6 +1667,24 @@ static int usb_sys_resolve_suffix(const char *raw_sfx,
             errno = ENOENT;
             return -1;
         }
+
+        /* Probe the leaf that was reattached without being walked. Without this
+         * the nofollow resolve succeeds for every name whose *parent* exists --
+         * the scratch /sys root exists, so "/sys/class" resolved -- and the
+         * caller's ours/not-ours escape hatch, which only the failure path
+         * consults, was never reached. The lstat that followed then failed
+         * ENOENT and that became the answer, shadowing a populated sysroot for
+         * lstat, open(O_NOFOLLOW) and readlink while stat and plain open (which
+         * resolve the leaf too, and so fail here) fell through correctly.
+         *
+         * lstat, not stat: a symlink leaf is the object the caller named.
+         */
+        struct stat leaf_st;
+        if (lstat(resolved, &leaf_st) < 0) {
+            if (!errno)
+                errno = ENOENT;
+            return -1;
+        }
     }
 
     if (str_copy_trunc(host_out, resolved, host_sz) >= host_sz) {
@@ -1594,6 +1703,38 @@ static int usb_sys_resolve_suffix(const char *raw_sfx,
         return -1;
     }
     return 0;
+}
+
+/* Resolve a /sys name and settle, in one place, whether this layer answers for
+ * it at all -- the resolve half of the fall-through decision classify_and_
+ * normalize makes for every other name. Every /sys entry point goes through
+ * here so none of them can disagree about which names are ours.
+ *
+ * Returns true with @host_out and @canon_out filled.
+ *
+ * Returns false with *err_out set to 0 when the name is not ours (the caller
+ * reports PROC_NOT_INTERCEPTED so the sysroot backing answers), or to an errno
+ * when the name is ours and the resolve genuinely failed. An absence under
+ * /sys/bus/usb is authoritative -- that subtree is the one thing this layer
+ * synthesizes -- so it comes back as ENOENT rather than as a fall-through.
+ */
+static bool usb_resolve_or_disown(const char *raw_sfx,
+                                  const char *norm,
+                                  bool nofollow,
+                                  char *host_out,
+                                  size_t host_sz,
+                                  char *canon_out,
+                                  size_t canon_sz,
+                                  int *err_out)
+{
+    if (usb_sys_resolve_suffix(raw_sfx, nofollow, host_out, host_sz, canon_out,
+                               canon_sz) == 0) {
+        *err_out = 0;
+        return true;
+    }
+    int reserr = errno;
+    *err_out = (reserr == ENOENT && !usb_sys_suffix_owned(norm)) ? 0 : reserr;
+    return false;
 }
 
 int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz)
@@ -1616,6 +1757,19 @@ int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz)
     return rc;
 }
 
+/* What an intercept entry point returns for a path the USB tree does not own:
+ * PROC_NOT_INTERCEPTED normally, or -1 with errno set when the path was ours in
+ * shape but malformed. Stated once so the three entry points cannot drift.
+ */
+static int usb_not_intercepted(int cerr)
+{
+    if (cerr) {
+        errno = cerr;
+        return -1;
+    }
+    return PROC_NOT_INTERCEPTED;
+}
+
 int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
 {
     int bus = 0, dev = 0, cerr = 0;
@@ -1623,13 +1777,8 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind == USB_PATH_NONE) {
-        if (cerr) {
-            errno = cerr;
-            return -1;
-        }
-        return PROC_NOT_INTERCEPTED;
-    }
+    if (kind == USB_PATH_NONE)
+        return usb_not_intercepted(cerr);
 
     pthread_mutex_lock(&usb_lock);
     int rc = -1;
@@ -1650,16 +1799,14 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
         /* Resolve in kernel order first: '..' after a symlink has to pop the
          * target's parent before anything is decided about the name.
          */
-        if (usb_sys_resolve_suffix(sfx, nofollow, host_path, sizeof(host_path),
-                                   canon_sfx, sizeof(canon_sfx)) < 0) {
-            int reserr = errno;
-
-            /* A /sys name we do not synthesize resolved to nothing here: hand
-             * it back to the sysroot backing instead of shadowing it with
-             * ENOENT. Only the /sys/bus/usb subtree we own answers for its own
-             * absences.
+        int reserr = 0;
+        if (!usb_resolve_or_disown(sfx, norm, nofollow, host_path,
+                                   sizeof(host_path), canon_sfx,
+                                   sizeof(canon_sfx), &reserr)) {
+            /* Not ours: hand it back to the sysroot backing instead of
+             * shadowing it with ENOENT.
              */
-            if (reserr == ENOENT && !usb_sys_suffix_owned(norm)) {
+            if (!reserr) {
                 pthread_mutex_unlock(&usb_lock);
                 return PROC_NOT_INTERCEPTED;
             }
@@ -1766,12 +1913,14 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
         }
         int accmode = translate_open_flags(linux_flags) & O_ACCMODE;
         if (accmode != O_RDONLY) {
-            /* TEMPORARY (stage 1): writable opens are what stage 2's FD_USBDEV
-             * constructor will serve; until then they fail.
+            /* Unreachable through sys_openat_path: usbdev_open_path claims
+             * every non-O_PATH open of a node before proc_intercept_open runs
+             * (stage 2, syscall/usbdev.c). Kept as a guard for any other caller
+             * of the intercept.
              */
             log_warn(
-                "usb-sysfs: O_RDWR open of %s not implemented yet "
-                "(stage 2)",
+                "usb-sysfs: writable open of %s bypassed the FD_USBDEV "
+                "constructor",
                 path);
             err = EACCES;
             goto out;
@@ -1784,8 +1933,9 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
     case USB_PATH_DEV_ABSENT:
         err = ENOENT;
         goto out;
+    case USB_PATH_DEV_FOREIGN:
     case USB_PATH_NONE:
-        break;
+        break; /* folded to USB_PATH_NONE by classify_and_normalize */
     }
 
 out:
@@ -1802,13 +1952,8 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st, bool follow)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind == USB_PATH_NONE) {
-        if (cerr) {
-            errno = cerr;
-            return -1;
-        }
-        return PROC_NOT_INTERCEPTED;
-    }
+    if (kind == USB_PATH_NONE)
+        return usb_not_intercepted(cerr);
 
     pthread_mutex_lock(&usb_lock);
     int rc = -1;
@@ -1835,16 +1980,14 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st, bool follow)
          * lstat() (follow == false) still reports the link itself.
          */
         char host_path[PATH_MAX], canon_sfx[PATH_MAX];
-        if (usb_sys_resolve_suffix(sfx, !follow, host_path, sizeof(host_path),
-                                   canon_sfx, sizeof(canon_sfx)) < 0) {
-            int reserr = errno;
-
-            /* A /sys name we do not synthesize resolved to nothing: let the
-             * sysroot backing answer rather than shadow it with ENOENT, so stat
-             * and open agree on it (see usb_sysfs_intercept_open). Only the
-             * /sys/bus/usb subtree we own reports its own absences.
+        int reserr = 0;
+        if (!usb_resolve_or_disown(sfx, norm, !follow, host_path,
+                                   sizeof(host_path), canon_sfx,
+                                   sizeof(canon_sfx), &reserr)) {
+            /* Not ours: let the sysroot backing answer rather than shadow it
+             * with ENOENT, so stat and open agree on it.
              */
-            if (reserr == ENOENT && !usb_sys_suffix_owned(norm)) {
+            if (!reserr) {
                 pthread_mutex_unlock(&usb_lock);
                 return PROC_NOT_INTERCEPTED;
             }
@@ -1903,8 +2046,9 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st, bool follow)
     case USB_PATH_DEV_ABSENT:
         err = ENOENT;
         goto out;
+    case USB_PATH_DEV_FOREIGN:
     case USB_PATH_NONE:
-        break;
+        break; /* folded to USB_PATH_NONE by classify_and_normalize */
     }
 
 out:
@@ -1921,13 +2065,8 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind == USB_PATH_NONE) {
-        if (cerr) {
-            errno = cerr;
-            return -1;
-        }
-        return PROC_NOT_INTERCEPTED;
-    }
+    if (kind == USB_PATH_NONE)
+        return usb_not_intercepted(cerr);
 
     if (kind == USB_PATH_SYS) {
         /* The scratch tree holds real symlinks for `subsystem` entries;
@@ -1955,16 +2094,13 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
              * object behind it.
              */
             char host_path[PATH_MAX], canon_sfx[PATH_MAX];
-            if (usb_sys_resolve_suffix(sfx, true, host_path, sizeof(host_path),
-                                       canon_sfx, sizeof(canon_sfx)) < 0) {
-                err = errno;
-
-                /* A /sys name we do not synthesize resolved to nothing: fall
-                 * through to the sysroot backing rather than shadow it, as the
-                 * open and stat paths do. Only /sys/bus/usb answers its own
-                 * absences.
+            if (!usb_resolve_or_disown(sfx, norm, true, host_path,
+                                       sizeof(host_path), canon_sfx,
+                                       sizeof(canon_sfx), &err)) {
+                /* Not ours: fall through to the sysroot backing rather than
+                 * shadow it, as the open and stat paths do.
                  */
-                if (err == ENOENT && !usb_sys_suffix_owned(norm)) {
+                if (!err) {
                     pthread_mutex_unlock(&usb_lock);
                     return PROC_NOT_INTERCEPTED;
                 }
@@ -1993,6 +2129,132 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     return -1;
 }
 
+/* True when @sfx (a /sys-relative spelling) names one of the `subsystem`
+ * symlinks this layer materializes. Caller holds usb_lock and has run
+ * ensure_usb_tree().
+ *
+ * The name alone is not enough: /sys/bus/usb/devices/9-9/subsystem names no
+ * link at all when there is no device 9-9, and rewriting a walk through a link
+ * that does not exist would turn a Linux ENOENT into a successful lookup
+ * somewhere else entirely.
+ */
+static bool usb_sys_is_subsystem_link(const char *sfx)
+{
+    char host[PATH_MAX];
+    int n = snprintf(host, sizeof(host), "%s/%s", usb_sys_dir, sfx);
+    if (n < 0 || (size_t) n >= sizeof(host))
+        return false;
+    struct stat st;
+    return lstat(host, &st) == 0 && S_ISLNK(st.st_mode);
+}
+
+int usb_sysfs_resolve_guest_path(const char *guest_path,
+                                 char *out,
+                                 size_t outsz)
+{
+    /* Every `subsystem` link this layer plants sits under /sys/bus/usb/devices,
+     * so nothing else can move a walk, and a path that cannot contain one is
+     * rejected before the tree is touched.
+     */
+    if (strncmp(guest_path, "/sys/bus/usb/devices/", 21) != 0 ||
+        !strstr(guest_path, "/subsystem"))
+        return 0;
+
+    pthread_mutex_lock(&usb_lock);
+    int rc = 0;
+    if (ensure_usb_tree() < 0)
+        goto out;
+
+    char rel[LINUX_PATH_MAX];
+    size_t len = 0;
+    size_t marks[64];
+    size_t depth = 0;
+    bool rewrote = false;
+    rel[0] = '\0';
+
+    for (const char *p = guest_path + 5; *p;) {
+        const char *seg = p;
+        while (*p && *p != '/')
+            p++;
+        size_t seglen = (size_t) (p - seg);
+        const char *after = p;
+        while (*after == '/')
+            after++;
+        p = after;
+
+        if (seglen == 0 || (seglen == 1 && seg[0] == '.'))
+            continue;
+        if (seglen == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (depth == 0)
+                goto out; /* above /sys; not a name this layer can place */
+            len = marks[--depth];
+            rel[len] = '\0';
+            continue;
+        }
+        if (depth >= ARRAY_SIZE(marks))
+            goto out;
+        marks[depth++] = len;
+        if (len + (len ? 1 : 0) + seglen + 1 > sizeof(rel))
+            goto out;
+        if (len)
+            rel[len++] = '/';
+        memcpy(rel + len, seg, seglen);
+        len += seglen;
+        rel[len] = '\0';
+
+        /* A `subsystem` link with nothing after it is the object the caller
+         * named, and lstat/readlink/O_NOFOLLOW have to keep seeing the link
+         * itself, so only a link the walk continues through is substituted.
+         * What it is substituted with is where it points -- every one of them
+         * points at /sys/bus/usb -- so the components that follow are applied
+         * to the target, which is what makes `subsystem/..` name /sys/bus the
+         * way the kernel does.
+         */
+        if (*p && seglen == 9 && !memcmp(seg, "subsystem", 9)) {
+            if (!usb_sys_is_subsystem_link(rel))
+                goto out;
+            memcpy(rel, "bus/usb", 8);
+            len = 7;
+            depth = 2;
+            marks[0] = 0;
+            marks[1] = 3;
+            rewrote = true;
+        }
+    }
+
+    if (!rewrote)
+        goto out;
+
+    /* A trailing slash survives: it is what makes a non-directory named as a
+     * directory report ENOTDIR, and the rewrite must not answer that question.
+     */
+    const char *tail = guest_path[strlen(guest_path) - 1] == '/' ? "/" : "";
+    int n = snprintf(out, outsz, "/sys%s%s%s", len ? "/" : "", rel, tail);
+    rc = (n > 0 && (size_t) n < outsz) ? 1 : 0;
+
+out:
+    pthread_mutex_unlock(&usb_lock);
+    return rc;
+}
+
+bool usb_sysfs_dir_unions_backing(const char *guest_path)
+{
+    int bus = 0, dev = 0, cerr = 0;
+    const char *sfx = NULL;
+    char norm[LINUX_PATH_MAX];
+    usb_path_kind_t kind = classify_and_normalize(guest_path, &bus, &dev, &sfx,
+                                                  norm, sizeof(norm), &cerr);
+    if (kind == USB_PATH_DEV_BUS)
+        return true;
+    if (kind != USB_PATH_SYS)
+        return false;
+
+    /* The same ownership test the lookup path uses, so the listing and the
+     * lookups can never disagree about which names this layer answers for.
+     */
+    return !usb_sys_suffix_owned(norm);
+}
+
 uint8_t *usb_sysfs_descriptors_dup(int busnum, int devnum, size_t *len_out)
 {
     pthread_mutex_lock(&usb_lock);
@@ -2011,4 +2273,48 @@ uint8_t *usb_sysfs_descriptors_dup(int busnum, int devnum, size_t *len_out)
     }
     pthread_mutex_unlock(&usb_lock);
     return copy;
+}
+
+int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out)
+{
+    pthread_mutex_lock(&usb_lock);
+    int rc = -1;
+    if (ensure_usb_tree() == 0) {
+        usb_dev_t *d = find_dev(busnum, devnum);
+        if (d) {
+            out->location_id = d->location_id;
+            out->speed_code = d->speed_code;
+            out->cfg_value = d->cfg_value;
+            out->minor = usb_minor(d);
+            out->blob_len = d->blob_len;
+            out->vid = d->vid;
+            out->pid = d->pid;
+            str_copy_trunc(out->serial, d->serial, sizeof(out->serial));
+            rc = 0;
+        } else {
+            errno = ENODEV;
+        }
+    }
+    pthread_mutex_unlock(&usb_lock);
+    return rc;
+}
+
+int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st)
+{
+    pthread_mutex_lock(&usb_lock);
+    int rc = -1;
+    if (ensure_usb_tree() == 0) {
+        usb_dev_t *d = find_dev(busnum, devnum);
+        if (d) {
+            char node[64];
+            snprintf(node, sizeof(node), "/dev/bus/usb/%03d/%03d", busnum,
+                     devnum);
+            fill_synth_chardev(st, node, d);
+            rc = 0;
+        } else {
+            errno = ENODEV;
+        }
+    }
+    pthread_mutex_unlock(&usb_lock);
+    return rc;
 }

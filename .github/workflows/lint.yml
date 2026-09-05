@@ -66,6 +66,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: .ci/check-security.sh
 
+      - name: Source character set
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check-ascii.py --self-test
+          python3 scripts/check-ascii.py
+
       - name: Syscall dispatch table consistency
         # The generator validates dispatch.tbl <-> syscall.c on every run;
         # writing to a throwaway path is enough to exercise validate_wrappers().

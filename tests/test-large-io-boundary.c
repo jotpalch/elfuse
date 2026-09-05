@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -82,15 +83,14 @@ static void test_large_write(void)
     for (size_t i = 0; i < IO_SIZE; i++)
         buf[i] = (unsigned char) (i * 131U + 17U);
 
-    char path[96];
-    snprintf(path, sizeof(path), "/tmp/elfuse-large-write-%d.tmp", getpid());
-    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
-    unlink(path);
+    char path[] = "/tmp/elfuse-large-write-XXXXXX";
+    int fd = mkstemp(path);
     if (fd < 0) {
         munmap(map, MAP_SIZE);
-        FAIL("open failed");
+        FAIL("mkstemp failed");
         return;
     }
+    unlink(path);
 
     ssize_t ret = write(fd, buf, IO_SIZE);
     int ok = (ret == (ssize_t) IO_SIZE);
@@ -143,15 +143,14 @@ static void test_large_read_from_split_block(void)
         return;
     }
 
-    char path[96];
-    snprintf(path, sizeof(path), "/tmp/elfuse-large-read-%d.tmp", getpid());
-    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
-    unlink(path);
+    char path[] = "/tmp/elfuse-large-read-XXXXXX";
+    int fd = mkstemp(path);
     if (fd < 0) {
         munmap(map, MAP_SIZE);
-        FAIL("open failed");
+        FAIL("mkstemp failed");
         return;
     }
+    unlink(path);
 
     unsigned char seed[4096];
     for (size_t i = 0; i < sizeof(seed); i++)

@@ -535,6 +535,24 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx)
     pthread_mutex_unlock(&thread_lock);
 }
 
+bool thread_ptrace_interrupt_pending_locked(void)
+{
+    THREAD_FOR_EACH_ACTIVE (t) {
+        /* A vm-clone that has exited keeps its slot until a wait reaps it, and
+         * carries whatever it was owed to the grave: nothing will consume it.
+         * Counting one holds ATTN_BIT_PTRACE up for the life of the process and
+         * sends every fast path down the slow lane for a stop that can never be
+         * taken. execve reaches here past its own guard, which counts only
+         * clones that have not exited.
+         */
+        if (t->is_vm_clone && t->vm_exited)
+            continue;
+        if (t->ptrace_interrupt_pending)
+            return true;
+    }
+    return false;
+}
+
 /* exec_mode is de_thread's contract rather than teardown's: the process
  * continues afterwards, so a straggler must not be detached (the handle stays
  * claimable for the real teardown) and a vm-clone slot must not be waited on at
@@ -1168,7 +1186,17 @@ static int64_t thread_elapsed_ms(const struct timespec *since)
 
 int thread_exec_de_thread(void)
 {
-    if (!current_thread || thread_count_joinable_siblings() == 0)
+    if (!current_thread)
+        return 0;
+
+    /* execve tears down an in-process tracer with the old thread group. */
+    pthread_mutex_lock(&thread_lock);
+    current_thread->ptraced = false;
+    current_thread->tracer_tid = 0;
+    current_thread->ptrace_interrupt_pending = false;
+    pthread_mutex_unlock(&thread_lock);
+
+    if (thread_count_joinable_siblings() == 0)
         return 0;
 
     /* Let an open quiesce window close before reaping anything.

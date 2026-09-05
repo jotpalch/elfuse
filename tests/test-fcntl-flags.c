@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <stdint.h>
@@ -48,9 +49,6 @@ int passes = 0, fails = 0;
 #define O_PATH 010000000
 #endif
 
-/* Written where the guest can create it under either sysroot. */
-#define NOATIME_FILE "/tmp/fcntl-noatime.tmp"
-#define SYNC_FILE "/tmp/fcntl-sync.tmp"
 
 static void check_accmode(const char *what, int fd, int want)
 {
@@ -109,13 +107,26 @@ int main(void)
 {
     printf("test-fcntl-flags: status flags across fd types\n");
 
+    /* A directory private to this run, under /tmp so the guest can create it
+     * under either sysroot. The fixed names it replaces were unlinked mid-test
+     * by concurrent runs.
+     */
+    char tmpdir[] = "/tmp/elfuse-fcntl-flags-XXXXXX";
+    if (!mkdtemp(tmpdir)) {
+        perror("mkdtemp");
+        return 1;
+    }
+    char noatime_file[128], sync_file[128], regular_file[128];
+    snprintf(noatime_file, sizeof(noatime_file), "%s/noatime.tmp", tmpdir);
+    snprintf(sync_file, sizeof(sync_file), "%s/sync.tmp", tmpdir);
+    snprintf(regular_file, sizeof(regular_file), "%s/regular", tmpdir);
+
     /* Regular files, one per access mode. */
     int rd = open("/etc/hostname", O_RDONLY);
     if (rd < 0)
         rd = open("/proc/self/cmdline", O_RDONLY);
-    int wr =
-        open("/tmp/elfuse-fcntl-flags", O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    int rw = open("/tmp/elfuse-fcntl-flags", O_RDWR);
+    int wr = open(regular_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int rw = open(regular_file, O_RDWR);
 
     check_accmode("regular O_RDONLY", rd, O_RDONLY);
     check_accmode("regular O_WRONLY", wr, O_WRONLY);
@@ -324,7 +335,7 @@ int main(void)
      * open() recorded. Checked in both directions, since a shadow that is only
      * ever set looks correct until something clears it.
      */
-    int nafd = open(NOATIME_FILE, O_RDWR | O_CREAT, 0600);
+    int nafd = open(noatime_file, O_RDWR | O_CREAT, 0600);
     if (nafd >= 0) {
         TEST("O_NOATIME is not reported before it is set");
         EXPECT_EQ(fcntl(nafd, F_GETFL) & O_NOATIME, 0, "reported unset flag");
@@ -337,7 +348,7 @@ int main(void)
         TEST("F_SETFL clears O_NOATIME");
         EXPECT_EQ(fcntl(nafd, F_GETFL) & O_NOATIME, 0, "bit did not clear");
         close(nafd);
-        unlink(NOATIME_FILE);
+        unlink(noatime_file);
     }
 
     /* O_PATH and O_DIRECTORY have no macOS equivalent and are carried in the
@@ -457,7 +468,7 @@ int main(void)
         close(wr);
     if (rw >= 0)
         close(rw);
-    unlink("/tmp/elfuse-fcntl-flags");
+    unlink(regular_file);
 
     /* A raw openat may carry __O_SYNC without O_DSYNC. Linux normalizes it to
      * O_SYNC, while an O_DSYNC-only open remains weaker. Every F_GETFL result
@@ -465,7 +476,7 @@ int main(void)
      * satisfy every mask below, so testing the call inline would turn a failure
      * into a row of green checks. check_accmode above guards the same way.
      */
-    int sfd_sync = open(SYNC_FILE, O_RDWR | O_CREAT | O_SYNC, 0600);
+    int sfd_sync = open(sync_file, O_RDWR | O_CREAT | O_SYNC, 0600);
     if (sfd_sync >= 0) {
         int fl = fcntl(sfd_sync, F_GETFL);
         TEST("O_SYNC round trips through F_GETFL");
@@ -475,7 +486,7 @@ int main(void)
             EXPECT_EQ(fl & O_SYNC, O_SYNC, "flag was lost");
         close(sfd_sync);
     }
-    int sfd_raw_sync = syscall(SYS_openat, AT_FDCWD, SYNC_FILE,
+    int sfd_raw_sync = syscall(SYS_openat, AT_FDCWD, sync_file,
                                O_RDWR | O_CREAT | (O_SYNC & ~O_DSYNC), 0600);
     if (sfd_raw_sync >= 0) {
         int fl = fcntl(sfd_raw_sync, F_GETFL);
@@ -486,7 +497,7 @@ int main(void)
             EXPECT_EQ(fl & O_SYNC, O_SYNC, "flag was lost");
         close(sfd_raw_sync);
     }
-    int sfd_dsync = open(SYNC_FILE, O_RDWR | O_CREAT | O_DSYNC, 0600);
+    int sfd_dsync = open(sync_file, O_RDWR | O_CREAT | O_DSYNC, 0600);
     if (sfd_dsync >= 0) {
         int fl = fcntl(sfd_dsync, F_GETFL);
         TEST("O_DSYNC round trips through F_GETFL");
@@ -500,7 +511,8 @@ int main(void)
         }
         close(sfd_dsync);
     }
-    unlink(SYNC_FILE);
+    unlink(sync_file);
+    rmdir(tmpdir);
 
     SUMMARY("test-fcntl-flags");
     return fails > 0 ? 1 : 0;

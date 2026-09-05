@@ -149,8 +149,9 @@ run_lldb()
 run_raw_rsp_script()
 {
     local timeout_sec="${RAW_RSP_TIMEOUT:-10}"
+    RAW_RSP_RC=0
     RAW_RSP_OUT=$(
-        timeout "$timeout_sec" python3 - "$GDB_PORT" 2>&1 << 'PY'
+        timeout "$timeout_sec" python3 - "$GDB_PORT" "${1:-single}" 2>&1 << 'PY'
 import socket
 import sys
 
@@ -158,10 +159,13 @@ port = int(sys.argv[1])
 sock = socket.create_connection(("127.0.0.1", port), timeout=5)
 sock.settimeout(5)
 
-def send_packet(payload: str) -> None:
+def frame_packet(payload: str) -> bytes:
     data = payload.encode("ascii")
     cksum = sum(data) & 0xFF
-    sock.sendall(b"$" + data + b"#" + f"{cksum:02x}".encode("ascii"))
+    return b"$" + data + b"#" + f"{cksum:02x}".encode("ascii")
+
+def send_packet(payload: str) -> None:
+    sock.sendall(frame_packet(payload))
 
 def recv_exact(n: int) -> bytes:
     buf = b""
@@ -187,6 +191,8 @@ def recv_packet():
             break
         body.extend(ch)
     cksum = recv_exact(2).decode("ascii")
+    if cksum != f"{sum(body) & 0xFF:02x}":
+        raise RuntimeError("invalid reply checksum")
     return ack, body.decode("ascii"), cksum
 
 send_packet("qSupported")
@@ -207,9 +213,19 @@ print(f"stop_ack={ack3 or 'none'}")
 print(f"stop_body={body3}")
 print(f"stop_cksum={cksum3}")
 
+if sys.argv[2] == "batch":
+    # This loopback write relies on coalescing; short reads can hide the stall.
+    # Send nothing else until all eight replies arrive.
+    sock.sendall(frame_packet("qAttached") * 8)
+    for _ in range(8):
+        ack, body, _ = recv_packet()
+        if ack or body != "1":
+            raise RuntimeError(f"unexpected batched reply: {ack!r} {body!r}")
+    print("batched_replies=8")
+
 sock.close()
 PY
-    ) || true
+    ) || RAW_RSP_RC=$?
 }
 
 report()
@@ -507,7 +523,8 @@ stop_elfuse
 start_elfuse "$GUEST"
 run_raw_rsp_script
 ok=0
-if echo "$RAW_RSP_OUT" | grep -q "qSupported_ack=+" \
+if [ "$RAW_RSP_RC" -eq 0 ] \
+    && echo "$RAW_RSP_OUT" | grep -q "qSupported_ack=+" \
     && echo "$RAW_RSP_OUT" | grep -q "qSupported_body=.*QStartNoAckMode+" \
     && echo "$RAW_RSP_OUT" | grep -q "noack_ack=+" \
     && echo "$RAW_RSP_OUT" | grep -q "noack_body=OK" \
@@ -516,6 +533,17 @@ if echo "$RAW_RSP_OUT" | grep -q "qSupported_ack=+" \
     ok=1
 fi
 report "QStartNoAckMode: final ack then packet-only replies" $ok
+stop_elfuse
+
+# Test 18: Requests buffered by the transport must not wait for socket input.
+start_elfuse "$GUEST"
+run_raw_rsp_script batch
+ok=0
+if [ "$RAW_RSP_RC" -eq 0 ] \
+    && echo "$RAW_RSP_OUT" | grep -q "^batched_replies=8$"; then
+    ok=1
+fi
+report "buffered packets: reply without further socket input" $ok
 stop_elfuse
 
 # Summary

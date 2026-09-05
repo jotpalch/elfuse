@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
@@ -244,22 +245,26 @@ int main(void)
     expect_op_errno("unregistered DEL", "/proc/self/mountinfo", EPOLL_CTL_DEL,
                     ENOENT);
 
-    /* Named after this process so two runs of the suite cannot collide on the
-     * unlink and see each other's fifo.
+    /* A private directory: guest pids restart at 1, so a pid-derived name was
+     * the same name in every concurrent run.
      */
-    char fifo_path[64];
-    snprintf(fifo_path, sizeof(fifo_path), "/tmp/elfuse-epoll-fifo-%d",
-             (int) getpid());
-    unlink(fifo_path);
+    char fifo_dir[] = "/tmp/elfuse-epoll-fifo-XXXXXX";
     TEST("fifo opened by path");
-    if (mkfifo(fifo_path, 0600) != 0) {
-        FAIL("mkfifo failed");
+    if (!mkdtemp(fifo_dir)) {
+        FAIL("mkdtemp failed");
     } else {
-        int ff = open(fifo_path, O_RDONLY | O_NONBLOCK);
-        EXPECT_EQ(add_to_fresh_epoll(ff, EPOLLIN), 0, "fifo was refused");
-        close(ff);
+        char fifo_path[128];
+        snprintf(fifo_path, sizeof(fifo_path), "%s/f", fifo_dir);
+        if (mkfifo(fifo_path, 0600) != 0) {
+            FAIL("mkfifo failed");
+        } else {
+            int ff = open(fifo_path, O_RDONLY | O_NONBLOCK);
+            EXPECT_EQ(add_to_fresh_epoll(ff, EPOLLIN), 0, "fifo was refused");
+            close(ff);
+        }
+        unlink(fifo_path);
+        rmdir(fifo_dir);
     }
-    unlink(fifo_path);
 
     /* Trees elfuse serves from ordinary host files. fstat calls every one of
      * them a plain file; Linux polls them, so the plain-file rule has to go by

@@ -80,7 +80,7 @@ INVENTORY = {
         "forbids",
         "The address-wait path plain FUTEX_WAIT takes; its deadline is " "relative.",
     ),
-    "runtime/futex.c::futex_wait": (
+    "runtime/futex.c::futex_wait_inner": (
         "forbids",
         "Relative FUTEX_WAIT has spent part of its timeout; FUTEX_WAIT_BITSET "
         "is absolute and stays restartable.",
@@ -111,6 +111,11 @@ INVENTORY = {
         "forbids",
         "FUSE_INTERRUPT is on the wire and the request is detached, so a "
         "restart would re-issue the operation under a fresh unique.",
+    ),
+    "syscall/usbdev.c::ioret_neg_errno": (
+        "forbids",
+        "kIOReturnAborted means a sync transfer already handed to IOKit was "
+        "aborted mid-flight; a restart would send the request twice.",
     ),
     # Waits that report EINTR before doing anything the guest can observe.
     "syscall/io.c::io_retry_backoff": (
@@ -209,14 +214,16 @@ INVENTORY = {
     ),
     "syscall/net-msg.c::sys_sendmsg": (
         "restartable",
-        "Both wait sites sit before their send in the EAGAIN retry loop, so "
-        "EINTR means nothing left the socket.",
+        "The wait sits before its send in the EAGAIN retry loop, so EINTR "
+        "means nothing left the socket.",
     ),
-    "syscall/net-msg.c::sys_sendmmsg": (
+    "syscall/net-msg.c::net_send_single_iov": (
         "restartable",
-        "Interrupting message i reports i as the count when i > 0, so the "
-        "restart never re-sends a delivered message; only an interrupt before "
-        "the first send reaches the guest as EINTR.",
+        "Same shape, for the single-iovec fast path both sendmsg and sendmmsg "
+        "take: the wait precedes the send, so EINTR means nothing left the "
+        "socket. sys_sendmmsg forwards this result and carries no wait of its "
+        "own, so it is not listed; its loop reports the delivered count rather "
+        "than the error once a message has gone out.",
     ),
     "syscall/net-msg.c::sys_recvmsg": (
         "restartable",
@@ -307,7 +314,7 @@ INVENTORY = {
         "restartable",
         "Same shape as sys_wait4: the reap and WNOHANG answers precede this.",
     ),
-    "runtime/futex.c::futex_lock_pi": (
+    "runtime/futex.c::futex_lock_pi_inner": (
         "restartable",
         "The deadline is absolute and futex_unlock_pi zeroes the word rather "
         "than transferring ownership, so a restart re-CASes.",

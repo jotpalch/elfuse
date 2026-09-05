@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -21,13 +21,14 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-tmp-remove test-sysroot-host-fallback test-sysroot-case-exact \
         test-sysroot-create-paths test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
-        test-dynamic-array-host test-string-builder-host \
-        test-config \
+        test-dynamic-array-host test-string-builder-host test-gdbstub-host \
+        test-config test-runner \
         test-mremap-tail-emfile \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-sysroot-fd-magiclink \
         test-timeout-disable test-launch-flags \
         test-fuse-alpine \
+        test-fstatat-empty-path \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
@@ -36,12 +37,18 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host \
+        test-usb-desc-host test-elf-headers-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
-        test-usb-sysfs-overflow \
+        test-usb-sysfs-matrix \
+        test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
+        test-dir-fd-budget-union \
+        test-dir-backing-drain-error test-dir-union-fd-reuse \
+        test-fstatfs-fd-identity \
+        test-dir-union-alias test-dir-primary-read-error \
+        test-getdents64-small-buf \
         test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
@@ -59,6 +66,10 @@ test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 ## Verify test-config.sh keeps its CLI mode separate from sourced mode
 test-config:
 	@bash tests/test-config-cli.sh
+
+## Verify output matching and exit status checks in the shared shell runner
+test-runner:
+	@bash tests/test-runner.sh
 
 ## Run the libc-based file-backed region removal EMFILE regression probe
 test-mremap-tail-emfile: $(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile
@@ -84,6 +95,17 @@ check-atomics:
 	@echo "  ATOMICS src/"
 	@python3 scripts/check-atomics.py --self-test
 	@python3 scripts/check-atomics.py
+
+## Fail when a source file carries non-ASCII outside the diagram set
+check-ascii:
+	@echo "  ASCII   src/"
+	@python3 scripts/check-ascii.py --self-test
+	@python3 scripts/check-ascii.py
+
+## Fail when an HVC #5 return tail can reach EL0 without the X7 ptrace test
+check-svc-tails:
+	@python3 scripts/check-svc-tails.py --self-test
+	@python3 scripts/check-svc-tails.py
 
 ## Verify every path, target, and section the skills name still resolves
 check-skill-refs:
@@ -114,6 +136,12 @@ endef
 # (test-runner.sh defaults to 10s) to keep the slowdown from surfacing as a
 # spurious TIMEOUT. TEST_TIMEOUT is only overridden if the caller has not
 # already set one.
+#
+# ASAN was raised from 30 after test-dup-setfl-race, whose 700 rounds take ~10s
+# under ASAN on an idle host, timed out on a CI runner that shares its machine
+# with a second runner. These defaults are for a local run: CI never reaches
+# these targets, it sets TEST_TIMEOUT itself in .github/workflows/build.yml.
+# The two are policy for different machines and may legitimately differ.
 
 # No "clean" prerequisite. These lanes used to depend on it, which removed the
 # whole build tree including the 186 cross-compiled guest binaries -- built with
@@ -129,7 +157,7 @@ endef
 
 ## Run the sanitizer subset with AddressSanitizer (ASAN)
 check-asan:
-	ASAN_OPTIONS="abort_on_error=1:detect_leaks=0" TEST_TIMEOUT="$${TEST_TIMEOUT:-30}" $(MAKE) EXTRA_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" check-sanitizer
+	ASAN_OPTIONS="abort_on_error=1:detect_leaks=0" TEST_TIMEOUT="$${TEST_TIMEOUT:-60}" $(MAKE) EXTRA_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" check-sanitizer
 
 ## Run the sanitizer subset with UndefinedBehaviorSanitizer (UBSAN)
 check-ubsan:
@@ -212,7 +240,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host)
+        test-usb-desc-host test-elf-headers-host test-gdbstub-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -233,9 +261,22 @@ $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
+$(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
+$(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
+$(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point against every path class)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
+$(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
+$(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
+$(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
+$(call run-lane,test-dir-backing-drain-error,a lost union listing is reported not truncated)
+$(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
+$(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
+$(call run-lane,test-dir-union-alias,a dup shares one listing position and one union)
+$(call run-lane,test-dir-primary-read-error,a failed synthetic read is reported not ended)
+$(call run-lane,test-getdents64-small-buf,a getdents64 buffer too small for one entry)
+$(call run-lane,test-fstatat-empty-path,AT_EMPTY_PATH stat by fd under a sysroot)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -249,16 +290,18 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-config \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs test-config test-runner \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
 	$(call run-lane,test-sysroot-name-race,concurrent creation of colliding names)
+	$(call run-lane,test-vcpu-watchdog,vCPU watchdog kills a wedged guest)
 	$(call run-lane,test-sysroot-pathmax,guest paths at the host path ceiling)
 	$(call run-lane,test-sysroot-corpus,frozen on-disk spelling corpus)
 	$(call run-lane,test-sysroot-path-matrix,addressing modes agree across the path matrix)
 	$(call run-lane,test-usage-synopsis,usage synopsis renderings)
 	$(call run-lane,test-shebang-host,shebang parser unit test)
+	$(call run-lane,test-shim-futex-stats,futex EL1 fast path is live)
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
@@ -328,6 +371,17 @@ test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 		printf "$(RED)FAIL$(RESET) rename escaped sysroot to host /tmp\n"; \
 		exit 1; \
 	fi
+
+## AT_EMPTY_PATH names the descriptor rather than a name under it, so it has to
+## be answered before anything resolves against dirfd. Only a sysroot run puts
+## a resolver in front of it, which is why this lane exists next to the matrix
+## registration: without --sysroot the empty path never reaches the code that
+## used to fail it, and the test passes without proving anything.
+test-fstatat-empty-path: $(ELFUSE_BIN) $(BUILD_DIR)/test-fstatat-empty-path
+	@tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$tmpdir/tmp"; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-fstatat-empty-path
 
 test-sysroot-nofollow: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-nofollow
 	@tmpdir=$$(mktemp -d); \
@@ -1032,6 +1086,18 @@ test-getdents64-overlong: $(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong
 	done; \
 	$(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong "$$tmpdir/fixture"
 
+## Verify a getdents64 buffer too small for one entry reports EINVAL
+test-getdents64-small-buf: $(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-small-buf
+	@$(SYSROOT_SCRATCH); \
+	mkdir -p "$$tmpdir/fixture" "$$tmpdir/wide"; \
+	: > "$$tmpdir/fixture/aaaaaaaaaaaa"; \
+	: > "$$tmpdir/fixture/bb"; \
+	i=0; while [ $$i -lt 96 ]; do \
+		printf '' > "$$tmpdir/wide/name-that-is-fairly-long-$$i"; \
+		i=$$((i + 1)); \
+	done; \
+	$(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-small-buf "$$tmpdir/fixture" "$$tmpdir/wide" 96
+
 test-sysroot-create-paths: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-create-paths
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
@@ -1089,8 +1155,13 @@ test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP) $(TEST_ENV_DEPS)
 test-usage-synopsis: $(ELFUSE_BIN)
 	@bash tests/test-usage-synopsis.sh $(ELFUSE_BIN)
 
+## Run the buffered GDB session host regression
+test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host
+	$(BUILD_DIR)/test-gdbstub-host
+
 ## Run GDB stub integration tests (LLDB <-> elfuse gdbstub)
-test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello
+test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello $(BUILD_DIR)/test-gdbstub-host
+	$(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 	@bash tests/test-gdbstub.sh -e $(ELFUSE_BIN) -v
 
 ## Run Rosetta CLI gating regressions without requiring Rosetta runtime support
@@ -1290,6 +1361,13 @@ $(BUILD_DIR)/busybox: | $(BUILD_DIR)
 	cp "$$tmpdir/root/usr/bin/busybox" "$@"; \
 	chmod 0755 "$@"; \
 	rm -rf "$$tmpdir"
+
+## Verify the futex EL1 fast path actually served the calls, via shim counters
+test-shim-futex-stats: $(ELFUSE_BIN) $(TEST_DIR)/test-shim-futex-fast \
+		$(TEST_DIR)/test-futex-wake-nowaiter
+	@bash tests/test-shim-futex-stats.sh $(ELFUSE_BIN) \
+		$(TEST_DIR)/test-shim-futex-fast \
+		$(TEST_DIR)/test-futex-wake-nowaiter
 
 ## Run busybox applet smoke tests
 test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
@@ -1550,6 +1628,10 @@ test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 ## Assert the synthetic USB tree's contract and its two agreeing views
 # The device-dependent half only runs against whatever is attached, so the lane
 # prints the device count rather than letting an empty bus read as full cover.
+# The fixture stays on: stage 2's FD_USBDEV constructor resolves its IOKit
+# device on first use rather than at open, so a modeled device with no hardware
+# behind it still opens, reads and stats like one -- which is what keeps this
+# lane's device half running on a machine with no USB device attached.
 test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 
@@ -1572,11 +1654,215 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot
 
+## Every entry point that can name something under /sys or /dev/bus, against
+## every class of name those trees can hold. The layer synthesizes one subtree
+## on each side and the rest belongs to the sysroot, so the sysroot has to carry
+## the other side of each column: a /sys skeleton, a foreign /dev/bus, an /etc
+## file for the '..' chain that leaves the tree, and one name planted inside
+## /dev/bus/usb, which the layer owns and the backing must not reach into.
+## Nothing is planted under the sysroot's /sys/bus: a Linux rootfs image carries
+## an empty /sys, and its not having a `bus` is the shape the escape-syn column
+## records. Expected values are the
+## ones recorded on Linux; see tests/usb-sysfs-matrix-vectors.h.
+test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net/eth0" \
+		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
+		"$$sysroot/sys/devices/system/node" \
+		"$$sysroot/sys/fs/cgroup" \
+		"$$sysroot/sys/bus/pci/devices" \
+		"$$sysroot/dev/bus/other" "$$sysroot/dev/bus/usb/099" \
+		"$$sysroot/etc"; \
+	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
+	printf 'always [madvise] never\n' \
+		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
+	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	: > "$$sysroot/sys/fs/cgroup/g"; \
+	: > "$$sysroot/dev/bus/other/f"; \
+	: > "$$sysroot/dev/bus/usb/099/001"; \
+	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-matrix
+
 ## The devnum cap needs more than 127 address-less devices on one bus, which
 ## the overflow fixture injects through the real fallback path. No sysroot: the
 ## whole model is synthetic here.
 test-usb-sysfs-overflow: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
 	ELFUSE_USB_FIXTURE=overflow $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+
+## The usbdevfs fd's contract, decided before anything reaches the wire
+# The fixture's devices are modeled with no IOKit service behind them, which is
+# exactly the shape of a device the machine cannot reach: every answer below is
+# the same on a host with no USB device attached and on one with a bus full of
+# them, so the file contract, the ioctl gates and the whole argument-validation
+# surface get a lane that does not depend on what is plugged in.
+test-usbdev-ioctl: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+
+## The usbdevfs fd's failures, one forced condition per run
+# Six things this descriptor has to get right cannot be provoked from a guest on
+# a healthy host: a device declaring an interface number wider than the table
+# that indexes by it, the three ways an open can fail before it returns, and the
+# two windows an open leaves around the moment the side table binds its guest
+# fd -- before the bind, where a close finds no entry, and after it, where a
+# close can reap the entry and a sibling open can take the slot back. Each run
+# below forces exactly one and the binary asserts only that one, so a failure
+# names the condition. The malformed-descriptor run is also where the
+# out-of-bounds read lives: it is invisible in the answer -- both sides report
+# EINVAL, which is what checkintf reports -- and shows up only under
+# -fsanitize=array-bounds, which is why this lane is in the sanitizer set.
+test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=badifnum $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=info \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=blob \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=pipe \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_PUBLISH_DELAY_US=20000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_RETIRE_DELAY_US=20000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+
+## fstatfs answers for the descriptor it pinned, not for the fd number
+# The identity is decided from the slot's stamp and from the descriptor itself,
+# and those used to be two lookups with a window between them. The window is far
+# too narrow to reach unaided, so ELFUSE_FD_IDENTITY_WINDOW_US widens it and the
+# test swaps the slot inside it. The sysroot carries both sides the test needs:
+# a plain file, and a /sys directory this layer does not synthesize, so the
+# descriptor falls through to the sysroot and still has to answer sysfs.
+test-fstatfs-fd-identity: $(ELFUSE_BIN) $(TEST_DIR)/test-fstatfs-fd-identity
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" "$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" "$$sysroot/etc"; \
+	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
+	ELFUSE_FD_IDENTITY_WINDOW_US=120000 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-fstatfs-fd-identity /etc/hostname /sys/kernel
+## A union directory fd must cost one host descriptor, like a plain one
+# The measurement only means something with the host limit at exactly what
+# elfuse asks for -- the same squeeze tests/manifest.txt puts on
+# test-dir-fd-budget -- and only if /sys really is a union here, which needs a
+# sysroot that carries one. The skeleton is the same shape the other /sys lanes
+# stage, plus a marker directory the synthetic tree has no name for: the test
+# refuses to pass without seeing it, so the lane cannot go quietly vacuous if
+# the sysroot ever stops being planted.
+test-dir-fd-budget-union: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-fd-budget-union
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net/eth0" \
+		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
+		"$$sysroot/sys/devices/system/node" \
+		"$$sysroot/sys/elfuse-union-marker"; \
+	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
+	printf 'always [madvise] never\n' \
+		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
+	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	ulimit -n $(ELFUSE_HOST_NOFILE_MIN); \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-fd-budget-union
+
+## A union listing that cannot be delivered whole must be reported
+# Three runs over one staged sysroot, because the thing under test is what the
+# guest is told and each answer needs its own conditions. The drain-failure run
+# needs a failure that will not happen by itself -- a malloc coming back NULL
+# part-way through the backing -- so ELFUSE_DIR_BACKING_FAULT drives it after
+# two names, against a backing that has more than two to give. The unreadable
+# run needs no hook: chmod 000 on the sysroot's /sys makes the drain's own open
+# fail. The no-fault run is the control, and it is also what keeps the other
+# two honest: it refuses to pass unless the marker directory -- present in the
+# sysroot and nowhere in the synthetic tree -- comes back in the listing, so
+# the lane cannot go quietly vacuous if /sys ever stops being a union here.
+# chmod 000 outlives the scratch trap on some filesystems, so the mode goes
+# back before the shell exits.
+test-dir-backing-drain-error: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-backing-drain-error
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	trap 'chmod -R u+rwX "$$tmpdir" 2>/dev/null; rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$sysroot/sys/class/net" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker" \
+		"$$sysroot/sys/extra-one" "$$sysroot/sys/extra-two"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-backing-drain-error complete; \
+	ELFUSE_DIR_BACKING_FAULT=2 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-backing-drain-error fault; \
+	chmod 000 "$$sysroot/sys"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-backing-drain-error unreadable
+
+## A dup'd directory fd must share one listing position and one union state
+# Both directories the lane walks are staged several hundred names wide, and
+# that width is the lane. macOS reads one host block ahead when it opens a
+# directory, so a three-name fixture -- what this staged before -- fits inside
+# that block: a stream that never reads its primary loses nothing, and the loss
+# only becomes visible once the listing outruns the block. Measured over this
+# staging, an unread fork on the 403-name plain directory: 403 names across the
+# pair when the sharing is right, 340 when the child skips its primary. The
+# union side is staged wide for the mirror-image reason -- a backing delivered a
+# second time is 809 names where 405 are wanted. 400 a side is several times the
+# block and costs one mkdir.
+test-dir-union-alias: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-union-alias
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" "$$sysroot/sys/class/tty" \
+		"$$sysroot/sys/class/block" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker" \
+		"$$sysroot/plain-alias"; \
+	i=0; wide=""; \
+	while [ $$i -lt 403 ]; do \
+		wide="$$wide $$sysroot/plain-alias/plain-w$$i"; \
+		i=$$((i + 1)); \
+	done; \
+	i=0; \
+	while [ $$i -lt 400 ]; do \
+		wide="$$wide $$sysroot/sys/union-w$$i"; \
+		i=$$((i + 1)); \
+	done; \
+	mkdir -p $$wide; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-union-alias
+
+## A synthetic listing that failed part-way must be reported, not ended
+# Two runs over one staged sysroot: the control proves the union works at all,
+# and the fault run drives a readdir failure on the primary after one entry,
+# which is a failure that cannot happen by itself on a tree elfuse owns.
+test-dir-primary-read-error: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-primary-read-error
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-primary-read-error complete; \
+	ELFUSE_DIR_PRIMARY_READ_FAULT=1 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-primary-read-error fault
+
+## A union walk must answer for the directory it pinned, not the fd number
+# The window between pinning the stream and looking the backing up is far too
+# narrow to reach unaided, so ELFUSE_DIR_UNION_BACKING_DELAY_US widens it and
+# the guest closes the walked fd inside it. MARKER is planted in the sysroot's
+# /sys and nowhere in the synthetic tree, so its absence from a listing that
+# reported success is exactly the silent half-listing under test.
+test-dir-union-fd-reuse: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-union-fd-reuse
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker"; \
+	ELFUSE_DIR_UNION_BACKING_DELAY_US=20000 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-union-fd-reuse
+
 
 ## Run the absock derived-name unit test natively on the host
 test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
@@ -1585,6 +1871,10 @@ test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 ## Run the USB descriptor blob walk unit test natively on the host
 test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
 	$(BUILD_DIR)/test-usb-desc-host
+
+## Run the ELF header validation host unit test
+test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host
+	$(BUILD_DIR)/test-elf-headers-host
 
 # Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
 # race detector, so check-sanitizer is where this lane has its full weight.
@@ -1609,3 +1899,20 @@ test-shebang-host: $(BUILD_DIR)/test-shebang-host
 ## Run the proved/gva.h call-site precondition checks (skips without the flag)
 test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
 	$(BUILD_DIR)/test-gva-contracts
+
+# The two fixtures are prerequisites only where the makefile can build them.
+# A prebuilt tree sets TEST_DEPS empty and points TEST_DIR at binaries it did
+# not compile, so naming them there asks make for files it has no rule to
+# produce and the lane dies before the script runs. The same shape guards
+# BENCH_GUARDRAIL_DEPS above. They stay out of tests/manifest.txt because that
+# file lists tests the matrix runs, and .ci/check-matrix-lists.sh fails on an
+# entry no test_* call registers: these two are fixtures the script drives, not
+# tests of their own.
+VCPU_WATCHDOG_DEPS := $(ELFUSE_BIN)
+ifndef GUEST_TEST_BINARIES
+  VCPU_WATCHDOG_DEPS += $(TEST_DIR)/spin-forever $(TEST_DIR)/test-sleep-long
+endif
+
+## Verify the vCPU watchdog still kills a wedged guest and spares a blocked one
+test-vcpu-watchdog: $(VCPU_WATCHDOG_DEPS)
+	@bash tests/test-vcpu-watchdog.sh $(ELFUSE_BIN) $(TEST_DIR)

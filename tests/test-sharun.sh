@@ -168,6 +168,7 @@ run_guest()
     local tag="$1"
     shift
     set +e
+    test_host_busy_mark
     timeout "$GUEST_TIMEOUT" "$@" > "$scratch/$tag.out" 2> "$scratch/$tag.err"
     guest_rc=$?
 
@@ -185,7 +186,7 @@ run_guest()
     # the launcher and the probe, which exit 1 to 6 and never 124. A 124 here is
     # the cap and nothing else, so the only open question is whether load caused
     # it.
-    if [ "$guest_rc" -eq 124 ] && test_host_is_busy; then
+    if [ "$guest_rc" -eq 124 ] && test_host_busy_since_mark; then
         printf 'timeout under host load, re-running: %s\n' "$tag" >&2
         timeout "$GUEST_TIMEOUT" "$@" > "$scratch/$tag.out" 2> "$scratch/$tag.err"
         guest_rc=$?
@@ -289,9 +290,15 @@ if [ -z "$probe_dir" ]; then
     report_skip 'sharun probe (no cross-glibc sysroot)'
 else
     loader_arms_run=$((loader_arms_run + 1))
+
+    # Named relative to its own directory. Under --sysroot an absolute path is a
+    # guest path, and /tmp never falls through to the host
+    # (is_sysroot_backed_temp_path in src/syscall/proc-state.c), so a checkout
+    # under /tmp resolved its own probe into the sysroot.
     expect_marker 'sharun probe (dlopen, rpath, threads, fork)' \
         "$expected" probe env SHARUN_FIXTURE_MARKER=ok SHARUN_DIR=/sharun \
-        "$elfuse" --sysroot "$probe_sysroot" "$probe_dir/probe"
+        sh -c 'cd "$1" && exec "$2" --sysroot "$3" ./probe' sh \
+        "$probe_dir" "$elfuse" "$probe_sysroot"
 fi
 
 # Arms 5 and 6 only exist inside a bundle. Whenever arm 4 cannot run they still

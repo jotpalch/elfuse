@@ -1,40 +1,28 @@
 /*
- * EL1 shim globals (identity cache + attention flag)
+ * EL1 shim globals: the host-published cache the EL1 fast paths read
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * A small struct of host-published values that the EL1 shim consumes to serve
- * identity syscalls (getpid 172, getppid 173, getuid 174, geteuid 175, getgid
- * 176, getegid 177) without an HVC round-trip.
+ * Host-published values the EL1 shim serves without an HVC round trip: identity
+ * (getpid 172 through getegid 177, gettid, getpgid/getsid), an entropy ring for
+ * /dev/urandom, and a futex fast path.
  *
- * The cache lives at the start of the shim_data block (high IPA, inside the
- * infra reserve). Three layered protections keep guest EL0 code from MAP_FIXED
- * / MREMAP / MADVISE-spoofing the cache:
+ * The cache sits at the start of the shim_data block, inside the infra reserve,
+ * addressed through TPIDR_EL1. The host installs that register at every vCPU
+ * init site (bootstrap, fork-child, CLONE_THREAD, exec re-init); nothing else
+ * in elfuse uses it, and EL1 MRS/MSR of it is untrapped.
  *
- *   - sys_mmap MAP_FIXED rejects ranges hitting infra
- *   - sys_munmap and sys_mprotect reject infra ranges
- *   - sys_mremap (all variants) and sys_madvise reject infra ranges
+ * Guest EL0 cannot reach the cache. The block is MEM_PERM_RW_EL1_ONLY
+ * (AP[2:1]=00), so an EL0 dereference faults, and gva_translate_perm refuses
+ * EL1-only descriptors on EL0-behalf walks. Remapping it away is refused by
+ * sys_mmap MAP_FIXED, munmap, mprotect, mremap and madvise, all of which reject
+ * infra ranges. /proc/self/maps discloses the span as PROT_NONE.
  *
- * Direct EL0 store to the cache GVA is defended: the shim_data block is mapped
- * AP[2:1]=00 (RW at EL1, no EL0 access), so a guest EL0 dereference of the
- * cache base faults to the SIGSEGV path rather than spoofing values.
- * gva_translate_perm refuses MEM_PERM_EL1_ONLY descriptors on EL0-behalf walks,
- * and the EL1 shim retains full RW. /proc/self/maps still lists [shim-data] but
- * reports it PROT_NONE (region tracking is independent of EL0 access), so the
- * layout is disclosed without granting a usable mapping. The elfuse threat
- * model treats the guest as the user's own binary, not adversarial; this
- * mapping closes the direct-write spoofing gap as defense in depth.
- *
- * The shim addresses the cache via TPIDR_EL1, which the host sets at every vCPU
- * init point (bootstrap, fork-child, CLONE_THREAD, exec re-init). TPIDR_EL1 is
- * unused by elfuse aside from this and is not trapped under default HCR_EL2
- * settings at EL1.
- *
- * Memory ordering: each publish uses __ATOMIC_RELEASE. The shim reads the
- * attention flag with LDAR (acquire) to pair with the release. Identity slot
- * reads stay plain LDR -- each is independent and naturally-aligned 64-bit
- * loads are single-copy atomic on AArch64.
+ * Ordering: publishes are release-stores; the shim's attention read is LDAR.
+ * Identity slots are read with plain LDR, which is sufficient because each is
+ * independent and a naturally-aligned 64-bit load is single-copy atomic on
+ * AArch64.
  */
 
 #pragma once
@@ -44,62 +32,52 @@
 
 #include "core/guest.h"
 
-/* Layout within shim_data_base (offsets are bytes from the cache base which
- * equals shim_data_base; the shim's TPIDR_EL1 holds exactly this address).
+/* Offsets are bytes from the cache base, which equals shim_data_base and is
+ * what TPIDR_EL1 holds.
  *
- * Attention flag sits at offset 0 so the shim's LDAR (which only supports a
- * register base with no immediate offset) can load it via 'ldar w_, [x12]'
- * where x12 = mrs tpidr_el1. Identity slots follow 8-byte-aligned, with PID at
- * offset 0x08; the shim adds 8 to the base and then indexes by (X8 - 172) * 8
- * to land on the requested slot. Attention=0 takes the fast path; nonzero
- * forces HVC.
- *
- * Slice A ships attention as always-zero (the setter API exists but is only
- * called from cred publish in Slice B). The fast path is gated already so Slice
- * B can wire signal_queue / setitimer / exit- group setters without further
- * shim changes.
+ * Attention sits at offset 0 because LDAR takes a register base with no
+ * immediate offset, so the shim loads it as 'ldar w_, [x12]' straight off
+ * TPIDR_EL1. Zero takes the fast path, any bit set forces HVC. Identity slots
+ * follow 8-byte aligned from 0x08, indexed by (X8 - 172) * 8.
  */
 #define SHIM_GLOBALS_OFF_ATTN 0x00
 
-/* Stats gate: single byte at offset 0x04 (inside the natural 4-byte pad between
- * the uint32 attention flag and the 8-byte-aligned identity slots at 0x08).
- * Nonzero enables the COUNTER_INC body in the EL1 shim; zero (the default)
- * makes COUNTER_INC a single ldrb + cbz so disabled stats cost one cache-hot
- * byte load instead of the full load-add-store-to-shared-counter-line that was
- * paid on every fast path before. The byte lives in the same 64-byte cache line
- * as the attention flag, so the gate load piggybacks on the line the shim's
- * LDAR already pulls into L1 -- no extra coherence traffic in the common case.
- *
- * Plain release-store on publish: the gate is read once per fast-path tail with
- * relaxed semantics, and we accept a window after env-var resolution where an
- * in-flight syscall still sees the old value.
+/* Stats gate, one byte in the pad between attention and the identity slots.
+ * Nonzero enables the COUNTER_INC body; zero reduces it to ldrb + cbz. It
+ * shares attention's cache line, so the gate load rides the line the shim's
+ * LDAR already pulled in. Published with a plain release-store, which leaves a
+ * window after env-var resolution where an in-flight syscall reads the old
+ * value; that costs a counter, not correctness.
  */
 #define SHIM_GLOBALS_OFF_STATS_EN 0x04
 
-/* Attention is a bitmask, not a boolean. Splitting it by owner lets the HVC #5
- * epilogue's recompute (which polls signal/itimer state) coexist with the
- * cred-publish bracket without clobbering it. The shim still does a single cbnz
- * on the whole word: any bit set forces the slow path. Bit ownership keeps
- * recompute and cred bracket independent.
+/* Attention is a bitmask rather than a boolean, one bit per owner. The shim
+ * still tests the whole word with one cbnz: any bit set forces the slow path. A
+ * single boolean did not work, because the HVC #5 epilogue's recompute could
+ * drop it to zero mid-publish and reopen the torn-cred window the bracket
+ * exists to close.
  *
- *   ATTN_BIT_SIGTIMER   owned by signal_queue / setitimer / exit_group
- *                       and signal_check_timer's recompute. Set when
- *                       a signal is pending or an itimer is armed.
- *   ATTN_BIT_CRED       owned by CRED_BRACKETED in setuid/setgid
- *                       wrappers. Set across the four-slot publish
- *                       window so concurrent shim readers fall back
- *                       to HVC and see _Atomic-coherent host values.
- *   ATTN_BIT_TRACE      owned by --verbose syscall tracing. Set for the
- *                       lifetime of a verbose run so EL1 shim fast paths
- *                       fall back to HVC and syscall_dispatch can log them.
- *
- * Earlier revisions used a single boolean: a sibling vCPU's recompute dropping
- * it to zero mid-publish reopened the torn-cred window the bracket was meant to
- * close.
+ *   ATTN_BIT_SIGTIMER  signal_queue, setitimer, exit_group, and
+ *                      signal_check_timer's recompute. Set while a signal is
+ *                      pending or an itimer is armed.
+ *   ATTN_BIT_CRED      CRED_BRACKETED in the setuid/setgid wrappers. Set
+ *                      across the four-slot publish so a concurrent reader
+ *                      takes HVC instead of a half-updated cred set.
+ *   ATTN_BIT_TRACE     --verbose. Set for the run so fast paths bail and
+ *                      syscall_dispatch can log them.
+ *   ATTN_BIT_PTRACE    A PTRACE_INTERRUPT owes some thread a stop. Set so an
+ *                      EL1 fast path takes HVC instead of ERETing to EL0,
+ *                      where nothing would trap again until the guest's next
+ *                      syscall and the tracer would wait on it. Cleared when a
+ *                      stop is taken; process-wide, so with two traced threads
+ *                      one clear can drop the hint early, which costs the other
+ *                      thread nothing it did not already have (its own kick
+ *                      still stands).
  */
 #define ATTN_BIT_SIGTIMER 0x00000001u
 #define ATTN_BIT_CRED 0x00000002u
 #define ATTN_BIT_TRACE 0x00000004u
+#define ATTN_BIT_PTRACE 0x00000008u
 
 #define SHIM_IDENTITY_BASE 0x08
 #define SHIM_IDENTITY_OFF_PID 0x08
@@ -119,20 +97,16 @@
  *   0xC0 .. 0x10BF URANDOM_RING        4096-byte CSPRNG ring
  *   0x10C0..0x10C3 URANDOM_RING_LOCK   uint32, producer/consumer lock
  *
- * The bitmap is bit N == 1 iff guest fd N currently refers to an
- * FD_URANDOM-typed entry. The shim's read fast path consults this before
- * serving from the ring; any other fd type falls through to HVC. Host maintains
- * the bitmap from fd_alloc / fd_mark_closed.
+ * Bitmap bit N is set iff guest fd N is an FD_URANDOM entry; the shim checks it
+ * before serving, and every other fd type falls through to HVC. The host
+ * maintains it from fd_alloc and fd_mark_closed.
  *
- * Ring head/tail are byte counters that grow monotonically (uint32); fill =
- * tail - head (uint32 subtract) is the available byte count, pos = head &
- * (URANDOM_RING_SIZE - 1) is the index in the ring. Both cursors are atomic.
- * The shim advances head via LDXR/STXR; the host advances tail via
- * release-store after writing fresh entropy. The producer and shim consumer
- * also take RING_LOCK while touching the ring so the host cannot overwrite a
- * slice after the shim reserves it but before the EL1 copy has loaded it.
- *
- * Size must be a power of two so the index mask is AND of (SIZE - 1).
+ * Head and tail are monotonically growing byte counters, so fill is the uint32
+ * difference tail - head and the ring index is head & (SIZE - 1), which
+ * requires SIZE to be a power of two. The shim advances head with LDXR/STXR,
+ * the host advances tail with a release-store after writing entropy. Both also
+ * hold RING_LOCK across the ring itself, so the host cannot overwrite a slice
+ * between the shim reserving it and the EL1 copy reading it.
  */
 #define SHIM_URANDOM_OFF_BITMAP 0x0038
 #define SHIM_URANDOM_BITMAP_BYTES 128
@@ -142,36 +116,37 @@
 #define SHIM_URANDOM_RING_SIZE 4096
 #define SHIM_URANDOM_OFF_RING_LOCK 0x10C0
 
-/* Upper bound on the per-call byte count served by the shim's urandom/getrandom
- * fast paths. The probe coverage assumes the buffer spans at most two host
- * pages so a first+last byte AT probe suffices; 256 fits comfortably within
- * both 4 KiB and 16 KiB page sizes. The shim itself hardcodes the literal; a
- * static_assert in shim-globals.c pins the C macro to the assembly. Ring wraps
- * are handled inline by splitting the byte copy at the 4 KiB boundary, so this
- * cap is bounded only by probe coverage and per-call ring-fill cost (256 keeps
- * the 4 KiB ring serviceable for 16 sequential reads before host refill).
+/* Per-call cap on the urandom and getrandom fast paths. The bound comes from
+ * probe coverage: the shim AT-probes only the first and last byte, which is
+ * sound only while the buffer spans at most two host pages, and 256 fits that
+ * under both 4 KiB and 16 KiB pages. Ring wrap is handled by splitting the
+ * copy, so nothing else constrains the value. The shim hardcodes the literal; a
+ * static_assert in shim-globals.c pins this macro to it.
  */
 #define SHIM_URANDOM_INLINE_LIMIT 256
 
 /* Fast-path hit / miss counters.
  *
- * 16 uint64 slots placed after the urandom ring lock. The shim's
- * identity_class_fast and urandom_read_fast paths bump the relevant slot on
- * every entry and at every bail point so the host can attribute fast-path
- * activity instead of guessing. Counters are non-atomic plain load-add-store --
- * under multi-vCPU concurrent bails a small fraction of increments race and are
- * lost, which is acceptable for diagnostic ratios. Slots 0..7 cover the eight
- * bail reasons the shim distinguishes (sticky attention, fd out of range, fd
- * not in urandom bitmap, len zero, len over inline cap, ring fill below
- * request, ring wrap, EL0 buffer probe failure). Slots 8..11 record fast-path
- * hits so bail rates can be computed against a hit denominator. Slots 12..15
- * are reserved.
+ * 18 uint64 slots after the ring lock, bumped by identity_class_fast,
+ * urandom_read_fast, futex_wait_fast and futex_wake_fast at every hit and bail
+ * so fast-path activity can be attributed rather than guessed. Slots 0-7 are
+ * bail reasons, 8-11 identity and urandom hits, 12-13 futex wait hits, 14-15
+ * futex wait bails, 16-17 the futex wake path's hit and its one bail.
  *
- * The shim hardcodes the byte offset of each slot; the static_asserts in
- * shim-globals.c keep the C-side macros and the assembly in sync.
+ * Increments are plain load-add-store, so concurrent bails on separate vCPUs
+ * lose a few. These are diagnostic ratios, not accounting.
+ *
+ * The futex shape bail is counted before the attention load, so a SYS_futex the
+ * fast path never serves (a wake, a requeue, a timed wait) lands there whether
+ * or not attention was raised, and ATTN_BAIL counts only what attention
+ * diverted from an otherwise servable shape. See futex_wait_fast in
+ * core/shim.S.
+ *
+ * The shim hardcodes each slot's byte offset; static_asserts in shim-globals.c
+ * keep the two in sync.
  */
 #define SHIM_COUNTERS_OFF 0x10C8
-#define SHIM_COUNTERS_N 16
+#define SHIM_COUNTERS_N 18
 
 #define SHIM_COUNTER_ATTN_BAIL 0
 #define SHIM_COUNTER_URANDOM_FD_OOR 1
@@ -185,6 +160,12 @@
 #define SHIM_COUNTER_URANDOM_HIT 9
 #define SHIM_COUNTER_GETRANDOM_HIT 10
 #define SHIM_COUNTER_PGSID_HIT 11
+#define SHIM_COUNTER_FUTEX_EAGAIN_HIT 12
+#define SHIM_COUNTER_FUTEX_EFAULT_HIT 13
+#define SHIM_COUNTER_FUTEX_SHAPE_BAIL 14
+#define SHIM_COUNTER_FUTEX_MATCH_BAIL 15
+#define SHIM_COUNTER_FUTEX_WAKE_HIT 16
+#define SHIM_COUNTER_FUTEX_WAKE_WAITER_BAIL 17
 
 /* Extended identity slots: pgid and sid.
  *
@@ -193,10 +174,36 @@
  * matches. The host re-publishes after setpgid / setsid / exec / fork so the
  * slots match guest_pgid / guest_sid in proc-identity.c.
  */
-#define SHIM_IDENTITY_OFF_PGID 0x1148
-#define SHIM_IDENTITY_OFF_SID 0x1150
+#define SHIM_IDENTITY_OFF_PGID 0x1158
+#define SHIM_IDENTITY_OFF_SID 0x1160
 
-#define SHIM_GLOBALS_SIZE 0x1158
+/* Per-bucket futex waiter counts, one uint32 per hash bucket of the table in
+ * runtime/futex.c. The shim's wake fast path reads one of these to answer a
+ * FUTEX_WAKE that has nobody to wake: a zero count for the bucket a uaddr
+ * hashes to proves no waiter is parked on that address, and the syscall's whole
+ * result is then 0.
+ *
+ * A count rather than the one-bit-per-slot the urandom bitmap uses, because
+ * waiters nest: two threads on one bucket must not let the first to leave clear
+ * a bit the second still needs. Making the published word the count itself also
+ * removes the set/clear race a separate bit would have.
+ *
+ * Ordering is what makes this safe, and it is the store-buffer pattern. A
+ * waiter publishes its increment before it reads the futex word; the shim
+ * issues DMB ISH after the guest's store to that word and before reading the
+ * count. If the shim then reads zero, any waiter that exists must load the word
+ * after that read, so it sees the store and returns EAGAIN rather than parking.
+ * A stale-high count costs one wasted HVC; a stale-low one would lose a wakeup,
+ * which is why neither side may weaken.
+ *
+ * The shim recomputes the bucket index in assembly, so both the multiplier and
+ * the table size are pinned by static asserts in runtime/futex.c.
+ */
+#define SHIM_FUTEX_BUCKETS 1024u
+#define SHIM_FUTEX_WAITERS_OFF 0x1168
+#define SHIM_FUTEX_WAITERS_BYTES (SHIM_FUTEX_BUCKETS * 4u)
+
+#define SHIM_GLOBALS_SIZE (SHIM_FUTEX_WAITERS_OFF + SHIM_FUTEX_WAITERS_BYTES)
 
 /* Initialize the cache region to all-zero. Called once per process at the same
  * time the shim_data block is set up (initial bootstrap and fork-child). The
@@ -212,12 +219,12 @@ void shim_globals_init(guest_t *g);
  */
 void shim_globals_publish_pid(guest_t *g, int64_t pid, int64_t ppid);
 
-/* Publish all four credential slots. Slot writes are independent 64-bit atomic
- * stores; concurrent shim reads on another vCPU may see partial updates. Slice
- * B's attention bracket eliminates that race; until then, callers must accept
- * that a concurrent getuid+geteuid sequence on a different vCPU can witness a
- * torn cred set across a setresuid moment. Linux semantics require an atomic
- * cred swap; bracket via attention closes that gap.
+/* Publish all four credential slots. The writes are independent 64-bit stores,
+ * so this alone would let a sibling vCPU witness a half-updated cred set where
+ * Linux requires an atomic swap. Callers must publish inside the ATTN_BIT_CRED
+ * bracket, which forces concurrent readers to HVC for the duration;
+ * CRED_BRACKETED in src/syscall/syscall.c is that bracket, and
+ * src/syscall/exec.c open-codes it.
  */
 void shim_globals_publish_creds(guest_t *g,
                                 uint32_t uid,
@@ -244,20 +251,16 @@ void shim_globals_publish_pgsid(guest_t *g, int64_t pgid, int64_t sid);
  */
 uint64_t shim_globals_gva(const guest_t *g);
 
-/* Pre-flight validation that hv_vcpu_set_sys_reg + hv_vcpu_get_sys_reg
- * round-trip on TPIDR_EL1. Writes a sentinel and reads it back via the same HVF
- * accessors the bootstrap uses; aborts (log_error + -1) on mismatch. ARM
- * documents TPIDR_EL1 as ordinary EL1 thread/CPU pointer storage with no HCR
- * trap on the EL1-side MRS/MSR.
+/* Write a sentinel to TPIDR_EL1 and read it back through the same HVF accessors
+ * bootstrap uses, to catch a broken round trip before it becomes a stale cache
+ * base.
  *
- * Note: this test runs BEFORE the first hv_vcpu_run; it does not verify that
- * HVF preserves the register across vCPU run/exit boundaries. The existing
- * test-shim-identity microbench is the end-to-end check for that property -- if
- * HVF clobbered TPIDR_EL1, every identity-class fast path would observe a stale
- * base and test-shim-identity would fail on the first iteration after
- * remap_vdso_page.
+ * Returns 0, or -1 after log_error on mismatch.
  *
- * Returns 0 on success, -1 on failure.
+ * This runs before the first hv_vcpu_run, so it says nothing about whether HVF
+ * preserves the register across run/exit. test-shim-identity is the end-to-end
+ * check for that: a clobbered TPIDR_EL1 makes every identity fast path read a
+ * stale base and fails it on the first iteration.
  */
 int shim_globals_self_test(hv_vcpu_t vcpu);
 
@@ -266,22 +269,14 @@ int shim_globals_self_test(hv_vcpu_t vcpu);
  */
 int shim_globals_install_tpidr(hv_vcpu_t vcpu, const guest_t *g);
 
-/* Install CONTEXTIDR_EL1 = tid for the gettid shim fast path. The register is
- * per-vCPU and unused elsewhere in elfuse (HVF preserves it across hv_vcpu_run
- * alongside the rest of EL1 state). The shim answers SVC #0 with X8 == 178
- * (gettid) by emitting a single 'mrs x0, CONTEXTIDR_EL1' and an 'eret',
- * skipping the HVC #5 round-trip the same way the identity slot loads do for
- * syscalls 172-177. Caller passes the Linux tid; it is zero/sign-extended into
- * the 64-bit sysreg slot.
+/* Install CONTEXTIDR_EL1 = tid, which is where the gettid fast path reads from:
+ * the shim answers SVC #0 with X8 == 178 as one mrs plus an eret. The register
+ * is per-vCPU, preserved by HVF across hv_vcpu_run, and unused elsewhere in
+ * elfuse, which is why the tid can live there.
  *
- * Setup sites:
- *   bootstrap.c                  initial main thread (tid == pid)
- *   forkipc.c fork-child main    tid == child pid
- *   forkipc.c CLONE_THREAD       tid == thread's allocated guest_tid
- *   forkipc.c CLONE_VM           tid == child's guest_tid
- *
- * sys_execve reuses the vCPU and the main thread's tid does not change across
- * exec, so no re-set is required there.
+ * Set at each vCPU init site: bootstrap for the main thread (tid == pid), and
+ * forkipc for the fork child, CLONE_THREAD and CLONE_VM. sys_execve reuses the
+ * vCPU and does not change the tid, so it does not re-set this.
  */
 int shim_globals_install_tid(hv_vcpu_t vcpu, int64_t tid);
 
@@ -296,28 +291,28 @@ int shim_globals_install_per_vcpu(hv_vcpu_t vcpu,
                                   const guest_t *g,
                                   int64_t tid);
 
-/* Attention flag setters (Slice B).
+/* The SIGTIMER lane of the attention word. The shim reads attention with LDAR
+ * before anything else and takes HVC #5 when it is nonzero, so the host's
+ * epilogue can deliver a pending signal or itimer expiry.
  *
- * The shim's identity fast path reads the attention flag with LDAR before doing
- * anything else. When nonzero, the shim falls back to HVC #5 so the host's
- * post-syscall epilogue can deliver any pending signal or itimer expiry.
+ * raise_attention ORs in ATTN_BIT_SIGTIMER, leaving the other lanes alone, and
+ * then interrupts every sibling vCPU. The interrupt is what makes the raise
+ * visible promptly: a vCPU spinning on an EL1 fast path never traps, so without
+ * it the raise waits for that thread's timeslice to end.
  *
- * shim_globals_raise_attention sets the flag to 1 atomically (release) and also
- * issues hv_vcpus_exit on every sibling vCPU so any vCPU already spinning in
- * EL0 drops out of hv_vcpu_run and re-checks the flag on the next entry.
- * Without the exit, a tight identity loop on one vCPU could ignore an attention
- * raise on another vCPU until its timeslice ended.
+ * recompute_attention re-derives the same bit from signal_pending, any armed
+ * guest itimer, and exit_group, and is called from the HVC #5 epilogue after
+ * signal_check_timer to clear it once that work has drained.
  *
- * shim_globals_recompute_attention re-derives the flag from (signal_pending OR
- * any guest_itimer active OR exit_group requested). Called from the HVC #5
- * epilogue after signal_check_timer to drop the flag back to zero whenever the
- * slow-path workload has drained.
- *
- * The g pointer in both is necessary because the cache is per-guest. Slice B's
- * signal.c hooks call these via a singleton guest pointer registered at process
- * init (see signal_set_shim_globals_guest in src/syscall/signal.h).
+ * Both take g because the cache is per-guest; signal.c reaches them through the
+ * singleton registered at process init (signal_set_shim_globals_guest).
  */
 void shim_globals_raise_attention(guest_t *g);
+
+/* Raise or drop the ptrace lane. Separate from the signal lane's
+ * raise/recompute pair because the thread consuming the stop drops it.
+ */
+void shim_globals_ptrace_attention(guest_t *g, bool owed);
 void shim_globals_recompute_attention(guest_t *g);
 void shim_globals_set_trace_enabled(guest_t *g, bool enabled);
 
@@ -332,21 +327,16 @@ void shim_globals_attn_and(guest_t *g, uint32_t mask);
 
 /* Urandom bitmap maintenance.
  *
- * The fd-type bitmap is updated by the fd table whenever an FD_URANDOM slot
- * opens or closes (including dup, fork-IPC restore, etc.). The shim's
- * read-fast-path consults the bitmap with a single 64-bit load and a bit test
- * to decide whether the requested fd should hit the urandom ring or fall
- * through to HVC.
+ * The fd table updates the bitmap whenever an FD_URANDOM slot opens or closes,
+ * dup and fork-IPC restore included; the shim reads it with one 64-bit load and
+ * a bit test to decide ring or HVC. Updates are atomic OR/AND on the affected
+ * word, so a sibling vCPU dup'ing into a freshly opened slot cannot lose either
+ * bit.
  *
- * Updates use atomic OR/AND on the affected 64-bit word so concurrent dup races
- * (sibling vCPU dup'ing into a freshly-opened slot) cannot lose either bit.
- * Storing as uint64 rather than per-bit-CAS keeps the host hook trivial.
- *
- * shim_globals_set_singleton publishes the live guest_t * so the fd-table hooks
- * can update the bitmap without threading g through every fd_alloc /
- * fd_mark_closed call site. Same NULL-or-same lifecycle assertion as the
- * signal.c singleton. Call from bootstrap (initial) and fork-child (after
- * guest_init).
+ * set_singleton publishes the live guest_t * so the fd-table hooks need not
+ * thread g through every fd_alloc and fd_mark_closed. Called from bootstrap and
+ * from fork-child after guest_init, with the same NULL-or-same lifecycle
+ * assertion as the signal.c singleton.
  */
 void shim_globals_set_singleton(guest_t *g);
 
@@ -367,27 +357,21 @@ void shim_globals_mark_urandom_fd(int fd, bool is_urandom);
  */
 void shim_globals_rebuild_urandom_bitmap(void);
 
-/* Refill the entropy ring with fresh CSPRNG bytes from arc4random_buf. Called
- * from the host's sys_read slow path when a FD_URANDOM read encounters an empty
- * (or low-water) ring. The fill always brings tail up to head +
- * URANDOM_RING_SIZE so the ring is full after refill.
+/* Refill the ring from arc4random_buf, bringing tail up to head + RING_SIZE.
+ * Called from the sys_read slow path when an FD_URANDOM read finds the ring
+ * empty or low.
  *
- * The initial fill is NOT done by shim_globals_init (which only zeros the
- * cache). Every bring-up path that uses the urandom fast path must call this
- * explicitly after shim_globals_init: bootstrap.c does it during VM bring-up,
- * src/syscall/exec.c does it on execve, and src/runtime/forkipc.c does it on
- * the fork-child receive path. Any future init site that forgets this call
- * leaves the ring empty, so the first urandom read on that vCPU is forced
- * through the host SVC.
+ * shim_globals_init only zeros the cache, so every bring-up path that wants the
+ * fast path must call this after it: bootstrap during VM bring-up, exec.c on
+ * execve, forkipc.c on the fork-child receive. An init site that forgets leaves
+ * the ring empty and forces the first urandom read through HVC.
  */
 void shim_globals_refill_urandom_ring(guest_t *g);
 
-/* Counter access for diagnostics. shim_globals_counter_get returns the
- * cumulative slot value (lossy under multi-vCPU bail contention; see the
- * comment block on SHIM_COUNTERS_OFF). slot must be in [0, SHIM_COUNTERS_N).
- * shim_globals_counters_dump writes a one-line-per-slot summary to out with the
- * SHIM_COUNTER_* names and current values; intended for use at process exit
- * when ELFUSE_SHIM_STATS is set.
+/* Diagnostics. counter_get returns one slot, which must be in [0,
+ * SHIM_COUNTERS_N) and is lossy under concurrent bails (see SHIM_COUNTERS_OFF).
+ * counters_dump writes the whole table by name, for process exit under
+ * ELFUSE_SHIM_STATS.
  */
 uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot);
 void shim_globals_counters_dump(const guest_t *g);
@@ -399,12 +383,22 @@ void shim_globals_counters_dump(const guest_t *g);
  */
 bool shim_globals_stats_enabled(void);
 
-/* Publish the stats gate byte at SHIM_GLOBALS_OFF_STATS_EN based on
- * shim_globals_stats_enabled(). The EL1 shim's COUNTER_INC loads this byte and
- * skips the counter increment when zero, so an unset ELFUSE_SHIM_STATS pays
- * only a single cache-hot ldrb on each fast-path tail instead of a full
- * load-add-store on a shared counter line. Call after every shim_globals_init:
- * bootstrap, fork-child receive, and execve. The byte stays zero on a fresh
- * shim_globals_init unless this publisher runs.
+/* Publish the stats gate byte from shim_globals_stats_enabled(). Call after
+ * every shim_globals_init (bootstrap, fork-child receive, execve): init zeros
+ * the byte, and only this restores it, so an init site that skips this leaves
+ * counters silently off.
  */
 void shim_globals_publish_stats_gate(guest_t *g);
+
+/* Adjust the published waiter count for one futex bucket. delta is +1 on entry
+ * to a wait and -1 on the way out, seq_cst both ways: the increment has to be
+ * ordered against the waiter's own read of the futex word, which is what lets
+ * the shim treat a zero count as proof that nobody is parked.
+ *
+ * A NULL guest answers rather than faulting, so a caller does not have to test
+ * for one. That is the only case handled: a non-NULL guest whose slab is not
+ * mapped yet is not, and no wait path can reach here before bring-up, since
+ * they all run on behalf of a guest thread that is already executing.
+ */
+void shim_globals_futex_waiters_add(guest_t *g, unsigned bucket, int delta);
+uint32_t shim_globals_futex_waiters_get(const guest_t *g, unsigned bucket);

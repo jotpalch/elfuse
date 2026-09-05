@@ -1424,13 +1424,18 @@ static const char *elfuse_self_path(int *len_out)
     return elfuse_self_path_buf;
 }
 
-int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+/* Open the signal-transport file of another elfuse process for append.
+ *
+ * Refuses a host pid that is not (or is no longer) an elfuse process: if it was
+ * recycled onto an unrelated program, a raw SIGUSR2 would terminate it. A
+ * sub-microsecond exit and pid reuse between this check and the kill() the
+ * caller issues still lands the signal on the wrong process.
+ *
+ * Sets errno and returns -1 on every failure, so the callers report it as their
+ * own.
+ */
+static int proc_open_transport(pid_t host_pid)
 {
-    /* Refuse to signal a host pid that is not (or is no longer) an elfuse
-     * process: if it was recycled onto an unrelated program, a raw SIGUSR2
-     * would terminate it. A sub-microsecond exit and pid reuse between this
-     * check and kill() still lands the signal on the wrong process.
-     */
     int our_len;
     const char *our_path = elfuse_self_path(&our_len);
     char tpath[PROC_PIDPATHINFO_MAXSIZE];
@@ -1446,9 +1451,13 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
         errno = ENAMETOOLONG;
         return -1;
     }
+    return open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                0600);
+}
 
-    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-                  0600);
+int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+{
+    int fd = proc_open_transport(host_pid);
     if (fd < 0)
         return -1;
 
@@ -1613,23 +1622,7 @@ static int proc_send_reparent(pid_t host_pid,
                               int64_t target_guest_pid,
                               int64_t new_ppid)
 {
-    int our_len;
-    const char *our_path = elfuse_self_path(&our_len);
-    char tpath[PROC_PIDPATHINFO_MAXSIZE];
-    int tlen = proc_pidpath(host_pid, tpath, sizeof(tpath));
-    if (our_len <= 0 || tlen != our_len ||
-        memcmp(tpath, our_path, our_len) != 0) {
-        errno = ESRCH;
-        return -1;
-    }
-
-    char path[PATH_MAX];
-    if (!signal_transport_path(path, sizeof(path), host_pid)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-                  0600);
+    int fd = proc_open_transport(host_pid);
     if (fd < 0)
         return -1;
 
@@ -1913,17 +1906,33 @@ int64_t sys_ptrace(guest_t *g,
             return 0; /* Already stopped */
         }
 
-        /* If the tracee is still in vCPU bring-up (handle not yet published),
-         * hv_vcpus_exit cannot reach it, and dropping the interrupt would lose
-         * it silently. Record it instead: the worker checks this flag at
-         * publish and self-kicks so the interrupt is delivered before it runs
-         * any guest code. This serializes against the worker's publish (also
-         * under thread_lock), so exactly one of the two paths delivers it.
+        /* Record the stop as owed in every case, then kick. The flag used to
+         * mean only "the vCPU was still in bring-up, so hv_vcpus_exit could not
+         * reach it"; it now means "a stop is owed", because the kick alone was
+         * never sufficient. It can land while the tracee sits at EL1 in a shim
+         * fast path, and stopping there snapshots shim scratch as the guest's
+         * registers (thread_ptrace_stop reads the live set) and discards
+         * whatever the tracer writes back, since the shim restores its own
+         * frame over it. The HVC #5 epilogue consumes the flag and then either
+         * stops right there, on the tails whose live registers are already the
+         * final EL0 set, or asks the shim through X7 to restore the frame and
+         * come back at HVC #13. The canceled-exit handler consumes it once it
+         * has established the vCPU is at EL0.
+         *
+         * Attention goes up before the kick, the same order
+         * shim_globals_raise_attention uses and for the same reason: a fast
+         * path that has already tested it must not be the one that decides. It
+         * is what stops a tracee interrupted at EL1 from ERETing to EL0 and
+         * computing indefinitely with the stop still owed.
+         *
+         * Bring-up keeps its own arm of this: a vCPU with no published handle
+         * cannot be kicked, and the worker self-kicks at publish. Both run
+         * under thread_lock, so exactly one of them delivers.
          */
+        target->ptrace_interrupt_pending = true;
+        shim_globals_ptrace_attention(g, true);
         if (target->vcpu_valid)
             hv_vcpus_exit(&target->vcpu, 1);
-        else
-            target->ptrace_interrupt_pending = true;
         pthread_mutex_unlock(tlock);
         return 0;
     }
@@ -2295,6 +2304,78 @@ static void proc_deferred_reap_poll(void)
     pthread_mutex_unlock(&pid_lock);
 }
 
+/* Publish a wait4 report to the guest and release the slot.
+ *
+ * Returns the guest pid, or -LINUX_EFAULT when the guest buffers cannot be
+ * written. The slot is deactivated on every path, since another thread may have
+ * reaped it in the meantime.
+ */
+static int64_t proc_publish_wait_report(guest_t *g,
+                                        pid_t host_pid,
+                                        int64_t gpid,
+                                        int status,
+                                        const struct rusage *ru,
+                                        uint64_t status_gva,
+                                        uint64_t rusage_gva)
+{
+    if (WIFEXITED(status) || WIFSIGNALED(status))
+        status = lifecycle_guest_terminal_status(gpid, status);
+
+    /* Credit CPU only on a terminal report, and re-test after the translation
+     * above rather than reusing its result. mac_options may carry
+     * WUNTRACED/WCONTINUED, and a stop or continue report is a snapshot of a
+     * still-running child: crediting it here would count the same child again
+     * at each of its stop, continue, and final exit reports.
+     */
+    if (WIFEXITED(status) || WIFSIGNALED(status))
+        proc_children_cpu_add(ru);
+
+    /* Short-circuit order matters: a failed status write skips the rusage
+     * write, as the two separate exits it replaces did. Child already reaped
+     * either way, so the slot is released before reporting EFAULT, which is
+     * what Linux returns here.
+     */
+    int32_t linux_status = status;
+    int64_t rc = gpid;
+    if ((status_gva && guest_write_small(g, status_gva, &linux_status,
+                                         sizeof(linux_status)) < 0) ||
+        (rusage_gva && write_rusage_to_guest(g, rusage_gva, ru) < 0))
+        rc = -LINUX_EFAULT;
+    proc_deactivate_slot_if_matches(host_pid, gpid);
+    return rc;
+}
+
+/* Reap an entry already marked exited: account it, free the slot, and publish
+ * status and rusage to the guest. The caller holds pid_lock; this releases it
+ * before touching guest memory and never reacquires it, so every caller returns
+ * straight after.
+ *
+ * Returns the guest pid, or a negative Linux errno when the guest buffers
+ * cannot be written.
+ */
+static int64_t proc_reap_exited_and_unlock(guest_t *g,
+                                           proc_entry_t *entry,
+                                           uint64_t status_gva,
+                                           uint64_t rusage_gva)
+{
+    int64_t gpid = entry->guest_pid;
+    int32_t linux_status = entry->exit_status;
+    struct rusage ru = entry->rusage;
+    bool ru_valid = entry->rusage_valid;
+    proc_account_entry_locked(entry);
+    entry->active = false;
+    pthread_mutex_unlock(&pid_lock);
+    lifecycle_consume(gpid);
+    if (status_gva && guest_write_small(g, status_gva, &linux_status,
+                                        sizeof(linux_status)) < 0)
+        return -LINUX_EFAULT;
+    if (rusage_gva &&
+        write_rusage_to_guest(g, rusage_gva,
+                              ru_valid ? &ru : &(struct rusage) {0}) < 0)
+        return -LINUX_EFAULT;
+    return gpid;
+}
+
 int64_t sys_wait4(guest_t *g,
                   int pid,
                   uint64_t status_gva,
@@ -2352,23 +2433,8 @@ int64_t sys_wait4(guest_t *g,
                 found_any_child = true;
                 if (proc_table[i].exited) {
                     /* Already reaped (from CLONE_VFORK wait) */
-                    int64_t gpid = proc_table[i].guest_pid;
-                    int32_t linux_status = proc_table[i].exit_status;
-                    struct rusage ru = proc_table[i].rusage;
-                    bool ru_valid = proc_table[i].rusage_valid;
-                    proc_account_entry_locked(&proc_table[i]);
-                    proc_table[i].active = false;
-                    pthread_mutex_unlock(&pid_lock);
-                    lifecycle_consume(gpid);
-                    if (status_gva &&
-                        guest_write_small(g, status_gva, &linux_status,
-                                          sizeof(linux_status)) < 0)
-                        return -LINUX_EFAULT;
-                    if (rusage_gva)
-                        write_rusage_to_guest(
-                            g, rusage_gva,
-                            ru_valid ? &ru : &(struct rusage) {0});
-                    return gpid;
+                    return proc_reap_exited_and_unlock(g, &proc_table[i],
+                                                       status_gva, rusage_gva);
                 }
 
                 if (!proc_table[i].host_waitable) {
@@ -2396,34 +2462,8 @@ int64_t sys_wait4(guest_t *g,
                 pid_t ret =
                     wait4(host_pid, &status, mac_options | WNOHANG, &ru);
                 if (ret > 0) {
-                    if (WIFEXITED(status) || WIFSIGNALED(status))
-                        status = lifecycle_guest_terminal_status(gpid, status);
-
-                    /* Credit CPU only on a terminal report. mac_options may
-                     * carry WUNTRACED/WCONTINUED, and a stop/continue report is
-                     * a snapshot of a still-running child: crediting it here
-                     * would double- or triple-count the same child across its
-                     * stop, continue, and final exit reports.
-                     */
-                    if (WIFEXITED(status) || WIFSIGNALED(status))
-                        proc_children_cpu_add(&ru);
-                    if (status_gva) {
-                        int32_t linux_status = status;
-                        if (guest_write_small(g, status_gva, &linux_status,
-                                              sizeof(linux_status)) < 0) {
-                            /* Child already reaped. Match Linux: return EFAULT
-                             */
-                            proc_deactivate_slot_if_matches(host_pid, gpid);
-                            return -LINUX_EFAULT;
-                        }
-                    }
-                    if (rusage_gva &&
-                        write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                        proc_deactivate_slot_if_matches(host_pid, gpid);
-                        return -LINUX_EFAULT;
-                    }
-                    proc_deactivate_slot_if_matches(host_pid, gpid);
-                    return gpid;
+                    return proc_publish_wait_report(
+                        g, host_pid, gpid, status, &ru, status_gva, rusage_gva);
                 }
                 /* ret == 0 (not exited) or ret < 0 (error): try next */
                 pthread_mutex_lock(&pid_lock);
@@ -2479,22 +2519,8 @@ int64_t sys_wait4(guest_t *g,
     for (size_t i = 0; i < proc_table_capacity; i++) {
         if (proc_table[i].active && proc_table[i].guest_pid == pid) {
             if (proc_table[i].exited) {
-                int64_t gpid = proc_table[i].guest_pid;
-                int32_t linux_status = proc_table[i].exit_status;
-                struct rusage ru = proc_table[i].rusage;
-                bool ru_valid = proc_table[i].rusage_valid;
-                proc_account_entry_locked(&proc_table[i]);
-                proc_table[i].active = false;
-                pthread_mutex_unlock(&pid_lock);
-                lifecycle_consume(gpid);
-                if (status_gva &&
-                    guest_write_small(g, status_gva, &linux_status,
-                                      sizeof(linux_status)) < 0)
-                    return -LINUX_EFAULT;
-                if (rusage_gva)
-                    write_rusage_to_guest(
-                        g, rusage_gva, ru_valid ? &ru : &(struct rusage) {0});
-                return gpid;
+                return proc_reap_exited_and_unlock(g, &proc_table[i],
+                                                   status_gva, rusage_gva);
             }
 
             if (!proc_table[i].host_waitable) {
@@ -2543,27 +2569,8 @@ int64_t sys_wait4(guest_t *g,
                 }
             }
             if (ret > 0) {
-                if (WIFEXITED(status) || WIFSIGNALED(status))
-                    status = lifecycle_guest_terminal_status(gpid, status);
-                /* Same terminal-report gate as the P_ALL branch above. */
-                if (WIFEXITED(status) || WIFSIGNALED(status))
-                    proc_children_cpu_add(&ru);
-                if (status_gva) {
-                    int32_t linux_status = status;
-                    if (guest_write_small(g, status_gva, &linux_status,
-                                          sizeof(linux_status)) < 0) {
-                        proc_deactivate_slot_if_matches(host_pid, gpid);
-                        return -LINUX_EFAULT;
-                    }
-                }
-                if (rusage_gva &&
-                    write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                    proc_deactivate_slot_if_matches(host_pid, gpid);
-                    return -LINUX_EFAULT;
-                }
-                /* Re-validate slot: another thread may have reaped it */
-                proc_deactivate_slot_if_matches(host_pid, gpid);
-                return gpid;
+                return proc_publish_wait_report(g, host_pid, gpid, status, &ru,
+                                                status_gva, rusage_gva);
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
             }
@@ -2874,9 +2881,9 @@ void proc_request_hvc6_yield(void)
 }
 
 /* Preemption signals: SIGUSR2 is the cross-process guest-signal doorbell
- * (proc_send_guest_signal), SIGALRM is the main thread's per-iteration safety
- * timeout (armed by alarm() in vcpu_run_loop). Both are consumed by a dedicated
- * sigwait thread rather than a per-thread signal handler.
+ * (proc_send_guest_signal), SIGALRM is the main thread's watchdog tick (a
+ * repeating timer armed once in vcpu_run_loop). Both are consumed by a
+ * dedicated sigwait thread rather than a per-thread signal handler.
  *
  * The reason is Apple HVF: when either signal is delivered to a vCPU thread
  * while it is inside hv_vcpu_run, the run aborts with HV_EXIT_REASON_UNKNOWN
@@ -2891,6 +2898,32 @@ void proc_request_hvc6_yield(void)
  * same-thread async signal handlers.
  */
 static _Atomic int g_timed_out, g_external_guest_signal;
+
+/* Watchdog progress word, written by the guest main thread's run loop and read
+ * by preempt_thread_main. A Linux-style seqlock counter, the same shape the
+ * vvar uses in core/vdso.c: odd means the loop is inside hv_vcpu_run, even
+ * means it is not, and the value changes on every entry and every return.
+ *
+ * The loop used to arm and disarm alarm() around every hv_vcpu_run. On macOS
+ * alarm() is setitimer(ITIMER_REAL), so that was two real syscalls per guest
+ * syscall: measured 693 ns for the pair, against a 1226 ns bare HVF round trip.
+ * It made every host-served syscall on the main thread about 38 percent slower
+ * than the same syscall on a worker, which passes timeout_sec == 0 and skipped
+ * the alarm entirely. Single-threaded guests run wholly on the main thread, so
+ * that was most of the emulator's syscall cost.
+ *
+ * The timer is now a repeating one, armed once with an it_interval, and a tick
+ * that finds this word odd and unchanged since the previous tick has seen no
+ * progress for a whole period. One word rather than a flag beside a counter is
+ * what keeps that decision free of any ordering argument: a single atomic
+ * object has one modification order, so relaxed access is enough and there is
+ * no pairing to get wrong. An earlier revision split the state in two and got
+ * the pairing wrong twice.
+ *
+ * Detection therefore takes one to two periods rather than exactly one, which
+ * for a ten-second backstop is not a property anything depends on.
+ */
+static _Atomic uint64_t g_vcpu_progress;
 
 static pthread_t g_preempt_thread;
 static bool g_preempt_started;
@@ -2922,6 +2955,20 @@ static void *preempt_thread_main(void *arg)
             drain_external_guest_signal();
             wakeup_pipe_signal();
         } else if (sig == SIGALRM) {
+            static uint64_t last_progress;
+            uint64_t now =
+                atomic_load_explicit(&g_vcpu_progress, memory_order_relaxed);
+            bool wedged = (now == last_progress) && (now & 1);
+
+            last_progress = now;
+
+            /* Progress since the last tick, or not in the guest at all: say
+             * nothing, because interrupting here would hand a spurious EINTR to
+             * whatever the guest is waiting on. The timer repeats on its own
+             * interval, so there is nothing to re-arm.
+             */
+            if (!wedged)
+                continue;
             atomic_store_explicit(&g_timed_out, 1, memory_order_release);
         }
         thread_interrupt_all();
@@ -3813,25 +3860,612 @@ static bool vcpu_handle_el0_fault(guest_t *g,
     return sig_ret >= 0;
 }
 
+/* Consume this thread's owed stop. The pending scan and attention clear share
+ * thread_lock with PTRACE_INTERRUPT so a racing request cannot lose its hint.
+ */
+static bool ptrace_consume_owed_stop(guest_t *g)
+{
+    if (!current_thread)
+        return false;
+
+    pthread_mutex_t *tlock = thread_get_lock();
+    pthread_mutex_lock(tlock);
+    bool owed = current_thread->ptrace_interrupt_pending &&
+                current_thread->ptraced && !current_thread->ptrace_stopped;
+    if (owed)
+        current_thread->ptrace_interrupt_pending = false;
+    if (owed && !thread_ptrace_interrupt_pending_locked())
+        shim_globals_ptrace_attention(g, false);
+    pthread_mutex_unlock(tlock);
+
+    return owed;
+}
+
+/* Set where the syscall epilogue asks the shim for the HVC #13 detour, cleared
+ * where that detour arrives. Per-vCPU like cpu_tlbi_req and for the same
+ * reason: the thread that arms it is the thread that takes the stop.
+ *
+ * The window between the two is the X7 test, the frame restore, and the HVC,
+ * with nothing else reachable in between. A canceled exit can land there, and
+ * the flag has to survive that, which is why it is not cleared per exit; the
+ * canceled handler sees EL1 in CPSR and resumes into the same window. No other
+ * HVC is reachable from the SVC tail, and EL0 cannot issue one at all, so an
+ * unarmed HVC #13 means the shim and this file disagree.
+ */
+static _Thread_local bool cpu_ptrace_stop_armed;
+
+/* Take a consumed ptrace-stop and inject the tracer's resume signal. Every
+ * caller has already consumed the stop, which establishes current_thread.
+ */
+static bool ptrace_take_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
+{
+    int cont_sig = thread_ptrace_stop(current_thread, SIGTRAP);
+    if (cont_sig > 0)
+        signal_queue(cont_sig);
+
+    /* One delivery covers both the injected resume signal and anything that
+     * arrived while the tracee was stopped, so neither caller repeats it.
+     */
+    return !signal_pending() || signal_deliver(vcpu, g, exit_code) >= 0;
+}
+
+/* What a run-loop exit handler tells the loop to do next. VCPU_RESUME means the
+ * exit was handled and the vCPU should re-enter the guest; VCPU_STOP means
+ * leave the loop with *exit_code, which the handler has already set.
+ */
+typedef enum {
+    VCPU_RESUME,
+    VCPU_STOP,
+} vcpu_action_t;
+
+/* Guest exception handling, lifted out of vcpu_run_loop_with_hooks alongside
+ * the canceled-exit arm.
+ *
+ * Same reason as its sibling and one more: at 466 lines the loop was still over
+ * the 400 the size lint allows, and carried a NOLINT for it. What was left was
+ * two unrelated jobs sharing a body, an HVC dispatch and a debug-exception
+ * dispatch, neither of which the other's reader needs. Split out, the loop is
+ * what its name says: run the vCPU, dispatch on why it stopped.
+ *
+ * running is local and returned as the action rather than assigned through a
+ * pointer, because two arms below read it back (the post-exec ELR check and the
+ * signal delivery both skip themselves once something has failed) and a caller
+ * flag would not be visible to them.
+ */
+
+/* Finish an HVC #5 return: take or defer any owed ptrace-stop, deliver pending
+ * signals, and place the shim's X7 detour request.
+ *
+ * Returns whether the guest keeps running.
+ */
+static bool syscall_return_epilogue(guest_t *g,
+                                    hv_vcpu_t vcpu,
+                                    int ret,
+                                    bool running,
+                                    int *exit_code)
+{
+    /* Whether the shim's tail restores the saved frame is what decides if X7 is
+     * host-only. The vector entry clobbers no GPR below X9, so the live set at
+     * HVC #5 is still the guest's, and only that restore puts a host write to
+     * X7 back. Two tails skip it: X8 == 2, where the host has rebuilt EL0 state
+     * and the live registers are already final, and an execve re-entry, which
+     * goes through the MMU-off _start with no tail at all.
+     *
+     * Only the exec-happened return has to ask the vCPU which of those it is.
+     * Everywhere else tlbi_request_emit_to_vcpu has just written X8 itself and
+     * never writes 2, so the answer is known without the register read.
+     */
+    bool frame_restored = ret != SYSCALL_EXEC_HAPPENED;
+    bool regs_final = false;
+    if (!frame_restored) {
+        uint64_t x8_req = 0;
+        hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8_req);
+        regs_final = x8_req == 2; /* rt_sigreturn, as against execve */
+    }
+
+    /* An execve re-entry leaves the stop owed rather than consuming it: there
+     * is no tail to carry X7, and stopping on the MMU-off bootstrap state would
+     * show the tracer an EL1 PC. Attention stays raised, so the new image's
+     * first syscall takes it.
+     */
+    bool defer_stop = false, stop_taken = false;
+    if (running && (frame_restored || regs_final) &&
+        ptrace_consume_owed_stop(g)) {
+        if (regs_final) {
+            /* Live registers are already the architectural EL0 set, which is
+             * what the detour exists to produce. Stop here instead.
+             */
+            running = ptrace_take_stop(g, vcpu, exit_code);
+            stop_taken = true;
+        } else {
+            defer_stop = true;
+        }
+    }
+
+    /* Deliver pending signals after each syscall. A deferred stop takes its
+     * signal in the HVC #13 handler, once the shim has restored the frame.
+     * signal_deliver is a once-per-epilogue call by its own contract: it walks
+     * past discarded signals to the first the guest can see, and a second call
+     * here would stack a frame on the handler the first one just installed.
+     * ptrace_take_stop has already made that call on the inline path.
+     */
+    if (running && !defer_stop && !stop_taken && signal_pending()) {
+        int sig_ret = signal_deliver(vcpu, g, exit_code);
+        if (sig_ret < 0)
+            running = false; /* Default TERM/CORE disposition */
+        else if (sig_ret > 0)
+            frame_restored = false; /* committed to a handler frame: X8 = 2 */
+    }
+
+    /* X7 asks the shim to restore its SVC frame and enter HVC #13 for this
+     * stop. Written only on the tails that do restore the frame, which put the
+     * guest's own X7 back before the ERET. The flag beside it is what lets the
+     * HVC #13 arm say a stop was actually asked for.
+     */
+    if (frame_restored) {
+        hv_vcpu_set_reg(vcpu, HV_REG_X7, defer_stop);
+        cpu_ptrace_stop_armed = defer_stop;
+    }
+
+    return running;
+}
+
+static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
+                                                hv_vcpu_t vcpu,
+                                                const hv_vcpu_exit_t *vexit,
+                                                bool verbose,
+                                                const char *prefix,
+                                                int *exit_code)
+{
+    bool running = true;
+
+    uint32_t ec = (vexit->exception.syndrome >> 26) & 0x3F;
+
+    if (ec == 0x16) {
+        /* HVC exit */
+        uint16_t imm = vexit->exception.syndrome & 0xFFFF;
+
+        if (verbose)
+            log_debug("%s: HVC #%u", prefix, imm);
+
+        switch (imm) {
+        case 5: {
+            /* HVC #5: Linux syscall forwarding */
+            int ret = syscall_dispatch(vcpu, g, exit_code, verbose);
+            if (ret == 1)
+                running = false;
+
+            /* execve replaced the process image; sys_execve already installed
+             * the new X0/syscall-return state.
+             */
+
+            /* Check guest ITIMER_REAL expiry (queues SIGALRM if due) */
+            signal_check_timer();
+
+            /* Recompute the shim-globals attention flag now that
+             * signal_check_timer has had a chance to drain pending work. If
+             * nothing is pending and no itimer is armed, drop the flag back to
+             * zero so the identity fast path re-engages for the next getpid
+             * loop. Without this clear, the attention flag set by signal_queue
+             * (e.g., on a subprocess's SIGCHLD) would stick forever and
+             * permanently disable the fast path.
+             *
+             * Before the signal delivery below, not after, which costs one
+             * wasted round trip per delivered signal: the recompute still sees
+             * the signal queued, so the flag stays up until the next syscall's
+             * epilogue clears it. Moving it after the delivery recovers that
+             * (ATTN_BAIL fell 9.6 percent on a signal-storm workload) and
+             * crashes tests/test-mmap-sigbus-efault, because the fast paths it
+             * re-engages have no answer for a stage-2 fault on a truncated
+             * MAP_SHARED overlay: EC=0x24 reaches EL2 and no arm handles it.
+             * The clear stays here until that gap is closed.
+             */
+            shim_globals_recompute_attention(g);
+
+            /* Diagnostic: log signal state after exec/sigreturn to help debug
+             * signal delivery issues.
+             */
+            if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
+                uint64_t tblocked = current_thread
+                                        ? thread_blocked_load(current_thread)
+                                        : 0xDEAD;
+                log_debug(
+                    "%s: post-sigreturn state: "
+                    "pending=0x%llx global_blocked=0x%llx "
+                    "thread_blocked=0x%llx signal_pending=%d",
+                    prefix, (unsigned long long) signal_shared_pending_load(),
+                    (unsigned long long) signal_blocked_load(),
+                    (unsigned long long) tblocked, signal_pending());
+            }
+
+            running = syscall_return_epilogue(g, vcpu, ret, running, exit_code);
+
+            /* After exec, verify critical registers before resuming vCPU. This
+             * closes any gap where signal delivery or other code between
+             * sys_execve's sync flush and hv_vcpu_run could have modified
+             * ELR_EL1.
+             */
+            if (running && ret == SYSCALL_EXEC_HAPPENED) {
+                uint64_t verify_elr;
+                hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &verify_elr);
+                if (verify_elr == 0) {
+                    log_fatal(
+                        "%s: ELR_EL1=0 after exec, register sync "
+                        "failed",
+                        prefix);
+                    crash_report(vcpu, g, CRASH_ELR_ZERO,
+                                 "ELR_EL1=0 after exec");
+                    *exit_code = 128;
+                    running = false;
+                }
+            }
+            break;
+        }
+
+        case 0: {
+            /* HVC #0: Normal exit */
+            uint64_t x0;
+            hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+            if (verbose)
+                log_debug("%s: guest exit HVC #0 code=%llu", prefix,
+                          (unsigned long long) x0);
+            *exit_code = (int) x0;
+            running = false;
+            break;
+        }
+
+        case 4: {
+            /* HVC #4: Set system register (from shim). X0 = reg index into
+             * hvc4_sysregs, X1 = value.
+             */
+            uint64_t reg_id, value;
+            hv_vcpu_get_reg(vcpu, HV_REG_X0, &reg_id);
+            hv_vcpu_get_reg(vcpu, HV_REG_X1, &value);
+
+            if (reg_id >= ARRAY_SIZE(hvc4_sysregs)) {
+                log_error("%s: HVC #4 unknown reg %llu", prefix,
+                          (unsigned long long) reg_id);
+                *exit_code = 128;
+                return VCPU_STOP;
+            }
+            if (verbose)
+                log_debug("%s: HVC #4 set reg %llu = 0x%llx", prefix,
+                          (unsigned long long) reg_id,
+                          (unsigned long long) value);
+            HV_CHECK(hv_vcpu_set_sys_reg(vcpu, hvc4_sysregs[reg_id], value));
+            break;
+        }
+
+        case 7: {
+            vcpu_handle_mrs_trap(vcpu, verbose, prefix);
+            break;
+        }
+
+        case 9: {
+            running =
+                vcpu_handle_wx_toggle(g, vcpu, verbose, prefix, exit_code);
+            break;
+        }
+
+        case 10: {
+            running = vcpu_handle_brk(g, vcpu, verbose, prefix, exit_code);
+            break;
+        }
+
+        case 11:
+            running =
+                vcpu_handle_el0_fault(g, vcpu, verbose, prefix, exit_code);
+            break;
+
+        case 12: {
+            vcpu_handle_sysinstr_trap(vcpu, verbose, prefix);
+            break;
+        }
+
+        case 13:
+            /* Only the epilogue above arms this. Without the check a detour
+             * nobody asked for would park the thread in thread_ptrace_stop
+             * waiting on a tracer that will never CONT it: a silent hang
+             * instead of a report.
+             */
+            if (!cpu_ptrace_stop_armed) {
+                log_fatal("%s: HVC #13 with no ptrace stop armed", prefix);
+                crash_report(vcpu, g, CRASH_UNEXPECTED_HVC,
+                             "HVC #13 without an armed ptrace stop");
+                *exit_code = 128;
+                running = false;
+                break;
+            }
+            cpu_ptrace_stop_armed = false;
+            running = ptrace_take_stop(g, vcpu, exit_code);
+            break;
+
+        case 2: {
+            running = vcpu_handle_bad_exception(g, vcpu, prefix, exit_code);
+            break;
+        }
+
+        case 6: {
+            /* HVC #6: embedder extension hook. X8 = call number, X0-X7 =
+             * arguments. If a dispatch function is registered via
+             * elfuse_set_hvc6_handler(), it is called here. Otherwise falls
+             * through as a no-op.
+             */
+            if (g->hvc6_handler) {
+                uint64_t x8 = 0;
+                hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
+                uint64_t args[8] = {0};
+                for (int i = 0; i < 8; i++)
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0 + i, &args[i]);
+                hvc6_yield_requested = false;
+                uint64_t result = g->hvc6_handler(x8, args, g->hvc6_userdata);
+                hv_vcpu_set_reg(vcpu, HV_REG_X0, result);
+                if (hvc6_yield_requested) {
+                    hvc6_yield_requested = false;
+                    running = false;
+                }
+            }
+            /* PC already advanced by HVC instruction */
+            break;
+        }
+
+        default: {
+            log_error("%s: unexpected HVC #%u", prefix, imm);
+            char detail[64];
+            snprintf(detail, sizeof(detail), "HVC #%u", imm);
+            crash_report(vcpu, g, CRASH_UNEXPECTED_HVC, detail);
+            *exit_code = 128;
+            running = false;
+            break;
+        }
+        }
+    } else if (ec == 0x30 || ec == 0x32) {
+        /* EC=0x30: Hardware breakpoint from lower EL (EL0). EC=0x32: Software
+         * step exception from lower EL. Both are debug exceptions trapped to
+         * host via hv_vcpu_set_trap_debug_exceptions(). Forward to GDB.
+         *
+         * TDE causes debug exceptions to bypass EL1 entirely (EL0 -> EL2), so
+         * ELR_EL1 is NOT updated; it still holds the stale value from the
+         * shim's last ERET. Read the actual stop PC from HV_REG_PC and sync it
+         * to ELR_EL1 so the GDB register snapshot sees the correct value.
+         */
+        if (gdb_stub_is_active()) {
+            int reason = (ec == 0x30) ? GDB_STOP_BREAKPOINT : GDB_STOP_STEP;
+            uint64_t stop_pc = vcpu_get_reg(vcpu, HV_REG_PC);
+
+            /* TDE routes debug exceptions EL0->EL2, bypassing EL1. ELR_EL1 and
+             * SPSR_EL1 are NOT updated; sync them from HV_REG_PC/HV_REG_CPSR so
+             * the GDB register snapshot reads correct values.
+             */
+            vcpu_set_sysreg(vcpu, HV_SYS_REG_ELR_EL1, stop_pc);
+            vcpu_set_sysreg(vcpu, HV_SYS_REG_SPSR_EL1,
+                            vcpu_get_reg(vcpu, HV_REG_CPSR));
+            if (verbose)
+                log_debug(
+                    "%s: debug exception EC=0x%x "
+                    "at PC=0x%llx -> GDB",
+                    prefix, ec, (unsigned long long) stop_pc);
+            gdb_stub_handle_stop(reason, stop_pc);
+            /* After GDB resumes, re-sync debug registers */
+            gdb_stub_sync_debug_regs(vcpu);
+        } else if (verbose) {
+            log_debug("%s: debug exception EC=0x%x (no GDB attached)", prefix,
+                      ec);
+        }
+    } else if (ec == 0x34 || ec == 0x35) {
+        /* EC=0x34: Watchpoint from lower EL (EL0, data abort). EC=0x35:
+         * Watchpoint from current EL (shouldn't happen). Same TDE bypass as
+         * breakpoints: ELR_EL1 and FAR_EL1 are stale because the exception went
+         * EL0->EL2. Use HV_REG_PC for the stop PC and vexit->exception for the
+         * watched address.
+         */
+        if (gdb_stub_is_active()) {
+            uint64_t wp_pc = vcpu_get_reg(vcpu, HV_REG_PC);
+            vcpu_set_sysreg(vcpu, HV_SYS_REG_ELR_EL1, wp_pc);
+            vcpu_set_sysreg(vcpu, HV_SYS_REG_SPSR_EL1,
+                            vcpu_get_reg(vcpu, HV_REG_CPSR));
+            uint64_t wp_addr = vexit->exception.virtual_address;
+            if (verbose)
+                log_debug("%s: watchpoint at addr=0x%llx -> GDB", prefix,
+                          (unsigned long long) wp_addr);
+            gdb_stub_handle_stop(GDB_STOP_WATCHPOINT, wp_addr);
+            gdb_stub_sync_debug_regs(vcpu);
+        } else if (verbose) {
+            log_debug("%s: watchpoint EC=0x%x (no GDB attached)", prefix, ec);
+        }
+    } else if (ec == 0x01) {
+        /* WFI/WFE has no host-side work in this userspace VM. */
+        if (verbose)
+            log_debug("%s: WFI/WFE trapped", prefix);
+    } else {
+        /* Non-HVC exception at EL2 level */
+        log_error(
+            "%s: unexpected exception EC=0x%x "
+            "syndrome=0x%llx VA=0x%llx PA=0x%llx",
+            prefix, ec, (unsigned long long) vexit->exception.syndrome,
+            (unsigned long long) vexit->exception.virtual_address,
+            (unsigned long long) vexit->exception.physical_address);
+        {
+            char detail[128];
+            snprintf(detail, sizeof(detail),
+                     "EC=0x%x syndrome=0x%llx VA=0x%llx", ec,
+                     (unsigned long long) vexit->exception.syndrome,
+                     (unsigned long long) vexit->exception.virtual_address);
+            crash_report(vcpu, g, CRASH_UNEXPECTED_EC, detail);
+        }
+        *exit_code = 128;
+        running = false;
+    }
+    return running ? VCPU_RESUME : VCPU_STOP;
+}
+
+/* Canceled-exit handling, lifted out of vcpu_run_loop_with_hooks.
+ *
+ * Its own function because every branch below reads or rebuilds the guest's
+ * register state, and they only agree about where that state lives if they
+ * share one precondition. Inline among the loop's other arms they did not: the
+ * signal branch grew an EL1 guard and the ptrace branch above it did not, which
+ * is how a stop taken inside the shim came to show the tracer scratch. A guard
+ * that has to hold for four consecutive branches belongs at the top of a
+ * function they are all inside, not repeated in each.
+ *
+ * VCPU_RESUME means the exit was handled and the vCPU should re-enter the
+ * guest. VCPU_STOP means leave the run loop with *exit_code, which the caller
+ * has already been given.
+ */
+static vcpu_action_t vcpu_handle_canceled_exit(guest_t *g,
+                                               hv_vcpu_t vcpu,
+                                               bool is_main,
+                                               bool verbose,
+                                               const char *prefix,
+                                               int *exit_code)
+{
+    /* Canceled by hv_vcpus_exit(). Can be: alarm timeout, exit_group from
+     * another thread, or signal preemption (a queued guest signal, a fork
+     * barrier, or a ptrace interrupt kicked the vCPU out of a tight loop).
+     *
+     * Every self-directed hv_vcpus_exit is now issued from the preemption
+     * thread (proc_preempt_init), never from a vCPU thread, so hv_vcpu_run
+     * always returns CANCELED here. HV_EXIT_REASON_UNKNOWN therefore no longer
+     * has a legitimate producer -- it falls through to the "unexpected exit
+     * reason" crash path below.
+     */
+    if (is_main && atomic_load_explicit(&g_timed_out, memory_order_acquire)) {
+        /* Timeout already handled above the exception switch -- loop back so
+         * the timeout check fires.
+         */
+        return VCPU_RESUME;
+    }
+    if (proc_exit_group_requested()) {
+        *exit_code = proc_exit_group_code();
+        return VCPU_STOP;
+    }
+
+    /* An execve tearing this thread down wins over everything below: the GDB
+     * stop parks on an unbounded condvar with no teardown predicate, and the
+     * ptrace stop and signal delivery both touch guest memory the exec is about
+     * to reset. Reaching any of them here would outlive the join cap in
+     * thread_exec_de_thread.
+     */
+    if (!is_main && thread_exec_stop_requested()) {
+        *exit_code = 0;
+        return VCPU_STOP;
+    }
+
+    /* Nothing below may run while the vCPU sits at EL1. The GDB stop, the
+     * ptrace stop, the rseq abort and the signal frame all read or rebuild the
+     * guest's register state, and inside the shim that state is not live: the
+     * guest's values are in the saved SVC frame, the working registers are shim
+     * scratch, and ELR_EL1 holds the EL0 return the shim still means to ERET
+     * through. A stop taken there shows the tracer scratch and drops what it
+     * writes back; a signal frame built there restores that scratch on
+     * rt_sigreturn. signal_deliver already splits the EL0-preemption case out
+     * for the same reason (see its saved_pc comment); EL1 is the third case and
+     * has no correct reading at all.
+     *
+     * Resuming is what converges, and a self-directed hv_vcpus_exit is not: it
+     * is one-shot and takes effect before the next hv_vcpu_run executes
+     * anything, so the vCPU would re-exit at the same EL1 PC forever (measured:
+     * every threaded test hangs). Instead every EL1 window is short and ends at
+     * either HVC #5 or an ERET to EL0, the fast paths test attention on entry,
+     * futex_wait_fast re-tests it inside its spin, and both the signal and
+     * ptrace kicks raise attention before kicking. So the work lands a
+     * microsecond later at HVC #5, which restores the frame before HVC #13
+     * takes the stop.
+     */
+    uint64_t cur_cpsr = 0;
+    hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
+    if ((cur_cpsr & 0xfULL) != 0)
+        return VCPU_RESUME;
+
+    /* GDB stub: if GDB requested a stop (Ctrl+C or another thread hit a
+     * breakpoint), enter GDB stop state.
+     */
+    if (gdb_stub_stop_requested()) {
+        if (verbose)
+            log_debug("%s: GDB stop request -> entering GDB stop", prefix);
+        gdb_stub_handle_stop(GDB_STOP_SIGNAL, 0);
+        gdb_stub_sync_debug_regs(vcpu);
+        return VCPU_RESUME;
+    }
+
+    /* PTRACE_INTERRUPT: take the stop the tracer asked for. The kick that
+     * brought the vCPU here may not be the one that owes it, and the flag is
+     * what says whether anything is owed at all.
+     */
+    if (ptrace_consume_owed_stop(g) && !ptrace_take_stop(g, vcpu, exit_code))
+        return VCPU_STOP;
+
+    /* rseq preemption abort: mirrors Linux rseq_ip_fixup() on context switch.
+     */
+    if (current_thread->rseq_gva != 0) {
+        /* HV_REG_PC, not ELR_EL1: the guard above established EL0, where the
+         * resume runs from PC and ELR_EL1 is stale from the previous syscall
+         * return. Redirecting through ELR_EL1 here would be a no-op, and a
+         * critical section interrupted at EL0 with no queued signal (a
+         * fork-barrier or ptrace wakeup) would never abort.
+         */
+        uint64_t cur_pc = 0;
+        hv_vcpu_get_reg(vcpu, HV_REG_PC, &cur_pc);
+        int rseq_rc = rseq_try_abort(g, current_thread->rseq_gva,
+                                     current_thread->rseq_signature, &cur_pc);
+        if (rseq_rc == 1)
+            hv_vcpu_set_reg(vcpu, HV_REG_PC, cur_pc);
+        if (rseq_rc == -1) {
+            *exit_code = 128 + 11; /* SIGSEGV */
+            return VCPU_STOP;
+        }
+    }
+
+    /* Check guest ITIMER_REAL (may have fired during tight loop) */
+    signal_check_timer();
+
+    /* Signal preemption: if a signal is pending, deliver it and resume the
+     * vCPU. This enables alarm()/SIGALRM delivery and tgkill-based signals in
+     * compute-bound loops.
+     */
+    if (signal_pending()) {
+        if (signal_deliver(vcpu, g, exit_code) < 0)
+            return VCPU_STOP;
+
+        /* Delivered, or nothing was pending after all: either way the vCPU
+         * resumes.
+         */
+        return VCPU_RESUME;
+    }
+
+    /* Fork quiesce barrier: if a sibling is performing a fork snapshot, block
+     * here until the snapshot is complete. This prevents torn memory snapshots
+     * in multithreaded guests.
+     */
+    if (thread_fork_barrier_check())
+        return VCPU_RESUME;
+
+    /* No signal pending; truly unexpected cancelation */
+    if (verbose)
+        log_debug("%s: vCPU canceled (no signal pending)", prefix);
+    return VCPU_RESUME;
+}
+
 /* Unified vCPU execution loop for both main and worker threads.
  *
- * When timeout_sec > 0 (main thread): uses alarm() for per-iteration safety
- * timeout, logs with "elfuse:" prefix.
+ * When timeout_sec > 0 (main thread): arms the repeating watchdog timer and
+ * publishes progress to it, logs with "elfuse:" prefix.
  *
- * When timeout_sec == 0 (worker thread): skips alarm() setup (SIGALRM is
- * process-wide and would conflict). Workers are terminated by exit_group
- * setting proc_exit_group_requested and calling hv_vcpus_exit() to cancel
- * pending hv_vcpu_run calls. Logs with "elfuse: worker" prefix.
+ * When timeout_sec == 0 (worker thread): no watchdog (SIGALRM is process-wide
+ * and would conflict). Workers are terminated by exit_group setting
+ * proc_exit_group_requested and calling hv_vcpus_exit() to cancel pending
+ * hv_vcpu_run calls. Logs with "elfuse: worker" prefix.
  *
  * Both modes check proc_exit_group_requested so the main thread also reacts to
  * exit_group called by a worker.
  *
- * Over the function-size limit on purpose: the HVC dispatch is one arm per call
- * number. This is also the deepest nest in the tree at eight levels, which is
- * worth knowing, because the depth is a switch inside a loop inside the
- * leader/worker split rather than logic layered on logic.
+ * The body is the loop and nothing else: run the vCPU, then dispatch on why it
+ * stopped. Each reason's handling lives in its own function above, which is
+ * what took this from 610 lines and a size-lint suppression down to under 200,
+ * and what gave the two handlers that rebuild guest register state one place to
+ * state the precondition they share.
  */
-/* NOLINTNEXTLINE(readability-function-size) */
 int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                              hv_vcpu_exit_t *vexit,
                              guest_t *g,
@@ -3843,7 +4477,14 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
     int exit_code = 0;
     (void) signal_take_termination_wait_status();
     bool running = true;
-    int iter = 0;
+
+    /* Unsigned, and 64-bit, because the watchdog derives a parity from it
+     * below: signed overflow is undefined, and this increments once per guest
+     * exit, so a guest making a million syscalls a second reaches 2^31 in about
+     * half an hour. Unsigned wrap is defined and preserves the parity, 2^64
+     * being even.
+     */
+    uint64_t iter = 0;
     const int is_main = (timeout_sec > 0);
     const char *prefix = is_main ? "elfuse" : "elfuse: worker";
 
@@ -3853,15 +4494,27 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
      */
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    /* Main thread: arm the alarm-based per-iteration timeout below. SIGALRM is
-     * blocked here and consumed by the preemption thread (proc_preempt_init),
-     * which sets g_timed_out and kicks the vCPU via hv_vcpus_exit. Guest
-     * ITIMER_REAL is emulated internally by signal_check_timer() rather than
-     * using host setitimer, because macOS shares alarm() and
-     * setitimer(ITIMER_REAL) as the same underlying timer.
+    /* Main thread: arm the watchdog timer. SIGALRM is blocked here and consumed
+     * by the preemption thread (proc_preempt_init), which sets g_timed_out and
+     * kicks the vCPU via hv_vcpus_exit. Guest ITIMER_REAL is emulated
+     * internally by signal_check_timer() rather than using host setitimer,
+     * because macOS shares alarm() and setitimer(ITIMER_REAL) as the same
+     * underlying timer.
+     *
+     * Repeating rather than one-shot: it_interval is what lets the watchdog
+     * tick on its own forever instead of re-arming itself from the signal
+     * handler. Re-arming would need the period published across threads and
+     * would race the loop's own disarm.
      */
-    if (is_main)
+    if (is_main) {
         atomic_store_explicit(&g_timed_out, 0, memory_order_relaxed);
+
+        struct itimerval every = {
+            .it_interval = {.tv_sec = timeout_sec, .tv_usec = 0},
+            .it_value = {.tv_sec = timeout_sec, .tv_usec = 0},
+        };
+        setitimer(ITIMER_REAL, &every, NULL);
+    }
 
     while (running) {
         /* Check if another thread called exit_group */
@@ -3910,22 +4563,25 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         if (verbose) {
             uint64_t pc;
             hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
-            log_debug("%s: [%d] vcpu_run PC=0x%llx", prefix, iter,
-                      (unsigned long long) pc);
+            log_debug("%s: [%llu] vcpu_run PC=0x%llx", prefix,
+                      (unsigned long long) iter, (unsigned long long) pc);
         }
         iter++;
 
-        /* Main: arm per-iteration safety timeout */
+        /* Main: publish progress to the watchdog. Odd while inside the guest,
+         * even outside; see g_vcpu_progress.
+         */
         if (is_main)
-            alarm((unsigned) timeout_sec);
+            atomic_store_explicit(&g_vcpu_progress, iter * 2 + 1,
+                                  memory_order_relaxed);
 
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
-        drain_external_guest_signal();
-
-        /* Main: disarm timeout */
         if (is_main)
-            alarm(0);
+            atomic_store_explicit(&g_vcpu_progress, iter * 2 + 2,
+                                  memory_order_relaxed);
+
+        drain_external_guest_signal();
 
         /* Re-check exit_group after waking from hv_vcpu_run */
         if (proc_exit_group_requested()) {
@@ -3962,403 +4618,15 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         }
 
         if (vexit->reason == HV_EXIT_REASON_EXCEPTION) {
-            uint32_t ec = (vexit->exception.syndrome >> 26) & 0x3F;
-
-            if (ec == 0x16) {
-                /* HVC exit */
-                uint16_t imm = vexit->exception.syndrome & 0xFFFF;
-
-                if (verbose)
-                    log_debug("%s: HVC #%u", prefix, imm);
-
-                switch (imm) {
-                case 5: {
-                    /* HVC #5: Linux syscall forwarding */
-                    int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
-                    if (ret == 1)
-                        running = false;
-
-                    /* execve replaced the process image; sys_execve already
-                     * installed the new X0/syscall-return state.
-                     */
-
-                    /* Check guest ITIMER_REAL expiry (queues SIGALRM if due) */
-                    signal_check_timer();
-
-                    /* Recompute the shim-globals attention flag now that
-                     * signal_check_timer has had a chance to drain pending
-                     * work. If nothing is pending and no itimer is armed, drop
-                     * the flag back to zero so the identity fast path
-                     * re-engages for the next getpid loop. Without this clear,
-                     * the attention flag set by signal_queue (e.g., on a
-                     * subprocess's SIGCHLD) would stick forever and permanently
-                     * disable the fast path.
-                     */
-                    shim_globals_recompute_attention(g);
-
-                    /* Diagnostic: log signal state after exec/sigreturn to help
-                     * debug signal delivery issues.
-                     */
-                    if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
-                        uint64_t tblocked =
-                            current_thread ? thread_blocked_load(current_thread)
-                                           : 0xDEAD;
-                        log_debug(
-                            "%s: post-sigreturn state: "
-                            "pending=0x%llx global_blocked=0x%llx "
-                            "thread_blocked=0x%llx signal_pending=%d",
-                            prefix,
-                            (unsigned long long) signal_shared_pending_load(),
-                            (unsigned long long) signal_blocked_load(),
-                            (unsigned long long) tblocked, signal_pending());
-                    }
-
-                    /* Deliver pending signals after each syscall */
-                    if (running && signal_pending()) {
-                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
-                        if (sig_ret < 0)
-                            running = false; /* Default TERM/CORE disposition */
-                    }
-
-                    /* After exec, verify critical registers before resuming
-                     * vCPU. This closes any gap where signal delivery or other
-                     * code between sys_execve's sync flush and hv_vcpu_run
-                     * could have modified ELR_EL1.
-                     */
-                    if (running && ret == SYSCALL_EXEC_HAPPENED) {
-                        uint64_t verify_elr;
-                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,
-                                            &verify_elr);
-                        if (verify_elr == 0) {
-                            log_fatal(
-                                "%s: ELR_EL1=0 after exec, register sync "
-                                "failed",
-                                prefix);
-                            crash_report(vcpu, g, CRASH_ELR_ZERO,
-                                         "ELR_EL1=0 after exec");
-                            exit_code = 128;
-                            running = false;
-                        }
-                    }
-                    break;
-                }
-
-                case 0: {
-                    /* HVC #0: Normal exit */
-                    uint64_t x0;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
-                    if (verbose)
-                        log_debug("%s: guest exit HVC #0 code=%llu", prefix,
-                                  (unsigned long long) x0);
-                    exit_code = (int) x0;
-                    running = false;
-                    break;
-                }
-
-                case 4: {
-                    /* HVC #4: Set system register (from shim). X0 = reg index
-                     * into hvc4_sysregs, X1 = value.
-                     */
-                    uint64_t reg_id, value;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &reg_id);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &value);
-
-                    if (reg_id >= ARRAY_SIZE(hvc4_sysregs)) {
-                        log_error("%s: HVC #4 unknown reg %llu", prefix,
-                                  (unsigned long long) reg_id);
-                        exit_code = 128;
-                        running = false;
-                        continue;
-                    }
-                    if (verbose)
-                        log_debug("%s: HVC #4 set reg %llu = 0x%llx", prefix,
-                                  (unsigned long long) reg_id,
-                                  (unsigned long long) value);
-                    HV_CHECK(
-                        hv_vcpu_set_sys_reg(vcpu, hvc4_sysregs[reg_id], value));
-                    break;
-                }
-
-                case 7: {
-                    vcpu_handle_mrs_trap(vcpu, verbose, prefix);
-                    break;
-                }
-
-                case 9: {
-                    running = vcpu_handle_wx_toggle(g, vcpu, verbose, prefix,
-                                                    &exit_code);
-                    break;
-                }
-
-                case 10: {
-                    running =
-                        vcpu_handle_brk(g, vcpu, verbose, prefix, &exit_code);
-                    break;
-                }
-
-                case 11:
-                    running = vcpu_handle_el0_fault(g, vcpu, verbose, prefix,
-                                                    &exit_code);
-                    break;
-
-                case 12: {
-                    vcpu_handle_sysinstr_trap(vcpu, verbose, prefix);
-                    break;
-                }
-
-                case 2: {
-                    running =
-                        vcpu_handle_bad_exception(g, vcpu, prefix, &exit_code);
-                    break;
-                }
-
-                case 6: {
-                    /* HVC #6: embedder extension hook. X8 = call number, X0-X7
-                     * = arguments. If a dispatch function is registered via
-                     * elfuse_set_hvc6_handler(), it is called here. Otherwise
-                     * falls through as a no-op.
-                     */
-                    if (g->hvc6_handler) {
-                        uint64_t x8 = 0;
-                        hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
-                        uint64_t args[8] = {0};
-                        for (int i = 0; i < 8; i++)
-                            hv_vcpu_get_reg(vcpu, HV_REG_X0 + i, &args[i]);
-                        hvc6_yield_requested = false;
-                        uint64_t result =
-                            g->hvc6_handler(x8, args, g->hvc6_userdata);
-                        hv_vcpu_set_reg(vcpu, HV_REG_X0, result);
-                        if (hvc6_yield_requested) {
-                            hvc6_yield_requested = false;
-                            running = false;
-                        }
-                    }
-                    /* PC already advanced by HVC instruction */
-                    break;
-                }
-
-                default: {
-                    log_error("%s: unexpected HVC #%u", prefix, imm);
-                    char detail[64];
-                    snprintf(detail, sizeof(detail), "HVC #%u", imm);
-                    crash_report(vcpu, g, CRASH_UNEXPECTED_HVC, detail);
-                    exit_code = 128;
-                    running = false;
-                    break;
-                }
-                }
-            } else if (ec == 0x30 || ec == 0x32) {
-                /* EC=0x30: Hardware breakpoint from lower EL (EL0). EC=0x32:
-                 * Software step exception from lower EL. Both are debug
-                 * exceptions trapped to host via
-                 * hv_vcpu_set_trap_debug_exceptions(). Forward to GDB.
-                 *
-                 * TDE causes debug exceptions to bypass EL1 entirely (EL0 ->
-                 * EL2), so ELR_EL1 is NOT updated; it still holds the stale
-                 * value from the shim's last ERET. Read the actual stop PC from
-                 * HV_REG_PC and sync it to ELR_EL1 so the GDB register snapshot
-                 * sees the correct value.
-                 */
-                if (gdb_stub_is_active()) {
-                    int reason =
-                        (ec == 0x30) ? GDB_STOP_BREAKPOINT : GDB_STOP_STEP;
-                    uint64_t stop_pc = vcpu_get_reg(vcpu, HV_REG_PC);
-
-                    /* TDE routes debug exceptions EL0->EL2, bypassing EL1.
-                     * ELR_EL1 and SPSR_EL1 are NOT updated; sync them from
-                     * HV_REG_PC/HV_REG_CPSR so the GDB register snapshot reads
-                     * correct values.
-                     */
-                    vcpu_set_sysreg(vcpu, HV_SYS_REG_ELR_EL1, stop_pc);
-                    vcpu_set_sysreg(vcpu, HV_SYS_REG_SPSR_EL1,
-                                    vcpu_get_reg(vcpu, HV_REG_CPSR));
-                    if (verbose)
-                        log_debug(
-                            "%s: debug exception EC=0x%x "
-                            "at PC=0x%llx -> GDB",
-                            prefix, ec, (unsigned long long) stop_pc);
-                    gdb_stub_handle_stop(reason, stop_pc);
-                    /* After GDB resumes, re-sync debug registers */
-                    gdb_stub_sync_debug_regs(vcpu);
-                } else if (verbose) {
-                    log_debug("%s: debug exception EC=0x%x (no GDB attached)",
-                              prefix, ec);
-                }
-            } else if (ec == 0x34 || ec == 0x35) {
-                /* EC=0x34: Watchpoint from lower EL (EL0, data abort). EC=0x35:
-                 * Watchpoint from current EL (shouldn't happen). Same TDE
-                 * bypass as breakpoints: ELR_EL1 and FAR_EL1 are stale because
-                 * the exception went EL0->EL2. Use HV_REG_PC for the stop PC
-                 * and vexit->exception for the watched address.
-                 */
-                if (gdb_stub_is_active()) {
-                    uint64_t wp_pc = vcpu_get_reg(vcpu, HV_REG_PC);
-                    vcpu_set_sysreg(vcpu, HV_SYS_REG_ELR_EL1, wp_pc);
-                    vcpu_set_sysreg(vcpu, HV_SYS_REG_SPSR_EL1,
-                                    vcpu_get_reg(vcpu, HV_REG_CPSR));
-                    uint64_t wp_addr = vexit->exception.virtual_address;
-                    if (verbose)
-                        log_debug("%s: watchpoint at addr=0x%llx -> GDB",
-                                  prefix, (unsigned long long) wp_addr);
-                    gdb_stub_handle_stop(GDB_STOP_WATCHPOINT, wp_addr);
-                    gdb_stub_sync_debug_regs(vcpu);
-                } else if (verbose) {
-                    log_debug("%s: watchpoint EC=0x%x (no GDB attached)",
-                              prefix, ec);
-                }
-            } else if (ec == 0x01) {
-                /* WFI/WFE has no host-side work in this userspace VM. */
-                if (verbose)
-                    log_debug("%s: WFI/WFE trapped", prefix);
-            } else {
-                /* Non-HVC exception at EL2 level */
-                log_error(
-                    "%s: unexpected exception EC=0x%x "
-                    "syndrome=0x%llx VA=0x%llx PA=0x%llx",
-                    prefix, ec, (unsigned long long) vexit->exception.syndrome,
-                    (unsigned long long) vexit->exception.virtual_address,
-                    (unsigned long long) vexit->exception.physical_address);
-                {
-                    char detail[128];
-                    snprintf(
-                        detail, sizeof(detail),
-                        "EC=0x%x syndrome=0x%llx VA=0x%llx", ec,
-                        (unsigned long long) vexit->exception.syndrome,
-                        (unsigned long long) vexit->exception.virtual_address);
-                    crash_report(vcpu, g, CRASH_UNEXPECTED_EC, detail);
-                }
-                exit_code = 128;
-                running = false;
+            if (vcpu_handle_exception_exit(g, vcpu, vexit, verbose, prefix,
+                                           &exit_code) == VCPU_STOP) {
+                break;
             }
         } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
-            /* Canceled by hv_vcpus_exit(). Can be: alarm timeout, exit_group
-             * from another thread, or signal preemption (a queued guest signal,
-             * a fork barrier, or a ptrace interrupt kicked the vCPU out of a
-             * tight loop).
-             *
-             * Every self-directed hv_vcpus_exit is now issued from the
-             * preemption thread (proc_preempt_init), never from a vCPU thread,
-             * so hv_vcpu_run always returns CANCELED here.
-             * HV_EXIT_REASON_UNKNOWN therefore no longer has a legitimate
-             * producer -- it falls through to the "unexpected exit reason"
-             * crash path below.
-             */
-            if (is_main &&
-                atomic_load_explicit(&g_timed_out, memory_order_acquire)) {
-                /* Timeout already handled above the exception switch -- loop
-                 * back so the timeout check fires.
-                 */
-                continue;
-            }
-            if (proc_exit_group_requested()) {
-                exit_code = proc_exit_group_code();
+            if (vcpu_handle_canceled_exit(g, vcpu, is_main, verbose, prefix,
+                                          &exit_code) == VCPU_STOP) {
                 break;
             }
-
-            /* An execve tearing this thread down wins over everything below:
-             * the GDB stop parks on an unbounded condvar with no teardown
-             * predicate, and the ptrace stop and signal delivery both touch
-             * guest memory the exec is about to reset. Reaching any of them
-             * here would outlive the join cap in thread_exec_de_thread.
-             */
-            if (!is_main && thread_exec_stop_requested()) {
-                exit_code = 0;
-                break;
-            }
-
-            /* GDB stub: if GDB requested a stop (Ctrl+C or another thread hit a
-             * breakpoint), enter GDB stop state.
-             */
-            if (gdb_stub_stop_requested()) {
-                if (verbose)
-                    log_debug("%s: GDB stop request -> entering GDB stop",
-                              prefix);
-                gdb_stub_handle_stop(GDB_STOP_SIGNAL, 0);
-                gdb_stub_sync_debug_regs(vcpu);
-                continue;
-            }
-
-            /* PTRACE_INTERRUPT: if this thread is ptraced and not already
-             * stopped, enter ptrace-stop so the tracer can inspect state. This
-             * handles hv_vcpus_exit from sys_ptrace PTRACE_INTERRUPT.
-             */
-            if (current_thread->ptraced && !current_thread->ptrace_stopped) {
-                if (verbose)
-                    log_debug("%s: ptrace interrupt -> ptrace-stop", prefix);
-                int cont_sig = thread_ptrace_stop(current_thread, 5);
-                if (cont_sig > 0) {
-                    signal_queue(cont_sig);
-                    int sr = signal_deliver(vcpu, g, &exit_code);
-                    if (sr < 0)
-                        running = false;
-                }
-                continue;
-            }
-
-            /* rseq preemption abort: mirrors Linux rseq_ip_fixup() on context
-             * switch.
-             */
-            if (current_thread->rseq_gva != 0) {
-                /* Same EL0-preemption hazard as signal delivery: when the vCPU
-                 * was preempted while executing EL0 code, ELR_EL1 is stale from
-                 * the previous syscall return and the resume runs from
-                 * HV_REG_PC. Read the interrupted PC -- and write the abort_ip
-                 * back -- through whichever register the resume actually
-                 * consumes, selected from the live PSTATE (M[3:0]==0 => EL0t).
-                 * Otherwise a critical section interrupted at EL0 with no
-                 * queued signal (fork-barrier/ptrace wakeups) would never
-                 * abort.
-                 */
-                uint64_t cur_pc, cur_cpsr = 0;
-                hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
-                bool el0_preempt = (cur_cpsr & 0xfULL) == 0;
-                if (el0_preempt)
-                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &cur_pc);
-                else
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &cur_pc);
-                int rseq_rc =
-                    rseq_try_abort(g, current_thread->rseq_gva,
-                                   current_thread->rseq_signature, &cur_pc);
-                if (rseq_rc == 1) {
-                    if (el0_preempt)
-                        hv_vcpu_set_reg(vcpu, HV_REG_PC, cur_pc);
-                    else
-                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, cur_pc);
-                }
-                if (rseq_rc == -1) {
-                    exit_code = 128 + 11;
-                    running = false;
-                }
-            }
-
-            /* Check guest ITIMER_REAL (may have fired during tight loop) */
-            signal_check_timer();
-
-            /* Signal preemption: if a signal is pending, deliver it and resume
-             * the vCPU. This enables alarm()/SIGALRM delivery and tgkill-based
-             * signals in compute-bound loops.
-             */
-            if (signal_pending()) {
-                int sig_ret = signal_deliver(vcpu, g, &exit_code);
-                if (sig_ret < 0)
-                    running = false;
-
-                /* sig_ret >= 0: signal delivered or nothing pending, loop back
-                 * and resume vCPU execution
-                 */
-                continue;
-            }
-
-            /* Fork quiesce barrier: if a sibling is performing a fork snapshot,
-             * block here until the snapshot is complete. This prevents torn
-             * memory snapshots in multithreaded guests.
-             */
-            if (thread_fork_barrier_check())
-                continue;
-
-            /* No signal pending; truly unexpected cancelation */
-            if (verbose)
-                log_debug("%s: vCPU canceled (no signal pending)", prefix);
         } else if (vexit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
             /* Virtual timer fired. The emulator emulates timers host-side, so
              * mask the vtimer and continue. Without this, a pending vtimer
@@ -4378,9 +4646,15 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         }
     }
 
-    /* Clean up timeout if the run loop sets it up */
-    if (is_main)
-        alarm(0);
+    /* Clean up the timeout the run loop armed. Clearing it_interval as well as
+     * it_value is what makes the disarm final: the timer repeats on its own
+     * interval, so zeroing only the pending shot would leave it ticking for the
+     * life of the process with nothing watching it.
+     */
+    if (is_main) {
+        struct itimerval off = {0};
+        setitimer(ITIMER_REAL, &off, NULL);
+    }
 
     if (wait_status_out) {
         int signal_status = signal_take_termination_wait_status();

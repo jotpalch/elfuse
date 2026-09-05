@@ -299,3 +299,56 @@ That has a few direct implications:
   work entirely inside the VM. Programs that link against `libfuse`
   (sshfs, ntfs-3g, AppImage runtimes) run without macFUSE, FUSE-T, or
   FSKit on the host.
+
+## OCI Images
+
+`build/elfuse-oci` is separate from the C runtime. It pulls images into a local
+OCI image layout and does not unpack them.
+
+### Build
+
+```sh
+make elfuse-oci
+```
+
+The Go command is opt-in. Plain `make`, `make check`, and `make lint` do not
+probe the Go module graph or download Go dependencies. Use `make oci-test` and
+`make oci-lint` explicitly for its test and lint lanes. The C runtime build
+does not require Go.
+
+### Quick Start
+
+```sh
+build/elfuse-oci pull debian:stable-slim
+```
+
+### Commands
+
+| Command | Meaning |
+|---------|---------|
+| `pull <ref>` | Fetch one platform of an image into the store |
+| `help`, `version` | Print help or the elfuse-oci version |
+
+An abbreviated reference receives the Docker Hub registry, the `library`
+repository when needed, and the `latest` tag when no tag is present. Digest
+references are accepted. Pull options may appear before or after `<ref>`.
+
+### Flags
+
+| Option | Commands | Meaning |
+|--------|----------|---------|
+| `--store DIR` | `pull` | Store directory; default `$ELFUSE_OCI_STORE`, then `~/.local/share/elfuse/oci` |
+| `--platform OS/ARCH[/VARIANT]` | `pull` | Target `linux/arm64` or `linux/amd64`; default `linux/arm64` |
+| `--timeout DURATION` | `pull` | Bound the pull and lock wait; zero sets no deadline |
+
+### Environment
+
+| Variable | Meaning |
+|----------|---------|
+| `ELFUSE_OCI_STORE` | Default store directory |
+| `DOCKER_CONFIG` | Alternate directory containing Docker `config.json` credentials |
+| `REGISTRY_AUTH_FILE` | Podman-compatible credential file used when Docker config is absent |
+| `XDG_RUNTIME_DIR` | Base directory for Podman's `containers/auth.json` fallback |
+
+Credential helpers and inline entries are handled by go-containerregistry.
+With no matching entry, the pull is anonymous.

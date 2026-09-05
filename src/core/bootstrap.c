@@ -253,42 +253,42 @@ static bool load_interpreter(guest_t *g,
         sizeof(boot->interp_display_path));
     log_debug("loading interpreter: %s", boot->interp_resolved);
 
+    /* One exit from here on. Every step below can fail, and each failure owes
+     * the same unlink of a materialized temp; four copies of that is four
+     * chances to forget one.
+     */
+    bool ok = false;
+
     if (elf_load(boot->interp_resolved, &boot->interp_info) < 0) {
         log_error("failed to load interpreter: %s", boot->interp_resolved);
-        if (interp_host_temp)
-            unlink(boot->interp_resolved);
-        return false;
+        goto out;
     }
 
-    if (boot->interp_info.e_machine != EM_AARCH64) {
-        log_error("interpreter has unsupported machine type %u: %s",
-                  boot->interp_info.e_machine, boot->interp_resolved);
-        if (interp_host_temp)
-            unlink(boot->interp_resolved);
-        return false;
-    }
+    if (!elf_interp_is_loadable(&boot->interp_info, boot->interp_resolved))
+        goto out;
 
     boot->interp_base = g->interp_base;
-    uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
-    uint64_t infra_hi = g->interp_base;
+    uint64_t infra_lo, infra_hi;
+    guest_infra_window(g, &infra_lo, &infra_hi);
     if (elf_map_segments(&boot->interp_info, boot->interp_resolved,
                          g->host_base, g->guest_size,
                          (elf_window_t) {0, boot->interp_base}, infra_lo,
                          infra_hi) < 0) {
         log_error("failed to map interpreter segments");
-        if (interp_host_temp)
-            unlink(boot->interp_resolved);
-        return false;
+        goto out;
     }
-    if (interp_host_temp)
-        unlink(boot->interp_resolved);
+    ok = true;
 
     log_debug(
         "interpreter loaded at base=0x%llx, entry=0x%llx, %d segments",
         (unsigned long long) boot->interp_base,
         (unsigned long long) (boot->interp_info.entry + boot->interp_base),
         boot->interp_info.num_segments);
-    return true;
+
+out:
+    if (interp_host_temp)
+        unlink(boot->interp_resolved);
+    return ok;
 }
 
 static bool build_boot_regions(mem_region_t *regions,
@@ -445,12 +445,17 @@ int guest_bootstrap_prepare(guest_t *g,
         boot->elf_load_base =
             (boot->elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
         t0 = startup_trace_now_ns();
-        uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
-        uint64_t infra_hi = g->interp_base;
+        uint64_t infra_lo, infra_hi;
+        guest_infra_window(g, &infra_lo, &infra_hi);
+
+        /* Forbidden from the reserve to the top of the slab: everything from
+         * interp_base up is the interpreter's and the runtime's, so an ET_EXEC
+         * linked above it must not be placed there.
+         */
         if (elf_map_segments(&boot->elf_info, elf_host_path, g->host_base,
                              g->guest_size,
                              (elf_window_t) {0, boot->elf_load_base}, infra_lo,
-                             infra_hi) < 0) {
+                             g->guest_size) < 0) {
             log_error("failed to map ELF segments");
             return -1;
         }

@@ -2969,8 +2969,19 @@ int proc_intercept_open(const guest_t *g,
          *   priority(18) nice(19) num_threads(20) itrealvalue(21)
          *   starttime(22) vsize(23) rss(24) rsslim(25) ... (52 fields total)
          */
+        /* tty_nr(7) and tpgid(8) follow the controlling-terminal state rather
+         * than the constants that stood here. elfuse models no specific tty
+         * device, so tty_nr reports the UNIX98 pts major with minor 0 when a
+         * terminal is held: readers such as ps only test it against zero to
+         * decide whether to print a tty at all. tpgid is the foreground process
+         * group, or -1 with no terminal, which is what Linux emits.
+         */
+        int has_ctty = proc_get_ctty();
+        int tty_nr = has_ctty ? (136 << 8) : 0;
+        long long tpgid = has_ctty ? (long long) proc_get_fg_pgrp() : -1;
+
         return proc_emit_fmt(
-            "%lld (%.15s) R %lld %lld %lld 0 -1 0 "        /* 1-9 */
+            "%lld (%.15s) R %lld %lld %lld %d %lld 0 "     /* 1-9 */
             "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
             "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
             "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
@@ -2979,7 +2990,7 @@ int proc_intercept_open(const guest_t *g,
             (long long) proc_get_ppid(),
             (long long) proc_get_pid(), /* pgrp = pid */
             (long long) proc_get_pid(), /* session = pid */
-            utime_ticks, stime_ticks, thread_active_count(),
+            tty_nr, tpgid, utime_ticks, stime_ticks, thread_active_count(),
             (unsigned long long) vsize, (unsigned long long) rss_pages,
             (unsigned long long) start_stack);
     }

@@ -37,20 +37,9 @@ int passes = 0, fails = 0;
 #define MAP_ANONYMOUS 0x20
 #endif
 
-/* glibc 2.28 static: shm_open is broken; emulate via /dev/shm. */
-static int my_shm_open(const char *name, int oflag, int mode)
-{
-    char path[128];
-    snprintf(path, sizeof(path), "/dev/shm%s", name);
-    return open(path, oflag, mode);
-}
-
-static int my_shm_unlink(const char *name)
-{
-    char path[128];
-    snprintf(path, sizeof(path), "/dev/shm%s", name);
-    return unlink(path);
-}
+/* This test opens a /dev/shm path directly rather than calling shm_open, which
+ * returns ENOSYS without trying on glibc 2.28 static.
+ */
 
 /* IPC primitives between parent and child: a single byte over a pipe pair
  * signals "go ahead" each direction. Replaces a sleep-based synchronization
@@ -347,14 +336,13 @@ static void test_shm_cross_fork(void)
 {
     TEST("MAP_SHARED shm: cross-fork live coherence");
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-cf-shm-%ld", (long) getpid());
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[64] = "/dev/shm/elfuse-cf-shm-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("shm_open");
+        FAIL("mkstemp /dev/shm failed");
         return;
     }
-    my_shm_unlink(name);
+    unlink(name);
 
     if (ftruncate(fd, 4096) != 0) {
         FAIL("ftruncate");

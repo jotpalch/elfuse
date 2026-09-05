@@ -113,6 +113,21 @@
  *                                     which is what pins a session against
  *                                     daemon exit while a request is in flight
  *   inotify_lock (syscall/inotify.c): inotify watch table
+ *   usbdev_table_lock (syscall/usbdev.c): FD_USBDEV side table. It is never
+ *                                     held together with the per-entry usbdev
+ *                                     lock: usbdev_acquire and
+ *                                     usbdev_fd_cleanup both find their entry
+ *                                     under the table lock, drop it, and only
+ *                                     then take the entry lock, because a sync
+ *                                     transfer can hold that lock for a whole
+ *                                     timeout and no other fd may wait behind
+ *                                     it. What keeps the slot from being torn
+ *                                     down and reused in between is the refs
+ *                                     and dead pair the lookup sets under the
+ *                                     table lock, not a nesting. Never held
+ *                                     together with any other file-scope lock
+ *                                     in this list either, in either direction,
+ *                                     so its position here is nominal
  *
  * Leaves. Each of these is the innermost lock on every path that takes it, so
  * it has no position in the order above and cannot be half of an inversion:
@@ -153,7 +168,7 @@
 #include "proved/timespec.h"
 
 #include "syscall/linux-wire.h"
-#include "syscall/linux-limits.h"
+#include "linux-limits.h"
 #include "runtime/thread.h"
 
 typedef int guest_fd_t;
@@ -461,6 +476,31 @@ uint64_t fd_current_generation(int guest_fd);
  */
 int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out);
 
+/* The dup(2) form of the above: snapshot an fd entry and take, in the same
+ * fd_lock critical section, whatever the duplicate has to own.
+ *
+ * A directory is duplicated by sharing its stream rather than by duplicating
+ * its descriptor. dup(2) gives the alias the same open file description, so the
+ * two guest fds share one listing position -- and, because the union state a
+ * synthetic directory carries lives in that same wrapper, one union state as
+ * well. Handing the alias its own fdopendir() over a duplicated descriptor gave
+ * it a second position and a second, empty union state instead, which is how a
+ * dup'd union directory came to re-emit the backing names the source had
+ * already delivered.
+ *
+ * On a shared return the host descriptor is the source's own, already owned by
+ * the stream, so the caller must neither close it nor hand it to
+ * dir_stream_open(); it installs *out's `dir` pointer as the alias's stream and
+ * balances the reference taken here with dir_stream_release().
+ *
+ * Returns the host fd the duplicate is to be installed with -- a fresh dup for
+ * every other type, the source's own when *out_shared_dir is set -- or -1 on
+ * failure.
+ */
+int fd_snapshot_and_dup_or_share_dir(int guest_fd,
+                                     fd_entry_t *out,
+                                     bool *out_shared_dir);
+
 /* Read just the fd type under fd_lock.
  *
  * Returns FD_CLOSED for out-of-range or closed slots. Cheaper than fd_snapshot
@@ -583,7 +623,7 @@ static inline bool fd_type_is_synthetic(int type)
 {
     return type == FD_EVENTFD || type == FD_SIGNALFD || type == FD_TIMERFD ||
            type == FD_INOTIFY || type == FD_NETLINK || type == FD_PIDFD ||
-           type == FD_EPOLL;
+           type == FD_EPOLL || type == FD_USBDEV;
 }
 
 /* The status bits the host description is authoritative for. Everything outside
@@ -774,6 +814,10 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap);
  * needs the descriptor to stay valid therefore holds a reference here:
  *
  *   - the fd-table slot          (released by fd_cleanup_entry)
+ *   - every other fd-table slot  (a dup shares the source's stream rather than
+ *     that aliases it           opening one, so the alias is one more slot
+ *                               reference on the same wrapper -- see
+ *                               fd_snapshot_and_dup_or_share_dir)
  *   - an in-flight getdents64    (dir_stream_acquire, syscall/fs.c)
  *   - an fd_lifetime pin         (fdtable.c, which delegates its close here)
  *
@@ -786,6 +830,65 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap);
 void *dir_stream_open(int host_fd);
 void dir_stream_ref_locked(void *ds);
 void dir_stream_release(void *ds);
+
+/* The same, for the directory fds a forked child inherits.
+ *
+ * The child receives the parent's descriptor over SCM_RIGHTS, so the two
+ * processes hold one open file description, and the two halves of a union
+ * listing are worth different things across it.
+ *
+ * The primary is shared and must be read. Darwin's fdopendir() reads one host
+ * block ahead as it builds the stream and leaves the description just past it,
+ * so what the parent's open() took is in the parent's memory and the rest of
+ * the directory is still in the description for the child to read: measured
+ * over the 403-name sysroot directory tests/test-dir-union-alias stages (macOS
+ * 15.6, APFS), the parent's open takes 49 names and the child's stream reads
+ * the remaining 354. A five-name directory fits inside that one block, which is
+ * the whole reason a five-name measurement reads as all-or-nothing; it is not
+ * what a directory of any width does. So the child's stream is built like any
+ * other and walks its primary normally, and the split that falls out is real --
+ * not Linux's split, but a partition, with nothing counted twice and nothing
+ * dropped.
+ *
+ * The backing is not shared and must not be re-read. It is drained into
+ * whichever stream first runs out of primary and held there as names, so a
+ * child that drained one of its own would emit every backing name a second time
+ * -- names the parent's stream still holds and goes on to deliver.
+ * dir_stream_open() would do exactly that. This wrapper comes back with the
+ * backing half marked private instead: the drain is skipped, the walk ends when
+ * the primary does, and the parent delivers the backing once.
+ *
+ * The gap this leaves is a child whose parent closes its copy of the fd before
+ * the backing is ever drained: nobody is left holding the half the parent owns,
+ * and the child answers with its primary alone. Measured over the same two
+ * fixtures, forking and closing the parent's fd at once gives the child 354 of
+ * the plain directory's 403 names -- the 49 the parent's open had taken go with
+ * it, which is the loss any inherited stream takes -- and 0 of the union's 405,
+ * because that tree's synthetic half fits inside the block that open consumed.
+ * Linux gives the child all 403. Closing it would mean keeping the position and
+ * the union state in the description rather than in a DIR* one process owns,
+ * which is a rewrite of every directory read and is not attempted here.
+ *
+ * Suppressing the whole walk rather than just the drain is the mistake this
+ * interface exists to avoid, and it is not a small one. A stream created
+ * already at the end of its listing never reads the primary at all, so the
+ * block its own fdopendir() consumed is lost to both sides: measured over that
+ * same 403-name directory, an unread fork came back with 352 names across the
+ * pair instead of 403, with no error at either end.
+ *
+ * Linux keeps the position in the description and splits the listing there --
+ * measured in docker (gcc 14.4, Linux 6.19 aarch64) over the same fork sequence
+ * that lane runs, an unread directory fd forked and drained by the child gives
+ * the child all 403 names and the parent 0, and draining the parent first gives
+ * the parent all 403 and the child 0. elfuse cannot reproduce which side
+ * delivers, because the block the open read ahead lives in a DIR* the opener
+ * owns rather than in the description; what it can do, and what this preserves,
+ * is deliver each name exactly once across the pair. Measured over that lane's
+ * fixtures in all four states a parent can fork in -- unread, part-read, read
+ * to the end, and forked then read by the parent first -- the plain 403-name
+ * directory and the 405-name union each come back whole and without a repeat.
+ */
+void *dir_stream_open_inherited(int host_fd);
 
 /* Translation helpers. */
 
@@ -918,6 +1021,45 @@ static inline int64_t host_fd_ref_open_state(guest_fd_t guest_fd,
     return 0;
 }
 
+/* Pin the host fd and take the slot's whole entry together, for a caller that
+ * decides something from the slot's own record -- its stamped virtual path, say
+ * -- as well as from the descriptor. Two separate lookups of one guest fd let a
+ * close and reopen between them answer from the record of one open file
+ * description and the descriptor of another.
+ *
+ * The same shape as host_fd_ref_open_state, and the same reasoning: with one
+ * active thread there is no mutator, and with siblings alive both come from the
+ * fd_lock window inside fd_host_ref_acquire.
+ */
+static inline int64_t host_fd_ref_open_entry(guest_fd_t guest_fd,
+                                             host_fd_ref_t *ref,
+                                             fd_entry_t *snap_out)
+{
+    ref->fd = -1;
+    ref->lifetime = NULL;
+
+    /* Settle the entry before anything can fail, so a caller that reads it
+     * after a refused open reads a closed slot rather than its own stack.
+     */
+    *snap_out = (fd_entry_t) {.type = FD_CLOSED};
+
+    if (thread_is_single_active()) {
+        int host_fd = fd_to_host(guest_fd);
+        if (host_fd < 0)
+            return -LINUX_EBADF;
+        if (!fd_snapshot(guest_fd, snap_out))
+            return -LINUX_EBADF;
+        ref->fd = host_fd;
+        return 0;
+    }
+
+    int host_fd = fd_host_ref_acquire(guest_fd, snap_out, &ref->lifetime);
+    if (host_fd < 0)
+        return linux_errno();
+    ref->fd = host_fd;
+    return 0;
+}
+
 static inline void host_fd_ref_close(host_fd_ref_t *ref)
 {
     /* Preserve errno across close(2). Callers commonly invoke this on the
@@ -941,6 +1083,24 @@ static inline int64_t host_dirfd_ref_open(guest_fd_t dirfd, host_fd_ref_t *ref)
         return 0;
     }
     return host_fd_ref_open(dirfd, ref);
+}
+
+/* Open both dirfd references a two-path *at() call needs, releasing the first
+ * if the second fails so no caller has to spell that rollback again. On success
+ * both refs are the caller's to close.
+ */
+static inline int64_t host_dirfd_ref_open_pair(guest_fd_t olddirfd,
+                                               guest_fd_t newdirfd,
+                                               host_fd_ref_t *old_ref,
+                                               host_fd_ref_t *new_ref)
+{
+    int64_t err = host_dirfd_ref_open(olddirfd, old_ref);
+    if (err < 0)
+        return err;
+    err = host_dirfd_ref_open(newdirfd, new_ref);
+    if (err < 0)
+        host_fd_ref_close(old_ref);
+    return err;
 }
 
 /* The transfer classification carried by an entry already in hand. Callers that

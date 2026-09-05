@@ -31,7 +31,9 @@ NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-wakeup-pipe-host.c \
                 tests/test-stdio-nonblock-host.c \
                 tests/test-guest-env-host.c \
-                tests/test-usb-desc-host.c
+                tests/test-usb-desc-host.c \
+                tests/test-elf-headers-host.c \
+                tests/test-gdbstub-host.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c
 SPECIAL_TEST_BINS := $(BUILD_DIR)/test-lowbase-mem-200000 $(BUILD_DIR)/test-lowbase-mem-300000
 

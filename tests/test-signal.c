@@ -13,6 +13,9 @@
  * 3. sigprocmask blocks/unblocks signals correctly
  * 4. SA_RESETHAND resets the handler to SIG_DFL after delivery
  * 5. alarm() interrupts a blocking read with EINTR
+ * 6. X7 survives delivery and rt_sigreturn (aarch64: the host uses X7 on the
+ *    HVC #5 return to ask the shim for a ptrace detour, and the tails that
+ *    rebuild EL0 state never restore it from the saved frame)
  */
 
 #include <errno.h>
@@ -22,6 +25,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <ucontext.h>
 
 static volatile sig_atomic_t handler_called = 0;
 static volatile int handler_signum = 0;
@@ -107,6 +111,45 @@ static int test_callee_saved(void)
 #undef N_CALLEE_SAVED
     return ok;
 }
+
+#if defined(__aarch64__)
+#define X7_CANARY 0x00C0FFEE0000B007ULL
+static volatile unsigned long uc_x7 = 0;
+
+static void x7_handler(int sig, siginfo_t *info, void *ucv)
+{
+    (void) info;
+    ucontext_t *uc = ucv;
+    uc_x7 = uc->uc_mcontext.regs[7];
+    handler_signum = sig;
+    handler_called = 1;
+}
+
+/* Park the canary in X7, then take an SVC that queues a signal to this thread.
+ * Delivery happens on that syscall's return path, so both the handler's
+ * ucontext and the state rt_sigreturn resumes on have to show the canary. A
+ * host-only flag left in X7 shows up as a zero in one or both.
+ */
+static unsigned long x7_across_signal(long pid, long sig)
+{
+    register long x0 __asm__("x0") = pid;
+    register long x1 __asm__("x1") = sig;
+    register unsigned long x7 __asm__("x7") = X7_CANARY;
+    register long x8 __asm__("x8") = 129; /* SYS_kill */
+
+    /* X8 is an in-out operand, not an input. Linux preserves it across SVC and
+     * so does the shim's frame restore, but a signal delivered on this return
+     * takes the drop-frame tail, and the frame rt_sigreturn restores from
+     * snapshotted X8 after the host had already written the TLBI request into
+     * it. Letting the compiler assume 129 survives would be wrong here.
+     */
+    __asm__ volatile("svc #0\n"
+                     : "+r"(x0), "+r"(x7), "+r"(x8)
+                     : "r"(x1)
+                     : "memory", "cc");
+    return x7;
+}
+#endif
 
 int main(void)
 {
@@ -223,6 +266,27 @@ int main(void)
             close(p[1]);
         }
     }
+
+#if defined(__aarch64__)
+    /* Test 6: X7 is not part of the syscall return ABI */
+    printf("test-signal: 6. X7 survives delivery and rt_sigreturn... ");
+    {
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = x7_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        handler_called = 0;
+        uc_x7 = 0;
+        unsigned long resumed = x7_across_signal(getpid(), SIGUSR1);
+        if (handler_called && uc_x7 == X7_CANARY && resumed == X7_CANARY) {
+            printf("PASS\n");
+        } else {
+            printf("FAIL (uc=0x%lx resumed=0x%lx)\n", uc_x7, resumed);
+            failures++;
+        }
+    }
+#endif
 
     if (failures == 0) {
         printf("test-signal: all tests passed -- PASS\n");

@@ -62,21 +62,29 @@ static int create_test_file(const char *path, const char *contents)
 int main(void)
 {
     int passes = 0, fails = 0;
-    const char *testfile = "/tmp/elfuse-test-file-ops.txt";
-    const char *symlink_path = "/tmp/elfuse-test-symlink";
-    const char *hardlink_path = "/tmp/elfuse-test-hardlink";
+
+    char tmpdir[] = "/tmp/elfuse-file-ops-XXXXXX";
+    if (!mkdtemp(tmpdir)) {
+        perror("mkdtemp");
+        return 1;
+    }
+    char testfile[256], symlink_path[256], hardlink_path[256];
+    char renamed_path[256], no_such_path[256], noreplace_dest[256];
+    snprintf(testfile, sizeof(testfile), "%s/file.txt", tmpdir);
+    snprintf(symlink_path, sizeof(symlink_path), "%s/symlink", tmpdir);
+    snprintf(hardlink_path, sizeof(hardlink_path), "%s/hardlink", tmpdir);
+    snprintf(renamed_path, sizeof(renamed_path), "%s/renamed.txt", tmpdir);
+    snprintf(no_such_path, sizeof(no_such_path), "%s/no-such.txt", tmpdir);
+    snprintf(noreplace_dest, sizeof(noreplace_dest), "%s/noreplace.txt",
+             tmpdir);
 
     printf("test-file-ops: Batch 1 file manipulation tests\n");
-
-    /* Clean up any leftover files */
-    unlink(testfile);
-    unlink(symlink_path);
-    unlink(hardlink_path);
 
     /* Create a test file */
     int fd;
     if (create_test_file(testfile, "hello\n") < 0) {
         printf("FATAL: cannot create %s\n", testfile);
+        rmdir(tmpdir);
         return 1;
     }
 
@@ -133,12 +141,12 @@ int main(void)
     TEST("readlinkat relative to dirfd");
     {
         char buf[256];
-        int dirfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+        int dirfd = open(tmpdir, O_RDONLY | O_DIRECTORY);
         if (dirfd < 0) {
-            FAIL("open /tmp failed");
+            FAIL("open tmpdir failed");
         } else {
-            ssize_t len = syscall(SYS_readlinkat, dirfd, "elfuse-test-symlink",
-                                  buf, sizeof(buf));
+            ssize_t len =
+                syscall(SYS_readlinkat, dirfd, "symlink", buf, sizeof(buf));
             close(dirfd);
             EXPECT_TRUE(len == (ssize_t) strlen(testfile) &&
                             !memcmp(buf, testfile, (size_t) len),
@@ -157,8 +165,7 @@ int main(void)
     TEST("readlinkat invalid dirfd");
     {
         char buf[1];
-        EXPECT_ERRNO(syscall(SYS_readlinkat, -1, "elfuse-test-symlink", buf,
-                             sizeof(buf)),
+        EXPECT_ERRNO(syscall(SYS_readlinkat, -1, "symlink", buf, sizeof(buf)),
                      EBADF, "expected EBADF for invalid dirfd");
     }
 
@@ -271,9 +278,7 @@ int main(void)
 
     TEST("renameat2");
     {
-        const char *renamed_path = "/tmp/elfuse-test-file-ops-renamed.txt";
         struct stat renamed_st, old_st;
-        unlink(renamed_path);
         long r = syscall(SYS_renameat2, AT_FDCWD, testfile, AT_FDCWD,
                          renamed_path, 0);
         if (r == 0 && stat(renamed_path, &renamed_st) == 0 &&
@@ -296,23 +301,21 @@ int main(void)
 
     TEST("renameat2 conflicting flags EINVAL");
     EXPECT_ERRNO(syscall(SYS_renameat2, AT_FDCWD, testfile, AT_FDCWD,
-                         "/tmp/elfuse-test-no-such.txt",
-                         RENAME_NOREPLACE | RENAME_EXCHANGE),
+                         no_such_path, RENAME_NOREPLACE | RENAME_EXCHANGE),
                  EINVAL, "expected EINVAL for conflicting flags");
 
     TEST("renameat2 NOREPLACE with existing dest");
     {
-        const char *dest = "/tmp/elfuse-test-noreplace-dest.txt";
-        int dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int dfd = open(noreplace_dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (dfd >= 0)
             close(dfd);
-        long r = syscall(SYS_renameat2, AT_FDCWD, testfile, AT_FDCWD, dest,
-                         RENAME_NOREPLACE);
+        long r = syscall(SYS_renameat2, AT_FDCWD, testfile, AT_FDCWD,
+                         noreplace_dest, RENAME_NOREPLACE);
         bool ok = (r == -1 && errno == EEXIST);
         /* Verify source still exists */
         struct stat st;
         ok = ok && (stat(testfile, &st) == 0);
-        unlink(dest);
+        unlink(noreplace_dest);
         EXPECT_TRUE(ok, "NOREPLACE should fail with EEXIST");
     }
 
@@ -367,6 +370,7 @@ int main(void)
     unlink(hardlink_path);
     unlink(symlink_path);
     unlink(testfile);
+    rmdir(tmpdir);
 
     SUMMARY("test-file-ops");
     return fails > 0 ? 1 : 0;

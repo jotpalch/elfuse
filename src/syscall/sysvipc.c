@@ -698,6 +698,13 @@ int64_t sys_msgget(guest_t *g, int32_t key, int msgflg)
 /* Max message size for stack allocation; larger messages use malloc. */
 #define MSG_STACK_THRESHOLD 4096
 
+/* Ceiling on a guest-supplied msgsz, checked before the sizeof(long) + msgsz
+ * total is formed so the addition cannot wrap. elfuse's own limit rather than a
+ * Linux constant: Linux caps msgsz at the per-queue MSGMAX (8192 by default,
+ * tunable through /proc/sys/kernel/msgmax, which elfuse does not emulate).
+ */
+#define MSG_SIZE_MAX 65536
+
 int64_t sys_msgsnd(guest_t *g,
                    int msqid,
                    uint64_t msgp_gva,
@@ -707,7 +714,7 @@ int64_t sys_msgsnd(guest_t *g,
     /* Linux msgsnd msgp layout: long mtype followed by msgsz bytes of message
      * text. Total read from guest = sizeof(long) + msgsz.
      */
-    if (msgsz > 65536)
+    if (msgsz > MSG_SIZE_MAX)
         return -LINUX_EINVAL;
 
     size_t total = sizeof(long) + (size_t) msgsz;
@@ -748,7 +755,7 @@ int64_t sys_msgrcv(guest_t *g,
                    int64_t msgtyp,
                    int msgflg)
 {
-    if (msgsz > 65536)
+    if (msgsz > MSG_SIZE_MAX)
         return -LINUX_EINVAL;
 
     /* MSG_EXCEPT and MSG_COPY are Linux-specific queue selection modes. macOS

@@ -20,7 +20,7 @@ of `make check`.
 The defaults below are what that table falls back to, not a substitute for it.
 
 ```
-make check                       # unit tests, busybox, syscall coverage gate
+make check                       # unit tests, busybox, coverage gate, guardrail
 bash tests/test-matrix.sh all    # the three modes
 ```
 
@@ -217,8 +217,8 @@ make infer-uninit          # uninitialized reads
 ## What done means
 
 Green is a claim about named commands, so report it as one: which lanes ran,
-what each said, and which ones did not run. Three failure modes to avoid, all
-of which have shipped before:
+what each said, and which ones did not run. The failure modes to avoid, all of
+which have shipped before:
 
 - A lane that could not run is named along with the risk that leaves. It is
   never rounded up into the passing set.
@@ -227,6 +227,21 @@ of which have shipped before:
   measured and is not.
 - A proof is done when `make verify` and `make verify-mutants` say so from the
   Makefile. MCP goals discharging is progress, not a verdict.
+- A failure blamed on the environment earns one reproduction attempt under the
+  condition blamed for it before it is written off. "Transient" and "the host
+  was busy" are the two that hide real defects here, because a test harness
+  racing its own pipeline and a probe that measures the wrong thing both fail
+  only under load or only on some networks. Reproduce it, or say it went
+  unexplained; do not report it as understood. Raising the reproduction rate on
+  a failure that will not repeat on demand is `elfuse-debug`, under "When it
+  only fails sometimes".
+
+The throughput guardrail is the exception to that bullet: it is the one lane
+where load genuinely decides the result. It runs near the end of `make check`,
+so it measures on a machine `make check` has just loaded, and an UNMEASURED
+verdict there says nothing about the change. Re-run `make test-bench-guardrail`
+alone on an idle host and report what it says. UNMEASURED exits non-zero
+exactly as a threshold violation does.
 
 Establish the baseline before a multi-command session rather than after: this
 tree is not green everywhere, and without the before-picture there is no way
@@ -241,3 +256,5 @@ so prefer them when the two disagree:
   area to command mapping.
 - `mk/verify.mk` - the per-target `_SRC` / `_MODEL` / `_FCTS` variables and
   the comment above each explaining its model choice.
+- `tests/test-bench-guardrail.sh` - the comment above the unmeasured check,
+  for why UNMEASURED and FAIL both exit non-zero.

@@ -1,5 +1,5 @@
 /*
- * EL1 shim globals -- host publisher.
+ * EL1 shim globals: host-side publisher
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -86,10 +86,14 @@ _Static_assert((SHIM_COUNTERS_OFF & 0xFFF) == 0xC8,
                "shim.S SHIM_COUNTERS_OFF_LO12 hard-coded to 0xC8");
 _Static_assert((SHIM_COUNTERS_OFF & ~0xFFF) == 0x1000,
                "shim.S SHIM_COUNTERS_OFF_HI hard-coded to 0x1000");
-_Static_assert(SHIM_IDENTITY_OFF_PGID == 0x1148,
-               "shim.S getpgid fast path hard-codes PGID off 0x1148");
-_Static_assert(SHIM_IDENTITY_OFF_SID == 0x1150,
-               "shim.S getsid fast path hard-codes SID off 0x1150");
+_Static_assert(SHIM_IDENTITY_OFF_PGID == 0x1158,
+               "shim.S getpgid fast path hard-codes PGID off 0x1158");
+_Static_assert(SHIM_IDENTITY_OFF_SID == 0x1160,
+               "shim.S getsid fast path hard-codes SID off 0x1160");
+_Static_assert(SHIM_FUTEX_WAITERS_OFF == 0x1168,
+               "shim.S futex_wake_fast hard-codes the waiter array at 0x1168");
+_Static_assert(SHIM_IDENTITY_OFF_SID + 8 <= SHIM_FUTEX_WAITERS_OFF,
+               "waiter array must not overlap the SID slot");
 _Static_assert(SHIM_GLOBALS_SIZE >= SHIM_IDENTITY_OFF_SID + 8,
                "SHIM_GLOBALS_SIZE must cover the PGID/SID slots");
 _Static_assert(SHIM_GLOBALS_SIZE <= BLOCK_2MIB,
@@ -285,18 +289,14 @@ void shim_globals_rebuild_urandom_bitmap(void)
     }
 }
 
-/* arc4random_buf is documented as deadlock-free and re-entrant. Used by the
- * initial fill at bootstrap and by the slow-path refill that runs from
- * sys_read/sys_getrandom when the shim's fast path falls through due to an
- * empty ring.
+/* Entropy is generated outside ring_lock, into a stack buffer, because
+ * arc4random_buf can take microseconds and a sibling vCPU hitting the fast path
+ * meanwhile spins on the lock. The lock is taken only to re-read head and copy
+ * the publishable prefix in.
  *
- * Entropy is generated OUTSIDE the ring_lock: arc4random_buf can take
- * microseconds, and any sibling vCPU that hits the fast path while the lock is
- * held spins (yield) until release. Generate up to a full ring into a stack
- * scratch buffer, then take the lock only to re-read head/fill and copy the
- * publishable prefix into the ring. The recheck after lock acquire matters: a
- * concurrent fast path may have advanced head while entropy was being
- * generated, raising the publishable count beyond the pre-lock estimate.
+ * The recheck under the lock is required, not defensive: a concurrent fast path
+ * can advance head while entropy is being generated, which raises the
+ * publishable count above the pre-lock estimate.
  */
 void shim_globals_refill_urandom_ring(guest_t *g)
 {
@@ -309,14 +309,11 @@ void shim_globals_refill_urandom_ring(guest_t *g)
         (_Atomic uint32_t *) (base + SHIM_URANDOM_OFF_RING_LOCK);
     uint8_t *ring = base + SHIM_URANDOM_OFF_RING;
 
-    /* Pre-lock estimate: skip the arc4random_buf + lock when the ring is
-     * already full. Both cursors are read RELAXED so a torn snapshot (head_pre
-     * observed past a producer step but tail_pre observed before it) can make
-     * tail_pre - head_pre wrap to a huge unsigned value. A loose ">= RING_SIZE"
-     * check would treat that garbage as "already full" and skip a
-     * genuinely-needed refill. Only the exact == RING_SIZE value is a safe
-     * full-detection; any other (valid or torn) reading falls through to the
-     * lock-held recheck below.
+    /* Skip the generate-and-lock when the ring is already full. Both cursors
+     * are read relaxed, so a torn snapshot can wrap tail_pre - head_pre to a
+     * huge unsigned value; a ">=" test would read that as full and skip a
+     * refill that was genuinely needed. Only an exact == RING_SIZE is safe, and
+     * everything else falls through to the recheck under the lock.
      */
     uint32_t head_pre = atomic_load_explicit(head_p, memory_order_relaxed);
     uint32_t tail_pre = atomic_load_explicit(tail_p, memory_order_relaxed);
@@ -365,16 +362,15 @@ void shim_globals_attn_or(guest_t *g, uint32_t bits)
     _Atomic uint32_t *slot =
         (_Atomic uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
 
-    /* SEQ_CST, not ACQ_REL. The CRED_BRACKETED invariant is the contrapositive
-     * of release-acquire: if a sibling vCPU LDAR-loads attn and sees 0, that
-     * sibling also does not yet observe any of the post-OR publish_creds
-     * stores. Acquire-release only guarantees the forward direction (observing
-     * the OR guarantees observing prior stores); the contrapositive needs a
-     * total order across atomics, which on ARM64 SEQ_CST provides via DMB ISH.
-     * The OR runs only on rare setuid/setgid/etc paths so the extra barrier is
-     * not a hot-path cost. shim_globals_attn_and stays RELEASE because it runs
-     * after publish_creds and only needs to order those prior stores before the
-     * clear.
+    /* SEQ_CST rather than ACQ_REL. CRED_BRACKETED needs the contrapositive of
+     * release-acquire: a sibling that LDAR-loads attn and sees 0 must also not
+     * yet observe any post-OR publish_creds store. Acquire-release gives only
+     * the forward direction; the contrapositive needs a total order across
+     * atomics, which SEQ_CST supplies on ARM64 via DMB ISH. This runs on the
+     * setuid family only, so the barrier is not on a hot path.
+     *
+     * attn_and stays RELEASE: it runs after publish_creds and only has to keep
+     * those stores ahead of the clear.
      */
     atomic_fetch_or_explicit(slot, bits, memory_order_seq_cst);
     vdso_attention_or(g, bits);
@@ -393,6 +389,19 @@ void shim_globals_attn_and(guest_t *g, uint32_t mask)
     vdso_attention_and(g, mask);
 }
 
+void shim_globals_ptrace_attention(guest_t *g, bool owed)
+{
+    /* OR to raise, AND to drop, so the signal and cred lanes are untouched
+     * either way. The raise has to be visible before the kick that follows it,
+     * which is the same ordering shim_globals_raise_attention documents; the
+     * drop only ever costs a spurious HVC, so RELEASE is enough.
+     */
+    if (owed)
+        shim_globals_attn_or(g, ATTN_BIT_PTRACE);
+    else
+        shim_globals_attn_and(g, ~ATTN_BIT_PTRACE);
+}
+
 void shim_globals_raise_attention(guest_t *g)
 {
     /* Signal/timer/exit-group lane. OR-only update so a concurrent cred
@@ -401,12 +410,10 @@ void shim_globals_raise_attention(guest_t *g)
      */
     shim_globals_attn_or(g, ATTN_BIT_SIGTIMER);
 
-    /* Kick any vCPU spinning in EL0 on the identity fast path. Without the
-     * exit, the spinning vCPU never traps into EL1 and never reads the new
-     * attention value, so a SIGALRM queued for it waits until its host-thread
-     * timeslice ends. Reusing the existing signal-preemption helper (which
-     * iterates the live vCPU set under thread_lock) avoids duplicating the
-     * iteration logic; on a single-vCPU guest the loop is essentially a no-op.
+    /* Kick every sibling vCPU. One spinning on an EL1 fast path never traps, so
+     * it never reads the new attention value and a SIGALRM queued for it would
+     * wait out its host timeslice. This reuses the signal-preemption helper,
+     * which already walks the live vCPU set under thread_lock.
      */
     thread_interrupt_all();
 }
@@ -433,6 +440,32 @@ void shim_globals_set_trace_enabled(guest_t *g, bool enabled)
         shim_globals_attn_and(g, ~ATTN_BIT_TRACE);
 }
 
+/* The shim hardcodes each counter's byte offset as a CB_* .equ; these pin those
+ * literals to the slot indices below. Without them the two drift silently, and
+ * a wrong offset writes into a neighbouring counter rather than failing to
+ * build. Every CB_* in core/shim.S is listed, not just the futex ones: a
+ * partial list reads as though the offsets are pinned when most are not.
+ */
+_Static_assert(SHIM_COUNTER_ATTN_BAIL * 8 == 0, "CB_ATTN_BAIL");
+_Static_assert(SHIM_COUNTER_URANDOM_FD_OOR * 8 == 8, "CB_URANDOM_FD_OOR");
+_Static_assert(SHIM_COUNTER_URANDOM_FD_BMISS * 8 == 16, "CB_URANDOM_FD_BMISS");
+_Static_assert(SHIM_COUNTER_URANDOM_LEN_ZERO * 8 == 24, "CB_URANDOM_LEN_ZERO");
+_Static_assert(SHIM_COUNTER_URANDOM_LEN_OVER * 8 == 32, "CB_URANDOM_LEN_OVER");
+_Static_assert(SHIM_COUNTER_URANDOM_RING_LOW * 8 == 40, "CB_URANDOM_RING_LOW");
+_Static_assert(SHIM_COUNTER_URANDOM_PROBE_FAIL * 8 == 56,
+               "CB_URANDOM_PROBE_FAIL");
+_Static_assert(SHIM_COUNTER_IDENTITY_HIT * 8 == 64, "CB_IDENTITY_HIT");
+_Static_assert(SHIM_COUNTER_URANDOM_HIT * 8 == 72, "CB_URANDOM_HIT");
+_Static_assert(SHIM_COUNTER_GETRANDOM_HIT * 8 == 80, "CB_GETRANDOM_HIT");
+_Static_assert(SHIM_COUNTER_PGSID_HIT * 8 == 88, "CB_PGSID_HIT");
+_Static_assert(SHIM_COUNTER_FUTEX_EAGAIN_HIT * 8 == 96, "CB_FUTEX_EAGAIN_HIT");
+_Static_assert(SHIM_COUNTER_FUTEX_EFAULT_HIT * 8 == 104, "CB_FUTEX_EFAULT_HIT");
+_Static_assert(SHIM_COUNTER_FUTEX_SHAPE_BAIL * 8 == 112, "CB_FUTEX_SHAPE_BAIL");
+_Static_assert(SHIM_COUNTER_FUTEX_MATCH_BAIL * 8 == 120, "CB_FUTEX_MATCH_BAIL");
+_Static_assert(SHIM_COUNTER_FUTEX_WAKE_HIT * 8 == 128, "CB_FUTEX_WAKE_HIT");
+_Static_assert(SHIM_COUNTER_FUTEX_WAKE_WAITER_BAIL * 8 == 136,
+               "CB_FUTEX_WAKE_WAITER_BAIL");
+
 static const char *const counter_names[SHIM_COUNTERS_N] = {
     [SHIM_COUNTER_ATTN_BAIL] = "ATTN_BAIL",
     [SHIM_COUNTER_URANDOM_FD_OOR] = "URANDOM_FD_OOR",
@@ -446,11 +479,17 @@ static const char *const counter_names[SHIM_COUNTERS_N] = {
     [SHIM_COUNTER_URANDOM_HIT] = "URANDOM_HIT",
     [SHIM_COUNTER_GETRANDOM_HIT] = "GETRANDOM_HIT",
     [SHIM_COUNTER_PGSID_HIT] = "PGSID_HIT",
+    [SHIM_COUNTER_FUTEX_EAGAIN_HIT] = "FUTEX_EAGAIN_HIT",
+    [SHIM_COUNTER_FUTEX_EFAULT_HIT] = "FUTEX_EFAULT_HIT",
+    [SHIM_COUNTER_FUTEX_SHAPE_BAIL] = "FUTEX_SHAPE_BAIL",
+    [SHIM_COUNTER_FUTEX_MATCH_BAIL] = "FUTEX_MATCH_BAIL",
+    [SHIM_COUNTER_FUTEX_WAKE_HIT] = "FUTEX_WAKE_HIT",
+    [SHIM_COUNTER_FUTEX_WAKE_WAITER_BAIL] = "FUTEX_WAKE_WAITER_BAIL",
 
-    /* Slots 12..15 (SHIM_COUNTERS_N == 16) are intentionally unnamed; the dump
-     * prints "(reserved)" so they appear in the output when non-zero, which
-     * would flag an out-of-band increment. Bind a name here when a future EL1
-     * service claims one of these slots.
+    /* Every slot of SHIM_COUNTERS_N == 18 is now named. The dump still prints
+     * "(reserved)" for an unnamed slot, which would flag an out-of-band
+     * increment; a future EL1 service needs the array grown rather than a free
+     * slot claimed.
      */
 };
 
@@ -492,20 +531,55 @@ bool shim_globals_stats_enabled(void)
     return stats_enabled_cache;
 }
 
+uint32_t shim_globals_futex_waiters_get(const guest_t *g, unsigned bucket)
+{
+    if (!g || bucket >= SHIM_FUTEX_BUCKETS)
+        return 0;
+    return atomic_load_explicit(
+        (_Atomic uint32_t *) (cache_base(g) + SHIM_FUTEX_WAITERS_OFF +
+                              bucket * 4u),
+        memory_order_seq_cst);
+}
+
+void shim_globals_futex_waiters_add(guest_t *g, unsigned bucket, int delta)
+{
+    if (!g || bucket >= SHIM_FUTEX_BUCKETS)
+        return;
+
+    _Atomic uint32_t *slot =
+        (_Atomic uint32_t *) (cache_base(g) + SHIM_FUTEX_WAITERS_OFF +
+                              bucket * 4u);
+
+    /* seq_cst, not relaxed or acq_rel. The waiter's increment has to be ordered
+     * against its own later read of the futex word, and the shim's read of this
+     * count against the guest's earlier store to that word: the store-buffer
+     * shape, where each side stores one location and loads the other. Only a
+     * total order over both makes "count reads zero" imply "the waiter will see
+     * the store". This runs once per blocking wait, which already costs a park.
+     *
+     * One add rather than a branch on the sign: a negative delta is added as
+     * its two's complement, which is the subtraction. The branch form applied
+     * one whatever the magnitude, so a caller charging two buckets at once
+     * would have been under-applied here, and an under-applied increment is the
+     * one direction the shim reads as "nobody parked".
+     */
+    atomic_fetch_add_explicit(slot, (uint32_t) delta, memory_order_seq_cst);
+}
+
 void shim_globals_publish_stats_gate(guest_t *g)
 {
     _Atomic uint8_t *slot =
         (_Atomic uint8_t *) (cache_base(g) + SHIM_GLOBALS_OFF_STATS_EN);
     uint8_t v = shim_globals_stats_enabled() ? 1 : 0;
 
-    /* One-shot bring-up publish. Every caller (bootstrap, fork-child receive,
-     * execve) runs before the guest vCPU starts executing, so the host-side
-     * ordering between this store and the first hv_vcpu_run is what makes the
-     * shim observe the published value; the release semantics here are
-     * conservative, not load-bearing. A future runtime setter that mutates the
-     * gate after guest entry would also need the shim side to upgrade its ldrb
-     * to ldarb (or gate the read on the attention flag) -- a release-store
-     * alone does not synchronize with a plain ldrb on the same address.
+    /* One-shot bring-up publish: every caller (bootstrap, fork-child receive,
+     * execve) runs before the vCPU executes, so what the shim observes is
+     * ordered by the first hv_vcpu_run and the release here is conservative
+     * rather than load-bearing.
+     *
+     * A setter that mutated the gate after guest entry would not be enough on
+     * its own: a release-store does not synchronize with the shim's plain ldrb,
+     * so that side would have to become ldarb or move behind attention.
      */
     atomic_store_explicit(slot, v, memory_order_release);
 }

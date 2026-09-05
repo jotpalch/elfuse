@@ -4,12 +4,16 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Minimal bench that measures the eleven labels the guardrail script checks,
- * all of which it extracts by name and holds to a ceiling:
+ * Minimal bench that measures thirteen labels. The guardrail script extracts
+ * twelve of them by name and holds each to a ceiling; hvc-floor is reported for
+ * the log rather than gated, for the reason its own comment gives below.
  *
  *   getpid          (raw SVC; shim identity fast path)
  *   clock_gettime   (vDSO trampoline; see -DGUARD_USE_LIBC_CG below)
  *   read-urandom1   (raw read; shim urandom ring fast path)
+ *   futex-eagain    (raw FUTEX_WAIT on a moved word; shim futex fast path)
+ *   hvc-floor       (a futex command the host does not implement; the HVC
+ *                    round trip and dispatch with no syscall work under it)
  *   stat-path       (full SVC round trip through guest_read_path)
  *   pipe-roundtrip  (write + read on a pipe; the read/write transfer path)
  *   pipe-eagain     (read of an empty nonblocking pipe; per-transfer cost)
@@ -53,6 +57,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -199,6 +204,54 @@ static long bench_clock_gettime(void *ctx)
      */
     return c->fn(CLOCK_MONOTONIC, &c->ts);
 #endif
+}
+
+/* Held at 1 while both futex lanes below ask for 0, so neither can block. */
+static int futex_word = 1;
+
+/* A futex command the host does not implement (FUTEX_FD), so sys_futex reaches
+ * its ENOSYS default having done nothing. That is the HVC round trip and the
+ * dispatch, with no syscall work under it: the price of admission for anything
+ * the host answers.
+ *
+ * Reported but deliberately not gated. The regression worth catching here is
+ * per-iteration work added to the vCPU run loop for the guest main thread only,
+ * which is what a setitimer-backed alarm around every hv_vcpu_run once was: two
+ * syscalls per guest syscall, about 38 percent of this row, invisible for as
+ * long as every measurement was quoted against a floor that included it.
+ *
+ * A ratio against getpid does not gate it honestly. getpid is served at EL1 and
+ * never pays the round trip, so under host load this row inflates and getpid
+ * does not: measured 40x idle against 89x on a loaded box. Any ceiling loose
+ * enough not to flake is looser than the regression.
+ *
+ * The load-invariant form is this same measurement taken on a worker vCPU
+ * thread beside the main-thread one, since both pay the round trip and the
+ * difference is exactly the main-thread-only work. That needs a case that runs
+ * on the sibling rather than beside it, which this harness does not express;
+ * the -mt cases run on the main thread with a sibling alive. Until then the row
+ * is a number in the make check log rather than a gate, which is still better
+ * than living in a bench nothing runs.
+ */
+static long bench_hvc_floor(void *ctx)
+{
+    (void) ctx;
+    return syscall(__NR_futex, &futex_word, 2 /* FUTEX_FD, unimplemented */, 0,
+                   NULL, NULL, 0);
+}
+
+/* The futex lane: an untimed FUTEX_WAIT whose word already moved, which the EL1
+ * shim answers with EAGAIN without the HVC round trip.
+ *
+ * A step function like the identity and urandom lanes: served it is ~51 ns, and
+ * any bail to the host lands past 2000 ns. Nothing else in the suite covers it,
+ * so a regression that merely stopped serving would otherwise pass every gate.
+ */
+static long bench_futex_eagain(void *ctx)
+{
+    (void) ctx;
+    return syscall(__NR_futex, &futex_word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0,
+                   NULL, NULL, 0);
 }
 
 static long bench_read_urandom1(void *ctx)
@@ -429,6 +482,8 @@ int main(int argc, char **argv)
         {"getpid", bench_getpid, NULL},
         {"clock_gettime", bench_clock_gettime, &cg_ctx},
         {"read-urandom1", bench_read_urandom1, &urandomfd},
+        {"futex-eagain", bench_futex_eagain, NULL},
+        {"hvc-floor", bench_hvc_floor, NULL},
         {"stat-path", bench_stat_path, &stat_buf},
         {"pipe-roundtrip", bench_pipe_roundtrip, &pipe_ctx},
         {"pipe-eagain", bench_pipe_eagain, &eagain_ctx},

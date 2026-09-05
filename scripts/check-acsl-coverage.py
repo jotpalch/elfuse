@@ -129,6 +129,18 @@ CHAR_PARAM_ALLOWLIST = {
     "gdb_parse_hex",
     "rsp_checksum",
     "nl_parse_link_filter",
+    # The three elf.c entries take a const char *display_path they only ever
+    # hand to log_error as %s. None dereferences it, so like
+    # nl_parse_link_filter there is no plain char read for the signedness to
+    # change.
+    "elf_place_segment",
+    "elf_check_placement",
+    "elf_record_load",
+    # elf_read_interp takes display_path on the same terms, and additionally
+    # reads the interpreter name it just filled. Those two reads go through an
+    # explicit (unsigned char), which is the invariant the rest of this list
+    # satisfies by never reading a plain char at all.
+    "elf_read_interp",
 }
 
 # A char parameter, with its signedness qualifier if it has one. Matching the

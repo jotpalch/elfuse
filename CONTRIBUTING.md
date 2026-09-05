@@ -64,13 +64,15 @@ Software requirements:
 * [shellcheck](https://www.shellcheck.net/), at warning severity.
 * [shfmt](https://github.com/mvdan/sh) and [black](https://github.com/psf/black), for shell and
   Python.
-  Neither version is pinned; `make indent` uses whatever is on `PATH` and skips the step when the
-  tool is absent.
+  Both are opt-in: neither version is pinned and no gate reads their output, so running them
+  unconditionally rewrites files nothing asked to change. Set `FORMAT_SHELL=1` or `FORMAT_PY=1`
+  to include them, and `make indent` still skips the step when the tool is absent.
 
 To maintain a uniform style across languages, run:
 * `make indent` to rewrite in place: `commentflow` over the C, shell, and assembly sources first,
-  then clang-format over the C sources, `shfmt -ln=bash -i 4 -ci -bn -fn -sr` over the shell
-  scripts, `black` over the Python scripts.
+  then clang-format over the C sources. Adding `FORMAT_SHELL=1` runs
+  `shfmt -ln=bash -i 4 -ci -bn -fn -sr` over the shell scripts and `FORMAT_PY=1` runs `black` over
+  the Python scripts.
   The order is not arbitrary. clang-format breaks a comment line that runs past the limit but never
   refills a short-wrapped one, so commentflow
   runs first and clang-format normalizes whatever indentation the reflow produced; the pair

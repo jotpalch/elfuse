@@ -11,7 +11,8 @@ from an entry there.
 This skill covers the host side of the boundary: taking guest arguments,
 translating them, and calling macOS. Anything that changes what the guest sees
 when it comes back is `elfuse-guest-abi`, even when the file lives under
-`src/syscall/`.
+`src/syscall/`. The guest chooses every argument a wrapper receives, so the
+rules for handling one it chose badly are `elfuse-security`.
 
 ## The steps
 
@@ -22,10 +23,10 @@ when it comes back is `elfuse-guest-abi`, even when the file lives under
    ```
 
    `<extra>` becomes `needs_extra_regs` in `syscall_table`
-   (`src/syscall/syscall.c`). The dispatcher always fetches X0-X2 and fetches
-   X3/X4/X5 only when it is set, so the criterion is whether the wrapper
-   expression consumes x3, x4, or x5 - not the syscall's documented argument
-   count. Several three-argument entries carry 1.
+   (`src/syscall/syscall.c`). The dispatcher always fetches X0-X2 and, on a
+   quiet run, fetches X3/X4/X5 only when it is set, so the criterion is
+   whether the wrapper expression consumes x3, x4, or x5 - not the syscall's
+   documented argument count. Several three-argument entries carry 1.
 
    The dispatcher zero-initializes x3-x5, so a wrapper that reads them with
    `<extra>` left at 0 sees a deterministic 0, not a stale register: a syscall
@@ -41,6 +42,15 @@ when it comes back is `elfuse-guest-abi`, even when the file lives under
 
 3. Implement it in two pieces. The `sc_` wrapper and the `sys_` function are
    not the same thing and do not live in the same file.
+
+   Write step 4's test before the `sys_` body, and have it pass a
+   distinguishable non-zero value in every slot the wrapper consumes. A test
+   written afterward is shaped by the implementation, so it accepts x3-x5
+   reading as zero and the `<extra>` mistake from step 1 survives its own
+   test. Run that test without elfuse's `-v`: the fetch is gated on
+   `verbose || ... || needs_extra_regs` (`src/syscall/syscall.c`), so a
+   verbose run hands the wrapper the real X3-X5 and passes on the very entry
+   the test exists to catch.
 
    3a. The wrapper goes in `src/syscall/syscall.c`, as one line built by the
    `SC_FORWARD` / `SC_LOCKED` / `SC_STUB` macros. It exists to unpack x0-x5
@@ -147,8 +157,9 @@ eventfd, timerfd, signalfd). A class check that reads the raw fd number is wrong
 a `dup`.
 
 The lock order is the comment at the top of `internal.h`. Acquire in the order
-it lists, and add a new lock to that comment before using it in a second
-module. Three constraints in it are not derivable from the ordering:
+it lists, and add a new lock to that comment as soon as it exists, whether or
+not a second module uses it. Three constraints in it are not derivable from
+the ordering:
 
 - The per-epoll-instance lock is taken under `fd_lock` by the close hook, but
   taken alone by `epoll_ctl` and `epoll_pwait`. This is the one a summary

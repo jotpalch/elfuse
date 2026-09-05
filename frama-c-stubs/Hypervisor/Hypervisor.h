@@ -36,7 +36,7 @@
 typedef int hv_return_t;
 
 #define HV_SUCCESS 0
-#define HV_BAD_ARGUMENT 0xfae94001
+#define HV_BAD_ARGUMENT 0xfae94003
 
 typedef uint64_t hv_vcpu_t;
 typedef uint32_t hv_reg_t;
@@ -104,7 +104,15 @@ typedef uint32_t hv_memory_flags_t;
 
 typedef uint32_t hv_exit_reason_t;
 
-#define HV_EXIT_REASON_CANCELED 1
+/* hv_vcpu_types.h enumerates these in order from zero. CANCELED read 1 until it
+ * was measured against the SDK, which put every analysis of the run loop's
+ * dispatch on the wrong branch. check-stub-constants.py compiles each of these
+ * against the SDK header, so the values are held rather than trusted.
+ */
+#define HV_EXIT_REASON_CANCELED 0
+#define HV_EXIT_REASON_EXCEPTION 1
+#define HV_EXIT_REASON_VTIMER_ACTIVATED 2
+#define HV_EXIT_REASON_UNKNOWN 3
 
 typedef struct {
     uint64_t syndrome;

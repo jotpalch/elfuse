@@ -64,8 +64,13 @@ check()
     fi
 }
 
-# The synopsis block runs from the "usage:" line to the first blank line.
-help_block="$("$ELFUSE" --help | awk '/^usage: /{f=1} f{if (!NF) exit; print}')"
+# The synopsis block runs from the "usage:" line to the first blank line. awk
+# reads to EOF rather than exiting there: an early exit closes the pipe while
+# elfuse is still writing --help, and under pipefail that SIGPIPE fails the run.
+# done latches at the first blank line so a later line starting with "usage: "
+# cannot re-arm the block, which is what exiting used to guarantee.
+help_block="$("$ELFUSE" --help |
+    awk '/^usage: / && !done {f = 1} f && !NF {f = 0; done = 1} f {print}')"
 
 # Collapsing runs of whitespace undoes the wrap without assuming how many lines
 # it takes or where the breaks fall, so re-grouping the flags is not a failure

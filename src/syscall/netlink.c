@@ -54,10 +54,6 @@
 #include "utils.h"
 #include <poll.h>
 
-#ifndef LINUX_MSG_DONTWAIT
-#define LINUX_MSG_DONTWAIT 0x40
-#endif
-
 static void netlink_close(int guest_fd);
 
 /* Linux netlink message structures. These structures are defined manually to
@@ -424,6 +420,46 @@ static size_t nl_put_attr(uint8_t *buf,
     return (size_t) aligned;
 }
 
+/* Backfill the nlmsghdr a dump builder reserved at msg_start, now that the
+ * message length is known. Every RTM_* dump frames its messages the same way,
+ * so the shape is stated here rather than once per builder.
+ */
+static void nl_finish_msg(const netlink_state_t *ns,
+                          uint8_t *buf,
+                          size_t msg_start,
+                          size_t off,
+                          uint16_t type)
+{
+    nlmsghdr_t hdr = {
+        .nlmsg_len = (uint32_t) (off - msg_start),
+        .nlmsg_type = type,
+        .nlmsg_flags = NLM_F_MULTI,
+        .nlmsg_seq = ns->seq,
+        .nlmsg_pid = ns->pid,
+    };
+    memcpy(buf + msg_start, &hdr, sizeof(hdr));
+}
+
+/* Terminate a dump with NLMSG_DONE.
+ *
+ * Returns the new offset, unchanged when the terminator does not fit, which is
+ * what the callers already did.
+ */
+static size_t nl_append_done(const netlink_state_t *ns,
+                             uint8_t *buf,
+                             size_t off,
+                             size_t max)
+{
+    if (off + NLMSG_HDRLEN > max)
+        return off;
+
+    /* The terminator is a bare header, so its own span is its whole length:
+     * proved/netlink.h asserts NLMSG_HDRLEN equals sizeof(nlmsghdr_t).
+     */
+    nl_finish_msg(ns, buf, off, off + NLMSG_HDRLEN, NLMSG_DONE);
+    return off + NLMSG_HDRLEN;
+}
+
 /* Build RTM_GETLINK response from host getifaddrs(). A non-empty name_filter or
  * non-zero index_filter restricts the reply to one matching link.
  */
@@ -497,33 +533,12 @@ static int nl_build_getlink(netlink_state_t *ns,
         n = nl_put_attr(buf + off, max - off, IFLA_MTU, &mtu, 4);
         off += n;
 
-        /* Backfill nlmsghdr now that nlmsg_len is known (header is reserved at
-         * msg_start; attributes were written after it).
-         */
-        nlmsghdr_t hdr = {
-            .nlmsg_len = (uint32_t) (off - msg_start),
-            .nlmsg_type = RTM_NEWLINK,
-            .nlmsg_flags = NLM_F_MULTI,
-            .nlmsg_seq = ns->seq,
-            .nlmsg_pid = ns->pid,
-        };
-        memcpy(buf + msg_start, &hdr, sizeof(hdr));
+        nl_finish_msg(ns, buf, msg_start, off, RTM_NEWLINK);
     }
 
     freeifaddrs(ifalist);
 
-    /* Append NLMSG_DONE */
-    if (off + NLMSG_HDRLEN <= max) {
-        nlmsghdr_t done = {
-            .nlmsg_len = NLMSG_HDRLEN,
-            .nlmsg_type = NLMSG_DONE,
-            .nlmsg_flags = NLM_F_MULTI,
-            .nlmsg_seq = ns->seq,
-            .nlmsg_pid = ns->pid,
-        };
-        memcpy(buf + off, &done, sizeof(done));
-        off += NLMSG_HDRLEN;
-    }
+    off = nl_append_done(ns, buf, off, max);
 
     ns->buf_len = off;
     ns->buf_pos = 0;
@@ -606,30 +621,12 @@ static int nl_build_getaddr(netlink_state_t *ns)
             off += nl_put_attr(buf + off, max - off, IFA_ADDRESS, addr, 16);
         }
 
-        nlmsghdr_t hdr = {
-            .nlmsg_len = (uint32_t) (off - msg_start),
-            .nlmsg_type = RTM_NEWADDR,
-            .nlmsg_flags = NLM_F_MULTI,
-            .nlmsg_seq = ns->seq,
-            .nlmsg_pid = ns->pid,
-        };
-        memcpy(buf + msg_start, &hdr, sizeof(hdr));
+        nl_finish_msg(ns, buf, msg_start, off, RTM_NEWADDR);
     }
 
     freeifaddrs(ifalist);
 
-    /* NLMSG_DONE */
-    if (off + NLMSG_HDRLEN <= max) {
-        nlmsghdr_t done = {
-            .nlmsg_len = NLMSG_HDRLEN,
-            .nlmsg_type = NLMSG_DONE,
-            .nlmsg_flags = NLM_F_MULTI,
-            .nlmsg_seq = ns->seq,
-            .nlmsg_pid = ns->pid,
-        };
-        memcpy(buf + off, &done, sizeof(done));
-        off += NLMSG_HDRLEN;
-    }
+    off = nl_append_done(ns, buf, off, max);
 
     ns->buf_len = off;
     ns->buf_pos = 0;

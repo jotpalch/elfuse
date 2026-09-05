@@ -63,6 +63,7 @@ static void inotify_close(int guest_fd);
 #define IN_NONBLOCK 0x00000800
 /* Same as O_CLOEXEC on aarch64. */
 #define IN_CLOEXEC 0x00080000
+#define IN_Q_OVERFLOW 0x00004000
 /* OR new events into existing mask. */
 #define IN_MASK_ADD 0x20000000
 
@@ -543,8 +544,8 @@ static int process_vnode_event(inotify_instance_t *inst,
     }
 
     if (overflow) {
-        /* IN_Q_OVERFLOW (0x4000) uses wd=-1 per Linux semantics. */
-        queue_event(inst, -1, 0x4000, 0, NULL);
+        /* IN_Q_OVERFLOW uses wd=-1 per Linux semantics. */
+        queue_event(inst, -1, IN_Q_OVERFLOW, 0, NULL);
         return -1;
     }
     return queued;

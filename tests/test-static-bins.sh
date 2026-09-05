@@ -90,7 +90,7 @@ srun_check()
     if [ "$rc" -eq 124 ]; then
         test_report fail "$label" " (timeout)"
         fail=$((fail + 1))
-    elif echo "$output" | grep -qE "$pattern"; then
+    elif grep -qE "$pattern" <<< "$output"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
@@ -124,7 +124,7 @@ srun_pipe()
     if [ "$rc" -eq 124 ]; then
         test_report fail "$label" " (timeout)"
         fail=$((fail + 1))
-    elif echo "$output" | grep -qE "$pattern"; then
+    elif grep -qE "$pattern" <<< "$output"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
@@ -158,7 +158,7 @@ srun_script()
     if [ "$rc" -eq 124 ]; then
         test_report fail "$label" " (timeout)"
         fail=$((fail + 1))
-    elif echo "$output" | grep -qE "$pattern"; then
+    elif grep -qE "$pattern" <<< "$output"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
@@ -355,7 +355,7 @@ if [ -n "$DIFF_BIN" ]; then
     if [ "$rc" -eq 124 ]; then
         test_report fail "$label" " (timeout)"
         fail=$((fail + 1))
-    elif [ "$rc" = "1" ] && echo "$output" | grep -qE "^[<>]"; then
+    elif [ "$rc" = "1" ] && grep -qE "^[<>]" <<< "$output"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else

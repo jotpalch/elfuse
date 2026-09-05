@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #include "core/elf.h"
 #include "debug/log.h"
@@ -22,9 +23,12 @@
 
 /* Verified parsing core.
  *
- * The five functions below take scalars and a bounded byte buffer, touch no
- * I/O, and carry ACSL contracts discharged by Frama-C WP with -wp-rte (make
- * verify-elf). They are ordered primitive-first.
+ * Eight functions are discharged by Frama-C WP with -wp-rte (make verify-elf):
+ * the five primitives below, which take scalars and a bounded byte buffer and
+ * touch no I/O, plus elf_place_segment and elf_check_placement further down,
+ * which decide a segment's destination and reach no I/O either. They are
+ * ordered primitive-first. hex_nibble comes from utils.h and is proved here
+ * too, so its contract is not assumed.
  *
  * Covered: the offsets and extents feeding the host-side reads and writes in
  * THIS file. The unproved code around them computes no guest-slab offset or
@@ -240,48 +244,125 @@ static bool elf_segment_extent(uint64_t vaddr,
     return true;
 }
 
+/* Sort n recorded segments by ascending gpa, in place.
+ *
+ * elf_map_segments_fd zeroes a segment's page tail before reading the next
+ * one's file data, so a segment listed ahead of a lower-addressed one used to
+ * be loaded first and then wiped by that one's fill. The mapper no longer
+ * depends on the order, but the boot regions and /proc/self/maps still read
+ * better in address order, and the overlap scan below needs it.
+ *
+ * Insertion sort: n is at most ELF_MAX_SEGMENTS and real images arrive sorted,
+ * so this is n-1 comparisons and no moves in the common case.
+ */
+static void elf_sort_segments(elf_segment_t *segs, int n)
+{
+    for (int i = 1; i < n; i++) {
+        elf_segment_t seg = segs[i];
+        int j = i;
+        while (j > 0 && segs[j - 1].gpa > seg.gpa) {
+            segs[j] = segs[j - 1];
+            j--;
+        }
+        segs[j] = seg;
+    }
+}
+
+/* Index of the first segment whose extent runs into its predecessor's, or -1
+ * when none does. Requires segs sorted by gpa, which is what makes an adjacent
+ * pair enough; neither end can wrap, because elf_record_load rejected a
+ * wrapping extent.
+ *
+ * Returns an index rather than logging so the diagnostic, and the char pointer
+ * it needs, stay with the caller.
+ */
+static int elf_first_overlap(const elf_segment_t *segs, int n)
+{
+    for (int i = 1; i < n; i++) {
+        if (segs[i].gpa < segs[i - 1].gpa + segs[i - 1].memsz)
+            return i;
+    }
+    return -1;
+}
+
 /* Read a PT_INTERP segment's dynamic linker path into info->interp_path.
  *
- * Returns 0 on success, -1 when the path does not fit. The path lives in the
- * file rather than in a loadable segment, so it is read while the ELF is still
- * open.
+ * Returns true when info->interp_path holds a usable name. The path lives in
+ * the file rather than in a loadable segment, so it is read while the ELF is
+ * still open.
+ *
+ * Every caller decides static versus dynamic from interp_path[0] (bootstrap.c
+ * and exec.c), so a name this cannot deliver has to be an error rather than an
+ * empty field: leaving it empty loads a dynamic executable with no loader and
+ * enters its unrelocated entry point.
  */
-static int elf_read_interp(int fd,
-                           const elf64_phdr_t *ph,
-                           const char *display_path,
-                           elf_info_t *info)
+static bool elf_read_interp(int fd,
+                            const elf64_phdr_t *ph,
+                            const char *display_path,
+                            elf_info_t *info)
 {
     size_t len = ph->p_filesz;
-    if (len >= sizeof(info->interp_path)) {
-        log_error("%s: PT_INTERP path too long (%zu >= %zu)", display_path, len,
-                  sizeof(info->interp_path));
-        return -1;
-    }
-    if (len == 0)
-        return 0;
 
-    /* len counts the NUL stored in the file. A short read leaves the path
-     * unusable, so clear it rather than act on a truncated interpreter name; a
-     * full read is force-terminated as insurance.
+    /* Linux wants at least one character and the NUL after it
+     * (fs/binfmt_elf.c).
      */
-    if (pread(fd, info->interp_path, len, ph->p_offset) < (ssize_t) len)
-        info->interp_path[0] = '\0';
-    else
-        info->interp_path[len - 1] = '\0';
-    return 0;
+    if (len < 2 || len >= sizeof(info->interp_path)) {
+        log_error("%s: PT_INTERP length %zu outside [2, %zu)", display_path,
+                  len, sizeof(info->interp_path));
+        return false;
+    }
+
+    if (pread(fd, info->interp_path, len, ph->p_offset) != (ssize_t) len) {
+        log_error("%s: failed to read the PT_INTERP path", display_path);
+        return false;
+    }
+
+    /* Linux requires the terminator at exactly p_filesz - 1. Writing one there
+     * instead drops the last character of an unterminated path.
+     *
+     * Read through (unsigned char) here and below: the proof's data model makes
+     * plain char signed and arm64 macOS makes it unsigned, so a proved function
+     * may not read one without saying which it means.
+     */
+    if ((unsigned char) info->interp_path[len - 1] != '\0') {
+        log_error("%s: PT_INTERP path is unterminated", display_path);
+        return false;
+    }
+
+    /* A terminator in the first byte satisfies the rule above and still names
+     * nothing. Linux fails it one step later, at open_exec("").
+     */
+    if ((unsigned char) info->interp_path[0] == '\0') {
+        log_error("%s: PT_INTERP names the empty path", display_path);
+        return false;
+    }
+    return true;
 }
 
 /* Record one PT_LOAD segment and fold its extent into the load bounds.
  *
- * Returns 0 on success, -1 when the segment table is full or the extent wraps.
- * seg_count is the caller's running total, kept out of info until the whole
- * table parses so a rejected ELF leaves no partial segment list behind.
+ * Returns true when the segment was recorded, or deliberately skipped because
+ * it maps no bytes. seg_count is the caller's running total, kept out of info
+ * until the whole table parses so a rejected ELF leaves no partial segment list
+ * behind.
+ *
+ * The lower bound on *seg_count is the caller's to keep: this function only
+ * ever raises it, and the ceiling below is what stops it passing
+ * ELF_MAX_SEGMENTS, but nothing here can see that it started at 0. Without the
+ * requires, the write to segments[slot] is an unproved index.
  */
-static int elf_record_load(const elf64_phdr_t *ph,
-                           const char *display_path,
-                           uint16_t idx,
-                           int *seg_count,
-                           elf_info_t *info)
+/*@
+  requires \valid(seg_count);
+  requires 0 <= *seg_count <= ELF_MAX_SEGMENTS;
+  requires \valid(info);
+  requires \separated(seg_count, info);
+ */
+static bool elf_record_load(const elf64_phdr_t *ph,
+                            const char *display_path,
+                            uint16_t idx,
+                            uint64_t file_size,
+                            int *seg_count,
+                            elf_info_t *info)
 {
     /* Linux ignores a PT_LOAD that maps no bytes, and so does the mapper.
      * Recording it anyway would still feed load_min/load_max, the boot region
@@ -291,11 +372,42 @@ static int elf_record_load(const elf64_phdr_t *ph,
      * there.
      */
     if (ph->p_memsz == 0)
-        return 0;
+        return true;
+
+    /* A segment cannot hold more initialized data than it has memory for, and
+     * cannot draw that data from past the end of the file. elf_segment_extent
+     * rejects the first pair and the pread below rejects the second, but both
+     * run inside elf_map_segments_fd, which sys_execve reaches only after the
+     * point of no return where the sole remaining option is exit(128). Decide
+     * it here, where execve can still return ENOEXEC. Same reasoning as the
+     * interpreter extent check in exec.c.
+     */
+    if (ph->p_filesz > ph->p_memsz) {
+        log_error("%s: PT_LOAD %u filesz 0x%llx exceeds memsz 0x%llx",
+                  display_path, idx, (unsigned long long) ph->p_filesz,
+                  (unsigned long long) ph->p_memsz);
+        return false;
+    }
+
+    /* p_offset is only meaningful when the segment draws file data: a BSS-only
+     * PT_LOAD carries whatever offset the linker left there, and the mapper
+     * reads nothing for it.
+     */
+    uint64_t file_end;
+    if (ph->p_filesz != 0 &&
+        (!elf_add_no_wrap(ph->p_offset, ph->p_filesz, &file_end) ||
+         file_end > file_size)) {
+        log_error(
+            "%s: PT_LOAD %u file range 0x%llx+0x%llx runs past the end of the "
+            "file (0x%llx)",
+            display_path, idx, (unsigned long long) ph->p_offset,
+            (unsigned long long) ph->p_filesz, (unsigned long long) file_size);
+        return false;
+    }
 
     if (*seg_count >= ELF_MAX_SEGMENTS) {
         log_error("%s: too many PT_LOAD segments", display_path);
-        return -1;
+        return false;
     }
 
     /* A PT_LOAD whose extent wraps past the end of the address space is
@@ -309,7 +421,7 @@ static int elf_record_load(const elf64_phdr_t *ph,
         log_error("%s: PT_LOAD %u extent 0x%llx+0x%llx wraps the address space",
                   display_path, idx, (unsigned long long) ph->p_vaddr,
                   (unsigned long long) ph->p_memsz);
-        return -1;
+        return false;
     }
 
     int slot = *seg_count;
@@ -324,12 +436,24 @@ static int elf_record_load(const elf64_phdr_t *ph,
         info->load_min = ph->p_vaddr;
     if (seg_end > info->load_max)
         info->load_max = seg_end;
-    return 0;
+    return true;
 }
 
 int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
 {
     memset(info, 0, sizeof(*info));
+
+    /* Every file range recorded below is checked against this, so a truncated
+     * image is rejected during the parse instead of by a short pread inside
+     * elf_map_segments_fd, which sys_execve reaches only past its point of no
+     * return.
+     */
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        log_error("%s: cannot stat the ELF image", display_path);
+        return -1;
+    }
+    uint64_t file_size = (uint64_t) st.st_size;
 
     elf64_ehdr_t ehdr;
     if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) {
@@ -408,6 +532,7 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
 
     /* Collect only the program headers that affect process startup. */
     int seg_count = 0;
+    bool have_interp = false;
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         /* Zero-initialized so the phdr scratch is never read uninitialized on a
          * path Pulse cannot follow; three of the suppressed Infer findings were
@@ -420,21 +545,51 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
             goto fail;
         }
 
-        if (ph.p_type == PT_INTERP &&
-            elf_read_interp(fd, &ph, display_path, info) < 0)
-            goto fail;
+        /* Linux stops its header scan at the first PT_INTERP (fs/binfmt_elf.c),
+         * so a later one is ignored rather than allowed to replace it. Taking
+         * the last instead lets a second, empty PT_INTERP downgrade a dynamic
+         * executable to a static load.
+         */
+        if (ph.p_type == PT_INTERP && !have_interp) {
+            if (!elf_read_interp(fd, &ph, display_path, info))
+                goto fail;
+            have_interp = true;
+        }
 
         if (ph.p_type == PT_LOAD &&
-            elf_record_load(&ph, display_path, i, &seg_count, info) < 0)
+            !elf_record_load(&ph, display_path, i, file_size, &seg_count, info))
             goto fail;
     }
-
-    info->num_segments = seg_count;
 
     if (seg_count == 0) {
         log_error("%s: no PT_LOAD segments", display_path);
         goto fail;
     }
+
+    /* The ELF spec requires PT_LOADs in ascending p_vaddr and every linker
+     * emits them that way, but the file cannot be trusted to. Sorting keeps an
+     * out-of-order image loadable, which rejecting would not.
+     */
+    elf_sort_segments(info->segments, seg_count);
+
+    /* Reject PT_LOADs that claim the same bytes: finalize_block_perms unions
+     * the permissions of every region covering a page, so the shared pages
+     * would carry both segments' PF_ bits. Byte granularity, not page: two
+     * segments merely sharing a page after rounding are legal and Linux runs
+     * them.
+     */
+    int bad = elf_first_overlap(info->segments, seg_count);
+    if (bad > 0) {
+        log_error("%s: PT_LOAD extents 0x%llx+0x%llx and 0x%llx+0x%llx overlap",
+                  display_path,
+                  (unsigned long long) info->segments[bad - 1].gpa,
+                  (unsigned long long) info->segments[bad - 1].memsz,
+                  (unsigned long long) info->segments[bad].gpa,
+                  (unsigned long long) info->segments[bad].memsz);
+        goto fail;
+    }
+
+    info->num_segments = seg_count;
 
     /* AT_PHDR, following Linux 5.19+ (commit 0da1d5002745, which replaced the
      * older load_addr + e_phoff): the program headers are visible to the guest
@@ -490,6 +645,107 @@ int elf_load(const char *path, elf_info_t *info)
     return rc;
 }
 
+bool elf_interp_is_loadable(const elf_info_t *info, const char *display_path)
+{
+    if (info->e_machine != EM_AARCH64) {
+        log_error("%s: interpreter has unsupported machine type %u",
+                  display_path, info->e_machine);
+        return false;
+    }
+
+    /* Both load paths map the interpreter at g->interp_base + p_vaddr, which is
+     * the right address only for ET_DYN. An ET_EXEC loader links at a fixed
+     * address, so it would run with every absolute reference off by interp_base
+     * and fault somewhere inside relocation processing.
+     */
+    if (info->e_type != ET_DYN) {
+        log_error("%s: interpreter is not position-independent (e_type=%u)",
+                  display_path, info->e_type);
+        return false;
+    }
+
+    /* An interpreter naming an interpreter of its own would need a loader
+     * elfuse does not have, and nothing here would load it.
+     */
+    if (info->interp_path[0] != '\0') {
+        log_error("%s: interpreter requests an interpreter of its own (%s)",
+                  display_path, info->interp_path);
+        return false;
+    }
+    return true;
+}
+
+/* Decide where one PT_LOAD lands and whether it may land there.
+ *
+ * Returns false, with the reason logged, when the window puts the segment
+ * outside guest memory or on top of the runtime infra reserve. When infra_lo ==
+ * infra_hi the caller opted out (early bring-up before guest_t is wired up);
+ * the guest_size bound still applies.
+ */
+static bool elf_place_segment(const elf_segment_t *seg,
+                              const char *display_path,
+                              uint64_t guest_size,
+                              elf_window_t window,
+                              uint64_t infra_lo,
+                              uint64_t infra_hi,
+                              uint64_t *gpa_out,
+                              uint64_t *zero_len_out)
+{
+    uint64_t gpa, zero_len;
+
+    if (!elf_segment_extent(seg->gpa, window.va_base, window.target_base,
+                            seg->filesz, seg->memsz, guest_size, &gpa,
+                            &zero_len)) {
+        log_error(
+            "%s: segment vaddr 0x%llx (memsz 0x%llx, filesz 0x%llx) is "
+            "not loadable: %s [window va_base 0x%llx target 0x%llx, guest "
+            "size 0x%llx]",
+            display_path, (unsigned long long) seg->gpa,
+            (unsigned long long) seg->memsz, (unsigned long long) seg->filesz,
+            seg->gpa < window.va_base ? "below the relocation window"
+                                      : "does not fit guest memory",
+            (unsigned long long) window.va_base,
+            (unsigned long long) window.target_base,
+            (unsigned long long) guest_size);
+        return false;
+    }
+
+    /* Half-open intersection test for [gpa, gpa+zero_len) and the reserve. */
+    if (infra_lo < infra_hi && gpa < infra_hi && gpa + zero_len > infra_lo) {
+        log_error(
+            "%s: segment at 0x%llx+0x%llx (zero-extent 0x%llx) overlaps "
+            "infra reserve [0x%llx, 0x%llx)",
+            display_path, (unsigned long long) gpa,
+            (unsigned long long) seg->memsz, (unsigned long long) zero_len,
+            (unsigned long long) infra_lo, (unsigned long long) infra_hi);
+        return false;
+    }
+
+    *gpa_out = gpa;
+    *zero_len_out = zero_len;
+    return true;
+}
+
+bool elf_check_placement(const elf_info_t *info,
+                         const char *display_path,
+                         uint64_t guest_size,
+                         elf_window_t window,
+                         uint64_t infra_lo,
+                         uint64_t infra_hi)
+{
+    uint64_t gpa, zero_len;
+    /*@
+      loop invariant 0 <= i;
+      loop variant info->num_segments - i;
+     */
+    for (int i = 0; i < info->num_segments; i++) {
+        if (!elf_place_segment(&info->segments[i], display_path, guest_size,
+                               window, infra_lo, infra_hi, &gpa, &zero_len))
+            return false;
+    }
+    return true;
+}
+
 int elf_map_segments_fd(const elf_info_t *info,
                         int fd,
                         const char *display_path,
@@ -499,13 +755,6 @@ int elf_map_segments_fd(const elf_info_t *info,
                         uint64_t infra_lo,
                         uint64_t infra_hi)
 {
-    /* Half-open intersection test for [a, a+alen) and [b, b+blen). When
-     * infra_lo == infra_hi the caller opted out (early bring-up before guest_t
-     * is wired up); the host-side writes that follow still get the existing
-     * guest_size bound check.
-     */
-    bool infra_active = infra_lo < infra_hi;
-
     /* The layout comes entirely from the single parse in elf_load_fd. Do not
      * re-read or re-parse the header here.
      *
@@ -524,72 +773,49 @@ int elf_map_segments_fd(const elf_info_t *info,
      * load_base as a side effect; when no segment covers the table phdr_gpa is
      * 0 and AT_PHDR reports 0, as on Linux. Dropping that copy removed the last
      * hand-written extent check in this file along with the second destination
-     * it guarded.
+     * it guarded. Two passes, because a segment's zero fill runs to the end of
+     * the page its extent lands in and can therefore reach into the next
+     * segment. Zeroing everything before reading anything means no fill can
+     * land on file data already placed, whatever order the segments are in.
+     * elf_load_fd sorts them for other reasons, so this is not what makes the
+     * common case work; it is what stops the mapper depending on that sort.
+     *
+     * Zero only the tail beyond filesz: the BSS portion [filesz, memsz) plus
+     * the page-padding [memsz, zero_len) that Linux guarantees clean for
+     * dynamic linkers allocating from the last mapped page's tail. Skipping the
+     * file-data range avoids writing zeros the second pass would overwrite; for
+     * typical shared libraries that is a hundreds-of-KiB win per segment.
      */
     for (int i = 0; i < info->num_segments; i++) {
-        uint64_t filesz = info->segments[i].filesz;
-        uint64_t memsz = info->segments[i].memsz;
         uint64_t gpa, zero_len;
 
-        if (!elf_segment_extent(info->segments[i].gpa, window.va_base,
-                                window.target_base, filesz, memsz, guest_size,
-                                &gpa, &zero_len)) {
-            log_error(
-                "%s: segment vaddr 0x%llx (memsz 0x%llx, filesz 0x%llx) is "
-                "not loadable: %s [window va_base 0x%llx target 0x%llx, guest "
-                "size 0x%llx]",
-                display_path, (unsigned long long) info->segments[i].gpa,
-                (unsigned long long) memsz, (unsigned long long) filesz,
-                info->segments[i].gpa < window.va_base
-                    ? "below the relocation window"
-                    : (filesz > memsz ? "filesz exceeds memsz"
-                                      : "does not fit guest memory"),
-                (unsigned long long) window.va_base,
-                (unsigned long long) window.target_base,
-                (unsigned long long) guest_size);
+        if (!elf_place_segment(&info->segments[i], display_path, guest_size,
+                               window, infra_lo, infra_hi, &gpa, &zero_len))
             return -1;
-        }
 
-        /* PT_LOAD with memsz == 0 maps no bytes, but the page-tail zero extent
-         * still rounds up to the next page boundary. For an unaligned gpa that
-         * means a crafted ELF could splat zeros across the tail of a previously
-         * loaded segment in the same page, or trip the infra-overlap check with
-         * no live mapping behind it. Linux ignores zero-memsz PT_LOADs; mirror
-         * that here.
-         */
-        if (memsz == 0)
-            continue;
-
-        if (infra_active && gpa < infra_hi && gpa + zero_len > infra_lo) {
-            log_error(
-                "%s: segment at 0x%llx+0x%llx (zero-extent 0x%llx) overlaps "
-                "infra reserve [0x%llx, 0x%llx)",
-                display_path, (unsigned long long) gpa,
-                (unsigned long long) memsz, (unsigned long long) zero_len,
-                (unsigned long long) infra_lo, (unsigned long long) infra_hi);
-            return -1;
-        }
-
-        /* Zero only the tail beyond filesz: the BSS portion [filesz, memsz)
-         * plus the page-padding [memsz, zero_len) that Linux guarantees clean
-         * for dynamic linkers allocating from the last mapped page's tail.
-         * Skipping the file-data range avoids writing zeros that the pread
-         * below would immediately overwrite; for typical shared libraries that
-         * is a hundreds-of-KiB win per segment.
-         */
+        uint64_t filesz = info->segments[i].filesz;
         if (zero_len > filesz)
             memset((uint8_t *) guest_base + gpa + filesz, 0, zero_len - filesz);
+    }
 
-        if (filesz > 0) {
-            if (pread(fd, (uint8_t *) guest_base + gpa, filesz,
-                      info->segments[i].offset) != (ssize_t) filesz) {
-                log_error(
-                    "%s: short read for segment at 0x%llx "
-                    "(expected %llu)",
-                    display_path, (unsigned long long) gpa,
-                    (unsigned long long) filesz);
-                return -1;
-            }
+    for (int i = 0; i < info->num_segments; i++) {
+        uint64_t gpa, zero_len;
+
+        /* Cannot fail: the first pass placed the same segment. */
+        if (!elf_place_segment(&info->segments[i], display_path, guest_size,
+                               window, infra_lo, infra_hi, &gpa, &zero_len))
+            return -1;
+
+        uint64_t filesz = info->segments[i].filesz;
+        if (filesz == 0)
+            continue;
+
+        if (pread(fd, (uint8_t *) guest_base + gpa, filesz,
+                  info->segments[i].offset) != (ssize_t) filesz) {
+            log_error("%s: short read for segment at 0x%llx (expected %llu)",
+                      display_path, (unsigned long long) gpa,
+                      (unsigned long long) filesz);
+            return -1;
         }
     }
 

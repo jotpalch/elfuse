@@ -1395,6 +1395,21 @@ static bool epoll_target_pollable(int kq, int host_fd)
     return true;
 }
 
+/* A directory takes no knote on Linux whatever it is mounted from: kernfs
+ * installs its poll method on sysfs *attributes*, and sysfs_dir_operations has
+ * none, so epoll_ctl(ADD) on /sys, /sys/class or /sys/bus/usb/devices is EPERM
+ * while the attributes under them are accepted (measured on 6.x). The
+ * path-based capability answer is a per-subtree one and cannot see that
+ * distinction, so it is asked only after the object has been ruled out as a
+ * directory -- otherwise every synthetic /sys directory was accepted while the
+ * sysroot-backed directory beside it was refused, for the same guest name.
+ */
+static bool epoll_target_is_dir(int host_fd)
+{
+    struct stat st;
+    return fstat(host_fd, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 /* Whether Linux would take this target at all. A plain file has no poll method
  * and kqueue does not mind, so that refusal originates here; fstat answers it
  * rather than the fd type, since FD_REGULAR also covers a fifo or a tty opened
@@ -1406,6 +1421,9 @@ static bool epoll_target_pollable(int kq, int host_fd)
  */
 static bool epoll_target_supported(int kq, const fd_entry_t *snap)
 {
+    if (epoll_target_is_dir(snap->host_fd))
+        return false;
+
     /* A settled path answers for itself. The kqueue probe would veto
      * /dev/random, which Linux polls and macOS refuses a knote on.
      */
@@ -1442,6 +1460,8 @@ static void epoll_undo_changes(int kq, const struct kevent *changes, int n)
  */
 static bool epoll_target_supported_standalone(const fd_entry_t *snap)
 {
+    if (epoll_target_is_dir(snap->host_fd))
+        return false;
     if (snap->path_poll_capable)
         return true;
     struct stat st;
@@ -1503,6 +1523,19 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     if (!fd_snapshot(fd, &target_snap)) {
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EBADF;
+    }
+
+    /* do_epoll_ctl tests file_can_poll on the target before it looks at the op,
+     * at the instance, or at whether a registration already exists, so a
+     * directory answers EPERM for every call whatever the mask says. Only the
+     * empty-mask path used to ask, which left the ordinary ADD to kqueue -- and
+     * kqueue does take an EVFILT_READ knote on a directory, which is how every
+     * synthetic /sys directory came to be accepted while the sysroot-backed
+     * directory next to it was refused.
+     */
+    if (epoll_target_is_dir(target_snap.host_fd)) {
+        host_fd_ref_close(&epoll_ref);
+        return -LINUX_EPERM;
     }
 
     /* Pin the instance so a concurrent close(epfd) cannot free it under us.

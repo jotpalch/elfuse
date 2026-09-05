@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include "core/guest.h"
+#include "linux-limits.h"
 
 /* Linux signal numbers (1-based, matching kernel). */
 #define LINUX_SIGHUP 1
@@ -146,9 +147,8 @@ typedef struct {
 } linux_sigcontext_t;
 
 /* Linux stack_t and sigaltstack constants. */
-#define LINUX_SS_ONSTACK 1     /* Currently executing on altstack */
-#define LINUX_SS_DISABLE 2     /* Altstack is disabled */
-#define LINUX_MINSIGSTKSZ 5120 /* Minimum altstack size (aarch64, post-SVE) */
+#define LINUX_SS_ONSTACK 1 /* Currently executing on altstack */
+#define LINUX_SS_DISABLE 2 /* Altstack is disabled */
 
 typedef struct {
     uint64_t ss_sp;

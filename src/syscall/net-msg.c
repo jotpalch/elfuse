@@ -142,6 +142,72 @@ static void build_scm_cred_cmsg(uint8_t *dst)
     memcpy(dst + CMSG_LINUX_HDR_BYTES, &cred, sizeof(cred));
 }
 
+/* Send the no-name, no-control, single-iovec fast path of a msghdr.
+ *
+ * Returns the byte count or a negative Linux errno, and consumes host_ref
+ * either way.
+ *
+ * The blocking contract is elfuse's own: wait for POLLOUT first, then a send
+ * that reports EAGAIN instead of parking the vCPU, retried when a sibling took
+ * the space first. macOS does not honor MSG_DONTWAIT on AF_UNIX, which is why
+ * the wait comes before the send rather than the send driving it.
+ */
+static int64_t net_send_single_iov(guest_t *g,
+                                   const linux_msghdr_t *lmsg,
+                                   host_fd_ref_t *host_ref,
+                                   const fd_block_state_t *sock_st,
+                                   int linux_flags)
+{
+    struct {
+        uint64_t iov_base, iov_len;
+    } guest_iov;
+
+    if (guest_read_small(g, lmsg->msg_iov, &guest_iov, sizeof(guest_iov)) < 0) {
+        host_fd_ref_close(host_ref);
+        return -LINUX_EFAULT;
+    }
+
+    void *base = NULL;
+    size_t len = 0;
+    if (guest_iov.iov_len > 0) {
+        uint64_t avail = 0;
+        base = guest_ptr_bound(g, guest_iov.iov_base, &avail, MEM_PERM_R,
+                               guest_iov.iov_len);
+        if (!base) {
+            host_fd_ref_close(host_ref);
+            return -LINUX_EFAULT;
+        }
+        len = guest_iov.iov_len;
+        if (len > avail)
+            len = (size_t) avail;
+    }
+
+    bool blocking =
+        len > 0 && sock_op_should_block(sock_st, host_ref->fd, linux_flags);
+    int host_flags =
+        translate_msg_flags(linux_flags) | (blocking ? MSG_DONTWAIT : 0);
+    ssize_t ret;
+    for (;;) {
+        if (blocking) {
+            int64_t waited = io_wait_fd_or_interrupted(host_ref->fd, POLLOUT);
+            if (waited < 0) {
+                host_fd_ref_close(host_ref);
+                return waited;
+            }
+        }
+        ret = send(host_ref->fd, base, len, host_flags);
+        if (!(blocking && ret < 0 && errno == EAGAIN))
+            break;
+    }
+    host_fd_ref_close(host_ref);
+    if (ret < 0) {
+        if (errno == EPIPE && !(linux_flags & LINUX_MSG_NOSIGNAL))
+            signal_queue(LINUX_SIGPIPE);
+        return linux_errno();
+    }
+    return ret;
+}
+
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
 {
     if (fd_get_type(fd) == FD_NETLINK)
@@ -159,62 +225,12 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         return -LINUX_EFAULT;
     }
 
-    int mac_flags = translate_msg_flags(linux_flags);
-    bool suppress_sigpipe = (linux_flags & 0x4000) != 0;
-
     if ((!lmsg.msg_name || lmsg.msg_namelen == 0) &&
-        (!lmsg.msg_control || lmsg.msg_controllen == 0) &&
-        lmsg.msg_iovlen == 1) {
-        struct {
-            uint64_t iov_base, iov_len;
-        } guest_iov;
+        (!lmsg.msg_control || lmsg.msg_controllen == 0) && lmsg.msg_iovlen == 1)
+        return net_send_single_iov(g, &lmsg, &host_ref, &sock_st, linux_flags);
 
-        if (guest_read_small(g, lmsg.msg_iov, &guest_iov, sizeof(guest_iov)) <
-            0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
-
-        void *base = NULL;
-        size_t len = 0;
-        if (guest_iov.iov_len > 0) {
-            uint64_t avail = 0;
-            base = guest_ptr_bound(g, guest_iov.iov_base, &avail, MEM_PERM_R,
-                                   guest_iov.iov_len);
-            if (!base) {
-                host_fd_ref_close(&host_ref);
-                return -LINUX_EFAULT;
-            }
-            len = guest_iov.iov_len;
-            if (len > avail)
-                len = (size_t) avail;
-        }
-
-        bool blocking =
-            len > 0 && sock_op_should_block(&sock_st, host_ref.fd, linux_flags);
-        int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
-        ssize_t ret;
-        for (;;) {
-            if (blocking) {
-                int64_t waited =
-                    io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
-                if (waited < 0) {
-                    host_fd_ref_close(&host_ref);
-                    return waited;
-                }
-            }
-            ret = send(host_ref.fd, base, len, host_flags);
-            if (!(blocking && ret < 0 && errno == EAGAIN))
-                break;
-        }
-        host_fd_ref_close(&host_ref);
-        if (ret < 0) {
-            if (errno == EPIPE && !suppress_sigpipe)
-                signal_queue(LINUX_SIGPIPE);
-            return linux_errno();
-        }
-        return ret;
-    }
+    int mac_flags = translate_msg_flags(linux_flags);
+    bool suppress_sigpipe = (linux_flags & LINUX_MSG_NOSIGNAL) != 0;
 
     struct sockaddr_storage mac_sa;
     struct sockaddr *dest_sa = NULL;
@@ -920,7 +936,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                             scm_hfds[scm_nfds] = host_recv_fd;
                             scm_nfds++;
                         }
-                        if (flags & 0x40000000)
+                        if (flags & LINUX_MSG_CMSG_CLOEXEC)
                             fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
                     }
                 }
@@ -1039,7 +1055,6 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 }
 
 #define LINUX_MMSGHDR_SIZE 64
-#define LINUX_MSG_WAITFORONE 0x10000
 
 static inline int write_linux_mmsghdr_len(guest_t *g,
                                           uint64_t hdr_gva,
@@ -1064,8 +1079,6 @@ int64_t sys_sendmmsg(guest_t *g,
         linux_msghdr_t lmsg;
         uint64_t msg_gva = mmsg_gva;
         uint32_t msg_len;
-        int mac_flags = translate_msg_flags(flags);
-        bool suppress_sigpipe = (flags & 0x4000) != 0;
         host_fd_ref_t host_ref;
 
         fd_block_state_t sock_st;
@@ -1080,53 +1093,10 @@ int64_t sys_sendmmsg(guest_t *g,
         if ((!lmsg.msg_name || lmsg.msg_namelen == 0) &&
             (!lmsg.msg_control || lmsg.msg_controllen == 0) &&
             lmsg.msg_iovlen == 1) {
-            struct {
-                uint64_t iov_base, iov_len;
-            } guest_iov;
-            uint64_t avail = 0;
-            void *base = NULL;
-            size_t len = 0;
-
-            if (guest_read_small(g, lmsg.msg_iov, &guest_iov,
-                                 sizeof(guest_iov)) < 0) {
-                host_fd_ref_close(&host_ref);
-                return -LINUX_EFAULT;
-            }
-            if (guest_iov.iov_len > 0) {
-                base = guest_ptr_bound(g, guest_iov.iov_base, &avail,
-                                       MEM_PERM_R, guest_iov.iov_len);
-                if (!base) {
-                    host_fd_ref_close(&host_ref);
-                    return -LINUX_EFAULT;
-                }
-                len = guest_iov.iov_len;
-                if (len > avail)
-                    len = (size_t) avail;
-            }
-
-            bool blocking =
-                len > 0 && sock_op_should_block(&sock_st, host_ref.fd, flags);
-            int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
-            ssize_t ret;
-            for (;;) {
-                if (blocking) {
-                    int64_t waited =
-                        io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
-                    if (waited < 0) {
-                        host_fd_ref_close(&host_ref);
-                        return waited;
-                    }
-                }
-                ret = send(host_ref.fd, base, len, host_flags);
-                if (!(blocking && ret < 0 && errno == EAGAIN))
-                    break;
-            }
-            host_fd_ref_close(&host_ref);
-            if (ret < 0) {
-                if (errno == EPIPE && !suppress_sigpipe)
-                    signal_queue(LINUX_SIGPIPE);
-                return linux_errno();
-            }
+            int64_t ret =
+                net_send_single_iov(g, &lmsg, &host_ref, &sock_st, flags);
+            if (ret < 0)
+                return ret;
             msg_len = (uint32_t) ret;
             if (write_linux_mmsghdr_len(g, mmsg_gva, msg_len) < 0)
                 return -LINUX_EFAULT;
@@ -1136,6 +1106,10 @@ int64_t sys_sendmmsg(guest_t *g,
         host_fd_ref_close(&host_ref);
     }
 
+    /* Once a message has gone out, report the count rather than the error, so a
+     * restart never re-sends a delivered message. Only a failure before the
+     * first send reaches the guest as an errno.
+     */
     unsigned int sent = 0;
     for (unsigned int i = 0; i < vlen; i++) {
         uint64_t hdr_gva = mmsg_gva + (uint64_t) i * LINUX_MMSGHDR_SIZE;

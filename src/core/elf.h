@@ -79,6 +79,14 @@ typedef struct {
 #define ELF_MAX_SEGMENTS 16
 
 typedef struct {
+    uint64_t gpa;    /* Guest physical address */
+    uint64_t offset; /* File offset (p_offset, for /proc/self/maps) */
+    uint64_t filesz; /* Bytes to load from file */
+    uint64_t memsz;  /* Total memory size (filesz + bss) */
+    int flags;       /* PF_R, PF_W, PF_X */
+} elf_segment_t;
+
+typedef struct {
     /* From ELF header */
     uint64_t entry;     /* e_entry: program entry point */
     uint16_t e_type;    /* ET_EXEC or ET_DYN */
@@ -102,15 +110,12 @@ typedef struct {
     /* PT_INTERP: dynamic linker path (empty if statically linked) */
     char interp_path[256];
 
-    /* Segment details */
+    /* Segment details, in ascending gpa. elf_load_fd sorts them: the mapper's
+     * page-tail zero fill runs past the end of one segment into the next, so
+     * loading them in any other order lets the fill wipe bytes already placed.
+     */
     int num_segments;
-    struct {
-        uint64_t gpa;    /* Guest physical address */
-        uint64_t offset; /* File offset (p_offset, for /proc/self/maps) */
-        uint64_t filesz; /* Bytes to load from file */
-        uint64_t memsz;  /* Total memory size (filesz + bss) */
-        int flags;       /* PF_R, PF_W, PF_X */
-    } segments[ELF_MAX_SEGMENTS];
+    elf_segment_t segments[ELF_MAX_SEGMENTS];
 } elf_info_t;
 
 /* Where a loaded image lands: a segment at p_vaddr goes to target_base +
@@ -167,6 +172,29 @@ int elf_map_segments_fd(const elf_info_t *info,
                         elf_window_t window,
                         uint64_t infra_lo,
                         uint64_t infra_hi);
+
+/* Answer the question elf_map_segments_fd answers, without writing anything:
+ * does every PT_LOAD of info land inside guest memory and clear of the infra
+ * reserve, under this window?
+ *
+ * Both take the same per-segment decision, so a caller that gets true here
+ * cannot then have the mapper refuse its placement. That is what lets
+ * sys_execve reject a badly placed image while it can still return ENOEXEC.
+ * Placement only: the mapper still reads the file, and a short pread on an
+ * image shrunk since the parse remains its to report.
+ */
+bool elf_check_placement(const elf_info_t *info,
+                         const char *display_path,
+                         uint64_t guest_size,
+                         elf_window_t window,
+                         uint64_t infra_lo,
+                         uint64_t infra_hi);
+
+/* True when info describes an image elfuse can load as a program interpreter.
+ * Rejects a non-ET_DYN loader, which both load paths would place at the wrong
+ * address, and one naming a PT_INTERP of its own. Logs the reason.
+ */
+bool elf_interp_is_loadable(const elf_info_t *info, const char *display_path);
 
 /* Resolve a PT_INTERP path against a sysroot directory. Tries three strategies:
  *   1. sysroot + interp_path  (standard /lib/ld-musl-*.so.1)

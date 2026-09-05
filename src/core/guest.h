@@ -789,6 +789,19 @@ static inline uint64_t guest_ipa(const guest_t *g, uint64_t offset)
     return g->ipa_base + offset;
 }
 
+/* The runtime infra reserve, [interp_base - INFRA_RESERVE, interp_base): page
+ * table pool, shim text, shim data, vDSO. One definition, because the two
+ * predicates below and every caller that has to hand the bounds to a callee
+ * were each deriving it themselves.
+ */
+static inline void guest_infra_window(const guest_t *g,
+                                      uint64_t *lo,
+                                      uint64_t *hi)
+{
+    *lo = g->interp_base - INFRA_RESERVE;
+    *hi = g->interp_base;
+}
+
 /* True iff [start, end) overlaps the runtime infra reserve [interp_base -
  * INFRA_RESERVE, interp_base). Covers the full reserve including the 64 KiB
  * null-guard slot at the bottom (which has no PT entries but must not become
@@ -800,8 +813,8 @@ static inline bool guest_range_hits_infra(const guest_t *g,
                                           uint64_t start,
                                           uint64_t end)
 {
-    uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
-    uint64_t infra_hi = g->interp_base;
+    uint64_t infra_lo, infra_hi;
+    guest_infra_window(g, &infra_lo, &infra_hi);
     return start < infra_hi && end > infra_lo;
 }
 
@@ -812,8 +825,8 @@ static inline bool guest_range_hits_infra(const guest_t *g,
  */
 static inline bool guest_addr_in_infra(const guest_t *g, uint64_t addr)
 {
-    uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
-    uint64_t infra_hi = g->interp_base;
+    uint64_t infra_lo, infra_hi;
+    guest_infra_window(g, &infra_lo, &infra_hi);
     return addr >= infra_lo && addr < infra_hi;
 }
 
@@ -1030,11 +1043,17 @@ static inline bool guest_kbuf_user_va_overlap(uint64_t va, uint64_t size)
 
 /* Get a host pointer for a guest virtual address (read access).
  * Returns NULL if gva is out of bounds or not readable.
+ *
+ * The address stays mapped as long as its region does: the primary slab for the
+ * process, an overflow segment or extra mapping until guest_reset or
+ * guest_destroy. The bytes behind it are not stable, so copy a value out before
+ * trusting it twice.
  */
 void *guest_ptr(const guest_t *g, uint64_t gva);
 
 /* Get a host pointer for a guest virtual address (write access).
- * Returns NULL if gva is out of bounds or not writable.
+ * Returns NULL if gva is out of bounds or not writable. Same validity window as
+ * guest_ptr.
  */
 void *guest_ptr_w(const guest_t *g, uint64_t gva);
 

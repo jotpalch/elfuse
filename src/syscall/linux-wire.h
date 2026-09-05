@@ -112,6 +112,8 @@ typedef struct {
 #define LINUX_EILSEQ 84     /* Illegal byte sequence */
 #define LINUX_EHOSTDOWN 112 /* Host is down */
 #define LINUX_ENODATA 61    /* No data available (xattr missing, stream) */
+#define LINUX_EPIPE 32      /* Broken pipe; also usbfs endpoint stall */
+#define LINUX_ETIME 62      /* Timer expired (USB device not responding) */
 
 /* Linux FD flags. */
 #define LINUX_FD_CLOEXEC 1
@@ -179,6 +181,23 @@ typedef struct {
 #define LINUX_IFNAMSIZ 16
 #define LINUX_ARPHRD_ETHER 1
 #define LINUX_ARPHRD_LOOPBACK 772
+
+/* Linux socket message flags (uapi linux/socket.h; the same values on every
+ * Linux architecture). These are the flags argument to send/recv and their
+ * msghdr variants, and are unrelated to the SysV LINUX_MSG_* constants in
+ * src/syscall/sysvipc.c, which are msgrcv's msgflg.
+ */
+#define LINUX_MSG_OOB 0x01
+#define LINUX_MSG_PEEK 0x02
+#define LINUX_MSG_DONTWAIT 0x40
+#define LINUX_MSG_WAITALL 0x100
+#define LINUX_MSG_DONTROUTE 0x04
+#define LINUX_MSG_CTRUNC 0x08
+#define LINUX_MSG_TRUNC 0x20
+#define LINUX_MSG_EOR 0x80
+#define LINUX_MSG_NOSIGNAL 0x4000
+#define LINUX_MSG_WAITFORONE 0x10000
+#define LINUX_MSG_CMSG_CLOEXEC 0x40000000
 
 /* Linux open flags. */
 #define LINUX_O_RDONLY 0x0000
@@ -254,6 +273,14 @@ typedef struct {
 #define LINUX_PR_GET_CHILD_SUBREAPER 37
 #define LINUX_PR_CAPBSET_READ 23
 #define LINUX_CAP_LAST_CAP 40
+
+/* _LINUX_CAPABILITY_VERSION_3, the only version elfuse's capget accepts (Linux
+ * still takes the two deprecated ones). A guest asking for another gets this
+ * one written back with EINVAL, which is how Linux tells it which version to
+ * retry with. sc_capset refuses every call with EPERM and never reads the
+ * header, so it has no use for this.
+ */
+#define LINUX_CAPABILITY_VERSION_3 0x20080522
 #define LINUX_PR_SET_VMA 0x53564d41 /* "SVMA" */
 #define LINUX_PR_SET_VMA_ANON_NAME 0
 
@@ -483,6 +510,7 @@ typedef struct {
 #define FD_FUSE_FILE 15
 #define FD_FUSE_DIR 16
 #define FD_URANDOM 17
+#define FD_USBDEV 18
 #define FD_VIRTUAL_PATH_MAX 64
 
 /* File sealing flags (F_SEAL_*) for memfd_create. Tracked per-FD. */

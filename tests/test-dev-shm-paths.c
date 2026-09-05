@@ -52,6 +52,7 @@ static char shm_fifo[128];
 static char shm_exec[128];
 static char victim_path[128];
 static char fixture_suffix[16];
+static char fixture_seed[] = "/tmp/elfuse-shm-seed-XXXXXX";
 
 /* Guest PIDs restart from the same value in each independent elfuse process.
  * Reserve a host-unique suffix so concurrent runtime jobs cannot unlink or
@@ -59,14 +60,15 @@ static char fixture_suffix[16];
  */
 static int name_fixtures(void)
 {
-    char seed[] = "/tmp/elfuse-shm-seed-XXXXXX";
-    int fd = mkstemp(seed);
+    int fd = mkstemp(fixture_seed);
     if (fd < 0)
         return -1;
     close(fd);
-    (void) unlink(seed);
 
-    const char *suffix = strrchr(seed, '-');
+    /* The seed stays until cleanup: mkstemp reserves a suffix only while the
+     * file exists, and the fixtures below are named after it.
+     */
+    const char *suffix = strrchr(fixture_seed, '-');
     if (suffix == NULL || suffix[1] == '\0')
         return -1;
     snprintf(fixture_suffix, sizeof(fixture_suffix), "%s", suffix + 1);
@@ -99,6 +101,16 @@ static void cleanup_fixtures(void)
     unlink(shm_exec);
     rmdir(shm_dir);
     unlink(victim_path);
+}
+
+/* Separate from cleanup_fixtures, which also runs once before the tests to
+ * sweep fixtures a killed run left in the shm backing dir. Releasing the seed
+ * there would free the suffix for another run to mint for the whole of this
+ * one.
+ */
+static void release_fixture_seed(void)
+{
+    unlink(fixture_seed);
 }
 
 /* The exact LTP setup_ipc() sequence: create via open, adjust via chmod. */
@@ -597,8 +609,8 @@ static void test_imported_symlink_contained(void)
 {
     TEST("symlink renamed into shm stays contained");
     char tmp_link[128];
-    snprintf(tmp_link, sizeof(tmp_link), "/tmp/elfuse-shm-implink-%d",
-             (int) getpid());
+    snprintf(tmp_link, sizeof(tmp_link), "/tmp/elfuse-shm-implink-%s",
+             fixture_suffix);
     if (make_victim() != 0) {
         FAIL("create victim");
         return;
@@ -804,6 +816,7 @@ int main(int argc, char **argv)
 
     if (name_fixtures() < 0) {
         FAIL("reserve unique fixture suffix");
+        release_fixture_seed();
         SUMMARY("test-dev-shm-paths");
         return 1;
     }
@@ -838,6 +851,7 @@ int main(int argc, char **argv)
     test_oversized_name();
 
     cleanup_fixtures();
+    release_fixture_seed();
 
     SUMMARY("test-dev-shm-paths");
     return fails == 0 ? 0 : 1;

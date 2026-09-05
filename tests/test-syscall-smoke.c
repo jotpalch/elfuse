@@ -1003,7 +1003,7 @@ static void test_sync_file_range(void)
         return;
     }
 
-    /* 7. Bad fd → EBADF. */
+    /* 7. Bad fd -> EBADF. */
     errno = 0;
     if (syscall(SYS_sync_file_range, -1, (off64_t) 0, (off64_t) 0, 7) != -1 ||
         errno != EBADF) {
@@ -1012,7 +1012,7 @@ static void test_sync_file_range(void)
         return;
     }
 
-    /* 8. Unsupported file type (pipe) → ESPIPE. */
+    /* 8. Unsupported file type (pipe) -> ESPIPE. */
     int pipefds[2];
     if (pipe(pipefds) == 0) {
         errno = 0;

@@ -1143,23 +1143,25 @@ static void gdb_client_session(void)
     gdb.rsp_ctx = &rsp_ctx;
 
     while (gdb.client_fd >= 0) {
-        /* Wait for either a packet from GDB or a stop event from a vCPU. Use
-         * poll() so the GDB stub can wake up when a thread stops.
+        /* A socket read can buffer several packets. Consume them before waiting
+         * for more input that the client may never send.
          */
-        struct pollfd pfd = {
-            .fd = gdb.client_fd,
-            .events = POLLIN,
-        };
+        if (!gdb_rsp_pending(&rsp_ctx)) {
+            struct pollfd pfd = {
+                .fd = gdb.client_fd,
+                .events = POLLIN,
+            };
 
-        int pr = poll(&pfd, 1, -1);
-        if (pr <= 0) {
-            if (pr < 0 && errno == EINTR)
-                continue;
-            break;
+            int pr = poll(&pfd, 1, -1);
+            if (pr <= 0) {
+                if (pr < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
+
+            if (pfd.revents & (POLLERR | POLLHUP))
+                break;
         }
-
-        if (pfd.revents & (POLLERR | POLLHUP))
-            break;
 
         int pkt_len =
             gdb_rsp_recv(&rsp_ctx, gdb.client_fd, pkt_buf, GDB_PKT_BUF_SIZE);

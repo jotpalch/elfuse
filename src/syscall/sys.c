@@ -61,8 +61,7 @@ static const uint8_t cached_affinity_mask[256] = {1}, zero_block[256] = {0};
  * sysctl(HW_MEMSIZE), free pages from host_statistics64, getloadavg). Even if
  * multiple guest_t instances ever coexist in one process they share the same
  * host stats, so a single rwlock-protected cache refreshed at most once per
- * second is the right shape. Audited under TODO "Static state testability
- * audit" -- intentionally NOT moved into guest_t.
+ * second is the right shape. Deliberately not moved into guest_t.
  */
 static pthread_once_t sysinfo_once = PTHREAD_ONCE_INIT;
 static pthread_rwlock_t sysinfo_lock = PTHREAD_RWLOCK_INITIALIZER;

@@ -35,27 +35,35 @@
 
 int passes = 0, fails = 0;
 
-static char tmp_file[256];
-static char tmp_dir[256];
+static char tmp_file[] = "/tmp/elfuse-opath-XXXXXX";
+static char tmp_dir[] = "/tmp/elfuse-opath-dir-XXXXXX";
 
-static void setup_fixtures(void)
+static int setup_fixtures(void)
 {
-    snprintf(tmp_file, sizeof(tmp_file), "/tmp/elfuse-opath-%d.txt",
-             (int) getpid());
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/elfuse-opath-dir-%d",
-             (int) getpid());
-
-    int fd = open(tmp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        write(fd, "hello\n", 6);
-        close(fd);
+    /* Both failures are fatal rather than ignored: an unexpanded template is
+     * still a valid path, so carrying on would recreate the fixed shared name
+     * this replaced.
+     */
+    int fd = mkstemp(tmp_file);
+    if (fd < 0) {
+        perror("setup: mkstemp");
+        return -1;
     }
-    mkdir(tmp_dir, 0755);
+    write(fd, "hello\n", 6);
+    close(fd);
+
+    if (!mkdtemp(tmp_dir)) {
+        perror("setup: mkdtemp");
+        unlink(tmp_file);
+        return -1;
+    }
+
     char child[300];
     snprintf(child, sizeof(child), "%s/child", tmp_dir);
     fd = open(child, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0)
         close(fd);
+    return 0;
 }
 
 static void teardown_fixtures(void)
@@ -275,7 +283,10 @@ int main(void)
 {
     printf("test-opath: O_PATH semantics tests\n");
 
-    setup_fixtures();
+    if (setup_fixtures() < 0) {
+        printf("test-opath: fixture setup failed\n");
+        return 1;
+    }
 
     test_open_path_smoke();
     test_read_write_rejected();

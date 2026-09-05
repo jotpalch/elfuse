@@ -43,11 +43,15 @@ static int set_lock(int fd, short type, off_t start, off_t len)
 int main(void)
 {
     int passes = 0, fails = 0;
-    const char *path = "/tmp/elfuse-test-flock.db";
 
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    /* Unique per invocation: record locks are held per (process, inode), so a
+     * fixed name shares one lock space with every concurrent run.
+     */
+    char path[] = "/tmp/elfuse-test-flock.XXXXXX";
+
+    int fd = mkstemp(path);
     if (fd < 0) {
-        perror("open");
+        perror("mkstemp");
         return 1;
     }
 

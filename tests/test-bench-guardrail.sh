@@ -9,6 +9,7 @@
 #   getpid                <= 200 ns/op    (shim identity fast path)
 #   clock_gettime(libc)   <=  50 ns/op    (vDSO CNTVCT fast path)
 #   read(/dev/urandom, 1) <= 400 ns/op    (shim urandom ring fast path)
+#   FUTEX_WAIT (word moved) <= 400 ns/op  (shim futex fast path)
 #   stat("/dev/null")     <= Nx getpid    (guest_read_path, no fast path)
 #   read(empty nonblocking pipe) <= Nx getpid   (per-transfer overhead)
 #   pipe write+read       <= Nx getpid    (transfer plus wait/wakeup)
@@ -51,6 +52,16 @@ ITERS="${BENCH_GUARDRAIL_ITERS:-200000}"
 THRESH_GETPID=200
 THRESH_CLOCK_GETTIME=50
 THRESH_URANDOM=400
+
+# futex-eagain is the same shape as the two above and takes the same ceiling.
+# Served at EL1 it measures ~51 ns, level with getpid; a bail to the host lands
+# at the HVC floor, ~2000 ns on an idle host and higher under load. 400 sits an
+# order of magnitude clear of the served value and well under the bail, so it
+# catches "the fast path stopped being taken" without tracking load. Paired with
+# tests/test-shim-futex-stats.sh, which asserts the path ran at all: that lane
+# catches a dispatch that stops reaching it, this one catches a slowdown that
+# still reaches it.
+THRESH_FUTEX=400
 
 # stat-path is checked as a ratio to getpid from the same run, not as an
 # absolute figure. It is the only lane whose cost is a slope: it scales with
@@ -281,6 +292,8 @@ run_one_pass()
         "$(extract_ns "$out" clock_gettime)" "$THRESH_CLOCK_GETTIME"
     check_threshold "$variant" "read-urandom1" \
         "$(extract_ns "$out" read-urandom1)" "$THRESH_URANDOM"
+    check_threshold "$variant" "futex-eagain" \
+        "$(extract_ns "$out" futex-eagain)" "$THRESH_FUTEX"
     check_ratio "$variant" "stat-path" \
         "$(extract_ns "$out" stat-path)" "$getpid_ns" "$stat_ratio"
     check_ratio "$variant" "pipe-eagain" \

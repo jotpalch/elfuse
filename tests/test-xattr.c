@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -75,25 +76,36 @@ static long do_lgetxattr(const char *path,
     return syscall(NR_lgetxattr, path, name, out, cap);
 }
 
-static const char tmp_file[] = "/tmp/elfuse-xattr-target";
-static const char tmp_link[] = "/tmp/elfuse-xattr-link";
+static char tmp_dir[] = "/tmp/elfuse-xattr-XXXXXX";
+static char tmp_file[128];
+static char tmp_link[128];
 
-static void setup(void)
+static int setup(void)
 {
-    unlink(tmp_link);
-    unlink(tmp_file);
+    if (!mkdtemp(tmp_dir)) {
+        perror("setup: mkdtemp");
+        return -1;
+    }
+    snprintf(tmp_file, sizeof(tmp_file), "%s/target", tmp_dir);
+    snprintf(tmp_link, sizeof(tmp_link), "%s/link", tmp_dir);
+
     int fd = open(tmp_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0)
-        return;
+    if (fd < 0) {
+        perror("setup: open");
+        rmdir(tmp_dir);
+        return -1;
+    }
     (void) !write(fd, "hello\n", 6);
     close(fd);
     symlink(tmp_file, tmp_link);
+    return 0;
 }
 
 static void teardown(void)
 {
     unlink(tmp_link);
     unlink(tmp_file);
+    rmdir(tmp_dir);
 }
 
 static void test_lgetxattr_regular_file(void)
@@ -162,7 +174,10 @@ int main(void)
 {
     printf("test-xattr: lgetxattr / getxattr / setxattr semantics\n");
 
-    setup();
+    if (setup() < 0) {
+        printf("test-xattr: fixture setup failed\n");
+        return 1;
+    }
 
     test_lgetxattr_regular_file();
     test_lgetxattr_symlink_no_follow();

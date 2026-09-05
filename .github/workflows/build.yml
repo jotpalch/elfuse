@@ -126,6 +126,27 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+  oci-linux:
+    name: elfuse-oci (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build, lint and test elfuse-oci
+        run: |
+          set -euo pipefail
+          go version
+          make elfuse-oci
+          make oci-lint
+          make oci-test
+
   runtime-macos:
     name: Runtime (${{ matrix.name }})
     needs: build-macos
@@ -162,7 +183,7 @@ jobs:
             asan_options: abort_on_error=1:detect_leaks=0
             ubsan_options: ''
             tsan_options: ''
-            test_timeout: '30'
+            test_timeout: '60'
             job_timeout: 30
             run_matrix: false
             check_target: check-sanitizer
@@ -210,9 +231,10 @@ jobs:
       UBSAN_OPTIONS: ${{ matrix.ubsan_options }}
       TSAN_OPTIONS: ${{ matrix.tsan_options }}
       # Empty on the release leg leaves each script its own default: 60s in
-      # tests/driver.sh, 10s in tests/lib/test-runner.sh. The 30 on the ASAN
-      # and UBSAN legs is therefore a raise for the lanes and a cut for the
-      # driver.
+      # tests/driver.sh, 10s in tests/lib/test-runner.sh. So 30 on UBSAN raises
+      # the lanes and cuts the driver, while 60 on ASAN and TSAN raises the
+      # lanes and leaves the driver at its default. mk/tests.mk carries the
+      # matching check-{asan,ubsan,tsan} defaults and records why ASAN is 60.
       TEST_TIMEOUT: ${{ matrix.test_timeout }}
       HOMEBREW_NO_INSTALL_CLEANUP: 1
       HOMEBREW_NO_AUTO_UPDATE: 1

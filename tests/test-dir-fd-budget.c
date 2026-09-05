@@ -18,6 +18,15 @@
  * measure the same thing from two directions: how many directories fit, and
  * whether dup'ing them fits too.
  *
+ * A dup costs nothing at all, which is the stronger form of the same invariant.
+ * dup(2) gives the alias the source's open file description, so the alias
+ * shares the source's stream -- one descriptor, one listing position, one union
+ * state, given back when the last of the two guest fds closes. The bound
+ * asserted below is therefore a ceiling the dup half can only come in under,
+ * and it is left as a ceiling on purpose: what must never happen is a dup
+ * costing more, and pinning it at exactly zero would make this test fail for a
+ * future dup that legitimately needed a descriptor of its own.
+ *
  * Runs with host_nofile=elfuse-minimum, which is the point: with the host limit
  * at exactly what elfuse asks for, the doubling has nowhere to hide. Before the
  * fix the first test reached 636 of a promised 1021.
@@ -76,7 +85,10 @@ static int expect_at_least(int limit)
 
 /* Enough open+dup pairs that a directory costing two descriptors would need
  * more than the whole host budget (4 * pairs > limit + HOST_FD_RESERVE), while
- * the 2 * pairs guest fds still fit under the limit.
+ * the 2 * pairs guest fds still fit under the limit. A shared alias spends no
+ * descriptor of its own, so the pairs cost half of this; the count is what a
+ * regression to a descriptor per alias would fail at, not what today's cost
+ * predicts.
  */
 static int dup_pairs(int limit)
 {
@@ -231,7 +243,7 @@ int main(void)
         FAIL("fixture entry missing from a surviving directory fd");
     close_all(fds, opened);
 
-    TEST("dup'ing directory fds costs one each");
+    TEST("dup'ing directory fds costs no more than one each");
     int paired = 0;
     for (; paired < want_pairs; paired++) {
         fds[paired] = open_fixture_dir();
@@ -260,11 +272,13 @@ int main(void)
     close_all(fds, paired);
     close_all(dups, paired);
 
-    /* The two fds hold separate streams over separate descriptors, so closing
-     * one must not take the other's descriptor with it. Checked by using the
-     * survivor as a directory rather than by reading it: a dup'd directory fd
-     * reports an empty stream on elfuse today, which predates this test and is
-     * a separate defect from the descriptor accounting under test here.
+    /* The two fds share one stream over one descriptor, held by a reference
+     * count, so closing either must not give the descriptor back while the
+     * other still names it. Checked by using the survivor as a directory rather
+     * than by reading it: the shared position means the source's own reads
+     * would have consumed the listing, and what is under test here is the
+     * descriptor's lifetime, not the listing. tests/test-dir-union-alias covers
+     * the sharing itself.
      */
     TEST("a dup outlives the fd it came from");
     bool dup_ok = false;

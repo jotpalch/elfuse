@@ -34,13 +34,14 @@ Only `bad_exception` vectors may clobber X5, because they halt.
 | #0 | Normal exit | x0 = exit code |
 | #2 | Bad exception | x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector |
 | #4 | Set sysreg | x0 = reg ID, x1 = value |
-| #5 | Syscall forward | X0-X5=args, X8=nr; on return X8=TLBI kind |
+| #5 | Syscall forward | X0-X5=args, X8=nr; on return X8=TLBI kind, X7=ptrace-stop request |
 | #6 | Embedder extension | X8=call nr, X0-X7=args |
 | #7 | MRS trap | host reads reg from ESR ISS, returns in x0 |
 | #9 | W^X toggle | x0=FAR, x1=type (0=exec->RX, 1=write->RW) |
 | #10 | BRK from EL0 | SIGTRAP / ptrace-stop |
 | #11 | EL0 fault | SIGSEGV / SIGILL |
 | #12 | System instruction trap | cache maintenance logging |
+| #13 | Ptrace stop | taken after the shim restores the HVC #5 saved frame |
 
 The register contract per HVC, including which return values each one accepts,
 is the header comment in `src/core/shim.S`. That comment is the specification;
@@ -69,6 +70,23 @@ the block size the shim assumes.
 X11=1 is the icache-flush hint: set when a page transitions to executable, and
 the shim then issues an IC invalidate alongside whichever TLBI it picked. The
 shim restores X11 from the saved frame before ERET, so EL0 never observes it.
+
+X7 is the ptrace-stop request on the same return, and it obeys a rule the TLBI
+codes do not. The shim reads it only after restoring the saved frame, so the
+tracer snapshots the guest's architectural registers rather than shim scratch;
+non-zero means take HVC #13 before the ERET. That makes X7 unusable on the one
+tail that never restores the frame, X8 = 2, where the live registers already
+are the final EL0 state and a host write to X7 would land in EL0 as guest
+state. The host takes that stop inline in the epilogue instead and leaves X7
+alone, and an `execve` re-entry, which has no tail at all, leaves the stop owed
+for the new image.
+
+Two consequences for anyone editing the dispatch in `shim.S`. Every exit from
+it has to reach the X7 test, so branch to `svc_hvc_restore_eret`, never to
+`svc_restore_eret`: a tail that skips the test drops a stop the host has
+already consumed, and the tracer waits forever in `wait4`. And do not put a
+numeric label on `svc_restore_eret`, because a `1f` anywhere in the tail would
+then reach it and skip the test. Both of these have been live bugs.
 
 The host accumulates the smallest sufficient request in `cpu_tlbi_req`
 (`src/core/guest.h`), which is `_Thread_local` per vCPU. Never promote it to a
@@ -108,7 +126,9 @@ your path goes through the dispatch epilogue at all:
   than returning from a syscall, because there is no shim frame to drop.
 - Bypass the epilogue by returning `SYSCALL_EXEC_HAPPENED`. The epilogue
   returns early, before it writes X0 or X8. `sys_execve` works this way, and
-  the normal X0 writeback is exactly what it needs to avoid.
+  the normal X0 writeback is exactly what it needs to avoid. It must also skip
+  the X7 write for the same reason it skips X0, which is what
+  `syscall_return_epilogue` calls an exec re-entry.
 - `signal_rt_sigreturn` does both, because it has restored the entire register
   set and neither the frame restore nor the X0 writeback may happen.
 

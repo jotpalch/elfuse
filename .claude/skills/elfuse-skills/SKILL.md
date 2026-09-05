@@ -55,6 +55,9 @@ The shape the tree already uses, and the reason for it:
 
 `elfuse-conventions` binds this prose the same as any other surface in the
 tree: no em dash, third person, and no register the machine writes in.
+When the task reduces a skill rather than adding one, read
+`.claude/skills/elfuse-conventions/references/prose-reduction.md`; keep
+reusable decisions and omit case-specific evidence.
 
 ## Authoritative sources
 

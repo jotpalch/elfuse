@@ -98,7 +98,7 @@ TEST_LIST="$SCRIPT_DIR/manifest.txt"
 # shellcheck source=tests/test-config.sh
 source "$SCRIPT_DIR/test-config.sh"
 source "$SCRIPT_DIR/lib/hang-sample.sh"
-source "$SCRIPT_DIR/lib/bash-compat.sh" # test_host_is_busy
+source "$SCRIPT_DIR/lib/bash-compat.sh" # test_host_busy_mark/_since_mark
 
 # Capture a stack sample from a test about to hit the watchdog. A hang that only
 # reproduces under suite load is otherwise reported as a bare "timeout after Ns"
@@ -417,6 +417,7 @@ for i in "${filtered_idx[@]}"; do
     # "${array[@]}". Host-limit annotations live in the manifest. Keep this
     # execution path generic so adding another constrained test does not require
     # a name-qualified branch here.
+    test_host_busy_mark
     if host_nofile=$(elfuse_test_host_nofile "$TEST_LIST" "$name"); then
         run_test_binary "$binary" "$host_nofile" \
             "$TESTDIR_ABS/test-timeouts/$(basename "$binary")-hang.txt" \
@@ -435,7 +436,7 @@ for i in "${filtered_idx[@]}"; do
     # Its sample goes to a separate file. The first attempt's is the one taken
     # while the suite was in the state that produced the timeout, so it is the
     # one worth keeping.
-    if [ "$rc" -eq 124 ] && test_host_is_busy; then
+    if [ "$rc" -eq 124 ] && test_host_busy_since_mark; then
         if [ "$TAP" -eq 1 ]; then
             echo "# $name timed out under host load; re-running"
         else

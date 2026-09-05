@@ -18,6 +18,7 @@
 #include "utils.h"
 
 #include "runtime/procemu.h"
+#include "runtime/usb-sysfs.h"
 #include "syscall/linux-wire.h"
 #include "syscall/casefold-walk.h"
 #include "syscall/fuse.h"
@@ -530,6 +531,34 @@ int path_translate_at(guest_fd_t dirfd,
             tx->guest_path = tx->guest_buf;
             tx->intercept_path = tx->guest_buf;
             tx->fuse_path = true;
+        }
+    }
+
+    /* A /sys walk that passes through one of the synthetic USB `subsystem`
+     * symlinks is rewritten to the canonical guest spelling of where it lands,
+     * before anything decides whose name it is. The links exist only in the
+     * synthetic tree, so no other layer can resolve them: the sysroot has no
+     * such link, and a lexical fold puts the walk back in the device directory
+     * it had just left. Doing it here, once, is what makes open, stat, lstat,
+     * readlink and getdents64 answer from one name -- the union listing of
+     * `<dev>/subsystem/..` offered /sys/bus/pci while every lookup of
+     * `<dev>/subsystem/../pci` denied it, because each entry point folded the
+     * name for itself.
+     *
+     * Cheap for everything else: the prefix test rejects every path that cannot
+     * contain such a link before the USB layer is called at all.
+     */
+    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21)) {
+        /* Through a local buffer, not straight into guest_buf: guest_path may
+         * already be guest_buf (the FUSE resolver above puts it there), and the
+         * rewrite reads its input while writing its output.
+         */
+        char resolved[LINUX_PATH_MAX];
+        if (usb_sysfs_resolve_guest_path(tx->guest_path, resolved,
+                                         sizeof(resolved)) == 1) {
+            str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
+            tx->guest_path = tx->guest_buf;
+            tx->intercept_path = tx->guest_buf;
         }
     }
 

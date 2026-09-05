@@ -36,6 +36,11 @@ State the fact and stop:
 - Effort and flattery: "carefully reviewed", "comprehensive", "thoroughly
   tested", "Great catch", "You're absolutely right". Effort is not a
   finding; name what ran and what it reported.
+- Deferral and self-report: an offer to redo the work another way ("say so
+  and I will", "happy to split this"), an apology for a correction, or an
+  announcement of candor before a caveat that stands on its own ("worth
+  flagging rather than hiding"). State the decision and the reason that
+  settles it; a reviewer who disagrees says so without being invited.
 - Formatting as emphasis in docs and PR text: bolded bullet-header runs
   where a paragraph belongs, decorative rules, emoji.
 - Machine artifacts, defects on sight: zero-width and bidi characters,

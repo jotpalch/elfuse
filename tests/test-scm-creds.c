@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -83,10 +84,18 @@ static void test_accept_inherits_passcred(void)
     TEST("accept inherits SO_PASSCRED");
 
     int srv = -1, cli = -1, acc = -1;
+
+    /* A private directory rather than one name per pid: elfuse restarts guest
+     * pids at 1, so the unlink() that used to precede bind() removed the live
+     * socket of whatever concurrent run held the same name.
+     */
+    char dir[] = "/tmp/elfuse-scm-creds-XXXXXX";
     char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
-    snprintf(path, sizeof(path), "/tmp/elfuse-scm-creds-%ld.sock",
-             (long) getpid());
-    unlink(path);
+    if (!mkdtemp(dir)) {
+        FAIL("mkdtemp failed");
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/s", dir);
 
     srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -145,6 +154,7 @@ done:
     if (srv >= 0)
         close(srv);
     unlink(path);
+    rmdir(dir);
 }
 
 static void test_blocked_accept_sees_passcred_toggle(void)
@@ -161,10 +171,13 @@ static void test_blocked_accept_sees_passcred_toggle(void)
         .lock = PTHREAD_MUTEX_INITIALIZER,
         .cond = PTHREAD_COND_INITIALIZER,
     };
+    char dir[] = "/tmp/elfuse-scm-creds-toggle-XXXXXX";
     char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
-    snprintf(path, sizeof(path), "/tmp/elfuse-scm-creds-toggle-%ld.sock",
-             (long) getpid());
-    unlink(path);
+    if (!mkdtemp(dir)) {
+        FAIL("mkdtemp failed");
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/s", dir);
 
     srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -245,6 +258,7 @@ done:
     pthread_cond_destroy(&args.cond);
     pthread_mutex_destroy(&args.lock);
     unlink(path);
+    rmdir(dir);
 }
 
 int main(void)

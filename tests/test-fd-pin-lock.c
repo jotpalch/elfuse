@@ -99,22 +99,32 @@ static void *sibling(void *arg)
  */
 static int child_can_lock(int go_wr, int rep_rd)
 {
-    if (write(go_wr, "x", 1) != 1)
-        return -1;
+    /* Every negative return is marked, not just one: the caller compares
+     * against 1 or 0, so an unmarked -1 reads as a child that was refused.
+     */
     int taken = -1;
-    if (read(rep_rd, &taken, sizeof(taken)) != (ssize_t) sizeof(taken))
+    if (write(go_wr, "x", 1) != 1 ||
+        read(rep_rd, &taken, sizeof(taken)) != (ssize_t) sizeof(taken)) {
+        printf("[child unreachable] ");
         return -1;
+    }
+    if (taken < 0)
+        printf("[child never tried] ");
     return taken;
 }
 
 int main(void)
 {
     int passes = 0, fails = 0;
-    const char *path = "/tmp/elfuse-test-fd-pin-lock";
 
-    lock_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    /* Unique per invocation: record locks are held per (process, inode), so a
+     * fixed name shares one lock space with every concurrent run.
+     */
+    char path[] = "/tmp/elfuse-test-fd-pin-lock.XXXXXX";
+
+    lock_fd = mkstemp(path);
     if (lock_fd < 0) {
-        perror("open");
+        perror("mkstemp");
         return 1;
     }
 

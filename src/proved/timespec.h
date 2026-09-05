@@ -84,6 +84,27 @@ static inline int timespec_valid(int64_t sec, int64_t nsec)
     return sec >= 0 && nsec >= 0 && nsec < TIMESPEC_NSEC_PER_SEC;
 }
 
+/* Whether a guest timespec is one Linux would accept AND whose seconds fit a
+ * caller-supplied ceiling.
+ *
+ * The ceiling is what a caller adds when it will convert the value and needs
+ * the product to stay well inside int64: futex caps at INT64_MAX/4 so the
+ * deadline arithmetic downstream cannot saturate. Expressed here rather than
+ * open-coded beside timespec_valid at each call site, so the cap is inside the
+ * same <==> the prover checks instead of sitting outside it untested.
+ */
+/*@
+  requires cap >= 0;
+  assigns \nothing;
+  ensures \result == 0 || \result == 1;
+  ensures \result != 0 <==>
+      (sec >= 0 && 0 <= nsec < TIMESPEC_NSEC_PER_SEC && sec <= cap);
+ */
+static inline int timespec_valid_capped(int64_t sec, int64_t nsec, int64_t cap)
+{
+    return timespec_valid(sec, nsec) && sec <= cap;
+}
+
 /* Nanoseconds in a timespec, saturating at INT64_MAX and flooring at 0.
  *
  * Total by construction: the multiplication happens only under the proved

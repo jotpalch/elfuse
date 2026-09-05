@@ -20,20 +20,28 @@
 int main(void)
 {
     int passes = 0, fails = 0;
-    const char *src_path = "/tmp/elfuse-test-io-src.txt";
-    const char *dst_path = "/tmp/elfuse-test-io-dst.txt";
+
+    char tmpdir[] = "/tmp/elfuse-io-opt-XXXXXX";
+    if (!mkdtemp(tmpdir)) {
+        perror("mkdtemp");
+        return 1;
+    }
+    char src_path[256], dst_path[256];
+    char alloc_path[256], punch_path[256], cfr_dst[256];
+    snprintf(src_path, sizeof(src_path), "%s/src.txt", tmpdir);
+    snprintf(dst_path, sizeof(dst_path), "%s/dst.txt", tmpdir);
+    snprintf(alloc_path, sizeof(alloc_path), "%s/alloc.bin", tmpdir);
+    snprintf(punch_path, sizeof(punch_path), "%s/punch.bin", tmpdir);
+    snprintf(cfr_dst, sizeof(cfr_dst), "%s/cfr-dst.txt", tmpdir);
     const char *test_data = "Hello from sendfile test! This is test data.\n";
 
     printf("test-io-opt: Batch 3 I/O optimization tests\n");
-
-    /* Clean up */
-    unlink(src_path);
-    unlink(dst_path);
 
     /* Create source file */
     int src_fd = open(src_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (src_fd < 0) {
         printf("FATAL: cannot create %s\n", src_path);
+        rmdir(tmpdir);
         return 1;
     }
     write(src_fd, test_data, strlen(test_data));
@@ -94,8 +102,6 @@ int main(void)
     /* Test fallocate (via ftruncate fallback) */
     TEST("fallocate (extend)");
     {
-        const char *alloc_path = "/tmp/elfuse-test-alloc.bin";
-        unlink(alloc_path);
         int fd = open(alloc_path, O_CREAT | O_RDWR, 0644);
         if (fd >= 0) {
             /* fallocate mode=0 should extend the file */
@@ -113,8 +119,6 @@ int main(void)
 
     TEST("fallocate punch hole keeps size past EOF");
     {
-        const char *punch_path = "/tmp/elfuse-test-punch.bin";
-        unlink(punch_path);
         int fd = open(punch_path, O_CREAT | O_RDWR, 0644);
         if (fd >= 0) {
             const char data[] = "abc";
@@ -145,8 +149,6 @@ int main(void)
     /* Test copy_file_range (via off_t-based API) */
     TEST("copy_file_range");
     {
-        const char *cfr_dst = "/tmp/elfuse-test-cfr-dst.txt";
-        unlink(cfr_dst);
         int in_fd = open(src_path, O_RDONLY);
         int out_fd = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (in_fd >= 0 && out_fd >= 0) {
@@ -183,9 +185,12 @@ int main(void)
         unlink(cfr_dst);
     }
 
-    /* Cleanup */
+    /* Cleanup. The other three fixtures are unlinked by the blocks that make
+     * them, so only these two are left for rmdir to trip over.
+     */
     unlink(src_path);
     unlink(dst_path);
+    rmdir(tmpdir);
 
     SUMMARY("test-io-opt");
     return fails > 0 ? 1 : 0;

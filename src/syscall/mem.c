@@ -2244,6 +2244,40 @@ static void hvf_remap_segments_best_effort(guest_t *g,
     }
 }
 
+/* Unmap the HVF segments covering [ipa, ipa+len) so the host VA underneath can
+ * be re-backed.
+ *
+ * Returns the segment count, or a negative Linux errno. On success the caller
+ * owns segments[0 .. count - 1] and must remap them once the new backing is in
+ * place. A failed unmap rolls the earlier ones back through
+ * hvf_remap_segments_best_effort, which is best effort: a remap that also fails
+ * leaves that range without stage-2 entries and is logged rather than reported.
+ */
+static int hvf_detach_range_segments(guest_t *g,
+                                     uint64_t ipa,
+                                     uint64_t len,
+                                     hvf_segment_t *segments)
+{
+    uint64_t aligned_start = ALIGN_2MIB_DOWN(ipa);
+    uint64_t aligned_end = ALIGN_2MIB_UP(ipa + len);
+
+    int err = hvf_segment_split_range_boundaries(g, aligned_start, aligned_end);
+    if (err < 0)
+        return err;
+    int nsegments = hvf_segment_collect_range(g, aligned_start, aligned_end,
+                                              segments, GUEST_MAX_HVF_SEGMENTS);
+    if (nsegments < 0)
+        return nsegments;
+
+    for (int i = 0; i < nsegments; i++) {
+        if (hv_vm_unmap(segments[i].ipa, segments[i].len) != HV_SUCCESS) {
+            hvf_remap_segments_best_effort(g, segments, i);
+            return -LINUX_EIO;
+        }
+    }
+    return nsegments;
+}
+
 /* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
  * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB segment is
  * split out first if it is not already isolated. Caller holds mmap_lock and has
@@ -2257,27 +2291,10 @@ static int hvf_apply_file_overlay_quiesced(guest_t *g,
                                            int fd,
                                            off_t file_off)
 {
-    uint64_t aligned_start = ALIGN_2MIB_DOWN(ipa);
-    uint64_t aligned_end = ALIGN_2MIB_UP(ipa + len);
     hvf_segment_t segments[GUEST_MAX_HVF_SEGMENTS];
-    int nsegments;
-
-    int err = hvf_segment_split_range_boundaries(g, aligned_start, aligned_end);
-    if (err < 0)
-        return err;
-    nsegments = hvf_segment_collect_range(g, aligned_start, aligned_end,
-                                          segments, GUEST_MAX_HVF_SEGMENTS);
+    int nsegments = hvf_detach_range_segments(g, ipa, len, segments);
     if (nsegments < 0)
         return nsegments;
-
-    int unmapped = 0;
-    for (int i = 0; i < nsegments; i++) {
-        if (hv_vm_unmap(segments[i].ipa, segments[i].len) != HV_SUCCESS) {
-            hvf_remap_segments_best_effort(g, segments, unmapped);
-            return -LINUX_EIO;
-        }
-        unmapped++;
-    }
 
     void *target = (uint8_t *) g->host_base + ipa;
     void *p = mmap(target, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
@@ -2362,29 +2379,12 @@ static int hvf_remove_file_overlay_quiesced(guest_t *g,
                                             uint64_t ipa,
                                             uint64_t len)
 {
-    uint64_t aligned_start = ALIGN_2MIB_DOWN(ipa);
-    uint64_t aligned_end = ALIGN_2MIB_UP(ipa + len);
     hvf_segment_t segments[GUEST_MAX_HVF_SEGMENTS];
-    int nsegments;
-
-    int err = hvf_segment_split_range_boundaries(g, aligned_start, aligned_end);
-    if (err < 0)
-        return err;
-    nsegments = hvf_segment_collect_range(g, aligned_start, aligned_end,
-                                          segments, GUEST_MAX_HVF_SEGMENTS);
+    int nsegments = hvf_detach_range_segments(g, ipa, len, segments);
     if (nsegments < 0)
         return nsegments;
 
-    int unmapped = 0;
-    for (int i = 0; i < nsegments; i++) {
-        if (hv_vm_unmap(segments[i].ipa, segments[i].len) != HV_SUCCESS) {
-            hvf_remap_segments_best_effort(g, segments, unmapped);
-            return -LINUX_EIO;
-        }
-        unmapped++;
-    }
-
-    err = hvf_restore_slab_backing(g, ipa, len);
+    int err = hvf_restore_slab_backing(g, ipa, len);
     if (err < 0) {
         /* Best-effort: re-establish the segment with whatever the host VA
          * currently has (still the file overlay) so the guest can see something

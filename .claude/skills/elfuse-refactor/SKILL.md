@@ -1,254 +1,147 @@
 ---
 name: elfuse-refactor
-description: Judging and cleaning elfuse C code that already works - which Refactoring smells carry weight in a Linux ABI reimplementation, which ones are false alarms in this tree, and what has to stay green before a change counts as behavior-preserving. Use when asked to clean up, simplify, deduplicate, or restructure, when reviewing a diff for maintainability rather than for bugs, or on the symptom alone: an over-long function, the same cleanup block repeated at many failure exits, a helper that returns 0 or -1 and is read with a < 0 test, a comment asserting a number. Not for adding a syscall (elfuse-syscall), for naming and commit style (elfuse-conventions), or for chasing a live failure (elfuse-debug).
+description: Behavior-preserving cleanup of elfuse code. Use when simplifying, deduplicating, or restructuring working code; reviewing maintainability; or reducing prose that narrates code or makes unchecked claims. Not for syscall changes (elfuse-syscall), naming or commit style (elfuse-conventions), or a live failure (elfuse-debug).
 ---
 
 # Refactoring elfuse code
 
-Refactoring is behavior-preserving change, and in this tree the behavior that
-must be preserved is what the guest observes, not what the host code returns.
-That makes the two halves of this file: what is worth changing, and what has
-to stay green before the change counts.
+Refactoring preserves what the guest observes, not merely a host return value.
+Do not call a behavior change a cleanup to make it easier to review.
 
-## What the gates actually measure
+## Route the change first
 
-Worth knowing before treating a green build as a verdict. `.clang-tidy` enables
-`bugprone-*`, `cert-*`, `clang-analyzer-*`, and `performance-*`, which answer
-"is this a bug". The one structural check is `readability-function-size`, and
-it measures line count only: nesting, statement, branch, and parameter
-thresholds are explicitly off, and the functions that predate the ceiling carry
-`NOLINTNEXTLINE`. Nothing counts a repeated block or a duplicated field list.
-`make check-format` settles layout and the generated dispatch header.
+Use this skill only after the code is known to work. A fault, hang, wrong
+errno, or intermittent result starts with `elfuse-debug` instead.
 
-Two things follow, and both have been claimed wrongly before. Read
-`.clang-tidy` rather than this paragraph for the current check set: it changes,
-and a stale summary of a gate is exactly the kind of assertion that reads as
-verified.
+Read the sibling skill that owns a boundary before moving code across it:
 
-First, none of it gates. `WarningsAsErrors` is empty and the tidy CI job says
-in its own comment that it logs rather than fails. A ceiling here reports; it
-does not stop anything.
+- `elfuse-guest-abi` for guest registers, page permissions, HVC, TLBI, EL0
+  return state, fork, or Rosetta state.
+- `elfuse-syscall` for syscall dispatch, guest-memory translation, paths, file
+  descriptors, or lock discipline in the syscall surface.
+- `elfuse-verify` when changing arithmetic covered by `src/proved/` or adding
+  bounds math over guest-controlled values.
 
-Second, `make lint` has never been clean. It emits thousands of advisory
-warnings, mostly `bugprone-multi-level-implicit-pointer-conversion`, none of
-which fail a build. "Lint is clean" is therefore not a claim this tree
-supports. The claims it does support are narrower and worth making precisely:
-no new warnings inside the code you touched, and zero `function-size`
-warnings.
+Do not fold a correctness finding into a cleanup. Report it separately: a diff
+that both moves code and changes behavior cannot be reviewed as either.
 
-So structure here is a judgment call with almost no compiler behind it, and
-this file is the calibration set for the judgment.
+## Decide whether the finding is real
 
-## Measure before judging
+Name the friction before treating it, and let that name bound the diff: which
+call site is hard to read, which contract is hard to find, which edit had to be
+repeated across files. A cleanup with no named friction has no stop condition,
+and the reviewer inherits the job of deciding where it should have ended. A
+second finding met on the way out is reported in its own diff, not absorbed
+into this one.
 
-Say which numbers were measured and which were eyeballed, and never quote a
-count from a document, including this one. Recompute it. The tree is
-clang-formatted, which is the only reason these one-liners are honest: a
-function definition is a signature at column 0 followed by a lone `{`, and its
-body ends at the first lone `}`.
+Measure it. `references/measuring.md` carries the scans for function size,
+duplication, and nesting, and the traps in reading each. Report a number with
+the command that produced it and a judgment as a judgment; never quote a count
+from a document, this one included.
 
-```sh
-# function lengths over 60 body lines, longest first
-awk 'FNR==1{d=0} /^\{$/{d=1;s=FNR;next}
-     d&&/^\}$/{if(FNR-s-1>60)printf "%5d  %s:%d\n",FNR-s-1,FILENAME,s;d=0}' \
-    $(git ls-files 'src/*.c') | sort -rn
+Prefer deletion, an existing local helper, or a direct rewrite over a new
+abstraction. A parameter every caller gives the same value, a hook with one
+implementation, and future-facing scaffolding are dead flexibility. Remove
+them unless a tracked contract needs them.
 
-# statements at nesting depth 4 or deeper (4-space indent, so 20 columns in)
-grep -rn '^ \{20\}[^ *]' --include='*.c' src
+Extract only when it gives a named operation or makes one contract easier to
+see. Splitting a single Linux flag matrix across helpers hides the syscall
+contract; separating path resolution, a host call, and result translation can
+clarify it.
 
-# file sizes
-git ls-files 'src/*.c' | xargs wc -l | sort -rn | head -20
-```
+Check all callers before changing a helper. A 0/-1 helper used only as a
+success/failure test should normally return `bool`, but read the body before
+converting: most such helpers here set `errno` on the failure path or forward a
+primitive's, which is what `elfuse-conventions` reserves `int` for. A sweep by
+call-site shape alone converts far more than it should. A repeated ABI literal
+belongs in `src/syscall/abi.h` or `src/syscall/linux-wire.h`, whichever the
+neighboring constants already use.
 
-The nesting grep also catches wrapped continuation lines, so it is a lead, not
-a count. Duplication has no mechanical detector here; `jscpd` and `lizard` are
-not part of this build and adding a dependency to score a cleanup is not worth
-it. Call duplication findings what they are: judgment, with the two locations
-quoted so a reader can check the call.
+Treat these as intentional until the surrounding contract proves otherwise:
 
-Report a measured number with the command that produced it, and a judgment as
-a judgment. A count with no command behind it reads as a fact and rots into a
-wrong one.
+- Similar Linux and macOS ABI structures are a translation boundary, not
+  duplicate types. Keep packed Linux structures beside their translation.
+- Repeated conversion switches belong in `src/syscall/translate.c`. An inline
+  conversion elsewhere is the smell.
+- `sc_` wrappers in `src/syscall/syscall.c` are typed dispatch unpacking. Their
+  unused-parameter runs are the widest hit any duplication scan reports here,
+  every time. Collapsing them behind a macro hides which arguments a handler
+  ignores.
+- Fixed-width guest values and per-vCPU `_Thread_local` state carry ABI and
+  concurrency meaning. Do not wrap or promote them for appearance alone.
+- A test fixture that only prints may have its oracle in a shell lane. Find the
+  lane before adding an assertion.
 
-## Behavior-preserving is a claim the lanes settle
+Before deleting a symbol, search `src/syscall/dispatch.tbl`, `src/core/shim.S`,
+and `tests/` as well as C callers. Generated dispatch, assembly, and test
+lanes are reachability paths.
 
-`docs/testing.md`, section "Validation Strategy By Change Type", maps the area
-touched to the minimum command set; a pure cleanup does not earn a smaller set
-than the feature would have. `elfuse-verify` explains what a failure in each
-lane means.
+## Preserve the boundaries
 
-Three cases where "I only moved code" is wrong:
+- A helper that acquires a lock changes lock order at every caller. The lock
+  order comment in `src/syscall/internal.h` is the contract. A helper that
+  releases one, or drops and retakes it, is the same hazard read backwards, and
+  the name has to carry it: `_locked` already means "call me holding it", so a
+  helper that hands the lock back needs a different suffix and a comment saying
+  the caller must not touch that lock again.
+- Moving an interruptible wait into a helper moves its restart classification.
+  `scripts/check-eintr-contract.py` keys on the function that decides, not the
+  syscall that returns, so the new helper takes the inventory entry and the
+  caller, now a forwarder, drops out of it. The gate fails the build until both
+  happen. Carry any reasoning the departing entry held into a comment at the
+  code it described rather than deleting it with the entry.
+- Vector entry stubs in `src/core/shim.S` cannot clobber a GPR before
+  `svc_handler`; do not consolidate them through a scratch-register prologue.
+- Do not unify X8 drop-frame-marker writes by appearance. Find current writes
+  with `grep -rn 'HV_REG_X8' src/`, read `src/core/shim.S`, then follow
+  `elfuse-guest-abi`.
+- `src/syscall/dispatch.tbl` owns generated dispatch. Change that input, not
+  generated output.
 
-- Anything under `src/proved/`. The contracts move with the arithmetic, so
-  `make verify` and `make verify-mutants` both have to pass again. A proof
-  that still discharges after a rewrite but no longer rejects the mutant is a
-  proof that got weaker while looking green.
-- Anything that writes guest registers on the return path, sets page
-  permissions, or touches the TLBI epilogue. That is guest-observable, so it
-  is not a refactor until `elfuse-guest-abi` says the observable side is
-  unchanged.
-- Extracting a helper that acquires a lock. The lock order comment at the top
-  of `src/syscall/internal.h` is the contract, and moving an acquire inside a
-  callee changes the order at every call site at once.
+When two functions encode the same forward and reverse bit correspondence,
+state the mapping once as a table and use it in both directions. Similar code
+is not enough: the two bodies must represent the same fact.
 
-## Smells that carry weight here
+## Work in small, evidenced steps
 
-- A `sys_` function that has grown to hold several unrelated Linux behaviors.
-  Length alone is not the finding: one syscall's flag matrix is allowed to be
-  long, because each branch is a documented kernel behavior and splitting it
-  scatters one contract. The finding is when the flag matrix, the path
-  resolution, the host call, and the result translation are all inline in one
-  body, because then no reader can tell which of the four a bug lives in.
-- Shotgun surgery across the translation boundary. If a new syscall needs an
-  edit in `src/syscall/translate.c`, a domain file, and two other places that
-  each re-derive the same thing, the re-derivations are the bug.
-- Dead flexibility: a parameter every caller passes the same value for, a hook
-  with one implementation, scaffolding for a feature the root working docs
-  still list as future work. Delete it; the git history keeps it.
-- A raw ABI literal in a domain file. The constant belongs in
-  `src/syscall/abi.h` with a name, and the domain file uses the name.
-- A helper that returns 0 or -1 and is only ever read with `< 0`. That is a
-  `bool` wearing an `int`, and `elfuse-conventions` says which is which.
-- A comment that asserts a number or a guarantee. Both rot silently and both
-  read as checked. A comment saying a buffer is "~100KiB" when the type it
-  sizes has since grown, or saying a check "has to be declared in the diff"
-  when `WarningsAsErrors` is empty and the CI job logs rather than gates, is
-  worse than no comment: the next reader trusts it instead of measuring. When
-  a refactor moves a comment, its claims move with it unverified, so recompute
-  the number and re-read the config the sentence describes. This is the same
-  failure `scripts/check-skill-refs.py` exists to catch in the skills, and
-  nothing catches it in `src/`.
+Read `docs/testing.md`, section "Validation Strategy By Change Type", and run
+the selected baseline before a multi-step cleanup. Keep inherited failures
+separate from the change. Stop when the baseline is red in the area being
+changed.
 
-## Smells that are false alarms in this tree
+Make one behavior-preserving step at a time, then run its mapped lanes. A pure
+cleanup uses the same validation as the feature area, not a weaker set, and
+`elfuse-verify` owns reading the verdicts. Changes under `src/proved/` require
+`make verify` and `make verify-mutants`.
 
-Each of these is a textbook finding that a generic audit reports and that is
-correct code here.
+`make lint` is advisory except for `readability-function-size`, which
+`.clang-tidy` names in `WarningsAsErrors`, so a function crossing the ceiling
+fails the job. Consult `.clang-tidy` for its current checks; report only
+warnings introduced by touched code, plus any `function-size` result. Do not
+claim that lint is clean.
 
-- Two structures that look alike across the ABI boundary. A Linux `stat` and a
-  macOS `stat` are not duplicated knowledge; they are two knowledges that
-  happen to rhyme, and merging them puts one definition where a translation
-  belongs. `elfuse-conventions` requires packed Linux structures to live next
-  to the translation code that reads them, precisely so they can diverge.
+Keep formatting local. `make indent` should be a no-op on a clean tree; a
+tree-wide formatter diff signals a version or tooling problem, not cleanup.
+Check `git diff --numstat` before handoff and split unrelated churn out.
 
-  A translation and its inverse are the opposite case, and the resemblance is
-  easy to wave off with the rule above. Which Linux bit means which macOS bit
-  is one fact, and a hand-written forward function plus a hand-written reverse
-  function state it twice, so a bit added to one silently misses the other and
-  nothing fails. State it once as a table and walk it in both directions. The
-  test is whether the two bodies encode the same correspondence or two
-  different ones.
-- Repeated switches at the translation boundary. errno, `AT_*` flags, clock
-  ids, and socket flags each get their own switch in
-  `src/syscall/translate.c`. That concentration is the design; the smell is a
-  conversion written inline somewhere else.
-- The wall of `sc_` wrappers in `src/syscall/syscall.c`. They look like
-  boilerplate begging for a loop; they are the typed unpack the generated
-  dispatch table calls. Moving one into a domain file yields a symbol nothing reaches.
-- `uint64_t gva` as primitive obsession. The fixed-width type is the signal
-  that says which side of the boundary the value came from. A wrapper type
-  removes information rather than adding it.
-- A `_Thread_local` slot that "should" be shared state. `cpu_tlbi_req` is
-  per-vCPU on purpose, and promoting it to guest-global reintroduces the
-  cross-vCPU drain race it was split to fix.
-- A test that makes no assertion. Guest fixtures like `tests/test-argc.c` only
-  print; the oracle is the shell lane that greps their output, so an
-  assertion-free `main` is the design rather than a gap. Among the tests that
-  do run in-process, `EXPECT_EQ` and friends are a convenience layer over
-  `TEST` / `PASS` / `FAIL` in `tests/test-harness.h`, so a file using only the
-  latter is fully asserted. Judge a test by whether something fails when the
-  behavior breaks, not by which macro it spells.
-- Apparently dead code. Before deleting a symbol, grep `src/syscall/dispatch.tbl`,
-  `src/core/shim.S`, and `tests/` for it. Reachability here runs through a
-  generated table, hand-written assembly, and test lanes, so the C call graph
-  alone does not decide it.
+Extracting a helper almost always leaves a call site the formatter wants to
+wrap differently, so expect `make check-format` to fail once per extraction.
+Run the formatter on that file and confirm from `git diff --numstat` that it
+touched only the lines you wrote: a file reporting far more is the version
+problem above, not the wrap. `commentflow` reflows adjacent comment lines into
+one paragraph, so a new comment block placed directly under an existing one
+merges into it; separate them with a bare `*` or `#` line.
 
-## Where a textbook refactor is a bug
-
-- Vector entry stubs in `src/core/shim.S` must not clobber any GPR before
-  `svc_handler`. A shared prologue macro that uses one scratch register
-  corrupts the EL0 caller after ERET, and the tests that notice are not the
-  ones a cleanup runs.
-- The paths that hand the shim its drop-frame marker in X8 look like one
-  duplication and are not safely unified. Which paths those are has already
-  changed once, so grep for the writes rather than trusting any list,
-  including this sentence: `grep -rn 'HV_REG_X8' src/` shows who sets it and
-  to what, and `src/core/shim.S` documents what each value means. They differ
-  in whether they return through the dispatch epilogue at all, so read
-  `elfuse-guest-abi` first; a wrong unification ties the handler PC to a stale
-  syscall frame and only shows up under signals.
-- The generated dispatch header is generated. Edit `src/syscall/dispatch.tbl`
-  and rerun `make check-format`.
-
-## Leave it cleaner, in proportion
-
-Every edit is a chance to leave one thing better, and the tree reached
-four-figure functions because nobody took it. But "in proportion" is the
-load-bearing half, and in this tree it has a mechanical edge that a good
-intention does not survive.
-
-Do not run `clang-format -i` on a whole file to tidy a small change. On the
-current tree that pass is a no-op, since every file `make indent` selects
-formats to itself with no diff, so it buys nothing. What it can cost is
-everything: a clang-format that is not version 22 reformats the whole tree at
-once and buries the change, which is why `CONTRIBUTING.md` pins the version
-rather than asking for 22 or newer.
-
-`make indent` also runs `commentflow`, and since the one-time reflow landed it
-is a no-op too. Treat a tree-wide diff from either half as a signal rather than
-as cleanup: it means the formatter you have is not the one the gate runs.
-
-Format the file only when you added code to it, and check `git diff --numstat`
-before calling the work done: a file you meant to touch in one line reporting
-twenty is churn, not cleanup. The same goes for a scripted edit that rewrites
-whole files.
-
-The proportionality test is the diff, not the intent. A cleanup that lands in
-a file the task never needed to open is a separate change, and it costs the
-next reader a bisect.
-
-## Fix it now, or write it down
-
-Most findings are not for the change you are making. Fix one now only when it
-blocks the task, when it is a live risk, or when your own edit introduced it.
-Everything else gets reported, in the summary or in the root working docs, and
-that report is the deliverable rather than a consolation prize: a named,
-located finding is worth more than a drive-by fix nobody asked to review.
-
-Two cases decide themselves. A correctness bug found while cleaning is never
-folded into the cleanup, because a diff that both moves code and changes
-behavior cannot be reviewed as either. A finding whose fix would touch a
-subsystem the task never opened is a separate change, however obvious it looks
-from here.
-
-## Before a multi-step cleanup
-
-Run the lanes before touching anything, and keep the output. This tree is not
-green everywhere: `make check-format` fails on shell scripts, `make lint`
-emits thousands of advisory warnings, and neither is your doing. Without that
-baseline you will spend the session unable to tell your breakage from the
-breakage you inherited, or worse, you will report someone else's red as your
-own.
-
-Then work in batches that each end green, one smell family or one file at a
-time, and say after every batch which lanes ran. When a lane cannot run, name
-it and say what risk that leaves rather than rounding up to success. When the
-baseline is already red in the area you are about to change, stop and report
-instead of refactoring on top of it.
-
-## Sequencing
-
-One behavior-preserving step per commit, each with its own green lanes, so a
-bisect lands on a step rather than on a rewrite. A commit that both moves code
-and changes behavior cannot be reviewed as either. Subject lines follow the
-seven rules in `elfuse-conventions`, and a cleanup commit says what stops
-happening, not that things were cleaned up.
+For a prose cleanup, follow
+`.claude/skills/elfuse-conventions/references/prose-reduction.md`. A Python
+docstring may be runtime data, so search its consumers before removing it.
 
 ## Authoritative sources
 
-This skill is a working summary. These are tracked and survive a fresh clone,
-so prefer them when the two disagree:
-
-- `.clang-tidy` - the enabled check set, which is what `make lint` decides.
-- `docs/testing.md`, section "Validation Strategy By Change Type" - the change
-  area to command mapping.
-- `src/syscall/internal.h` - the lock order comment at the top.
+- `.clang-tidy` for the enabled lint checks and which of them gates.
+- `references/measuring.md` for the scans behind any count reported here.
+- `scripts/check-eintr-contract.py` for the restart classifications.
+- `docs/testing.md`, section "Validation Strategy By Change Type", for
+  validation lanes.
+- `src/syscall/internal.h` for lock order.
+- `src/core/shim.S` for shim entry and return conventions.

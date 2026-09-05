@@ -10,7 +10,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#include "syscall/linux-limits.h"
+#include "linux-limits.h"
 
 typedef struct {
     bool active;

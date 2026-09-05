@@ -31,9 +31,14 @@ RESET = "\033[0m"
 # prefix that varies per proof and says nothing about which function is open,
 # so strip it and report the bare name.
 OPEN_GOAL = re.compile(
-    r"^\[wp\] \[(?:Timeout|Stepout|Unknown|Failed)\] "
+    r"^\[wp\] \[(Timeout|Stepout|Unknown|Failed)\] "
     r"(?:typed_caveat_|typed_|bytes_)?([A-Za-z0-9_]+)"
 )
+
+# Timeout and Stepout are the prover giving up on the clock or the step budget,
+# not a counterexample. They say nothing about whether the goal holds, so they
+# get their own advice below rather than the read-the-suffix key.
+RESOURCE_VERDICTS = {"Timeout", "Stepout"}
 
 PROVED_GOALS = re.compile(r"^\[wp\] Proved goals: *([0-9]+) / ([0-9]+)$")
 
@@ -55,6 +60,21 @@ MIN_GOALS_HINT = """\
            raise VERIFY_*_MIN_GOALS when adding proved functions\
 """
 
+RESOURCE_HINT = """\
+           %d of the open obligations above are prover resource limits
+           (%s), which say nothing about whether the goal holds. A loaded
+           host is the usual cause; measure before concluding anything."""
+
+# WP memoizes a verdict per goal, and a Timeout is memoized like any other, so
+# one run on a loaded host leaves the target red on every later run including
+# on an idle one. Nothing in the output says the verdict is a replay unless the
+# prover line is read, which is why this names the way out.
+CACHED_HINT = """\
+           At least one came from the WP cache in .frama-c/ rather than from a
+           prover run this time. The cache stores a timeout as if it were a
+           result, so the verdict outlives the load that caused it. Re-run the
+           target with FRAMAC_WP_CACHE=rebuild before reading anything into it."""
+
 SUFFIX_KEY = """\
            Each open obligation named above is either a real defect or an
            ACSL contract too weak to justify the code. Read the suffix:
@@ -72,12 +92,21 @@ def unproven(reason):
     return 1
 
 
+def open_goals(lines):
+    """Return [(verdict, goal, cached)] for every obligation WP left open."""
+    found = []
+    for line in lines:
+        if match := OPEN_GOAL.match(line):
+            found.append((match.group(1), match.group(2), "(Cached)" in line))
+    return found
+
+
 def report(log_path, lines, status, min_goals, src, unproved):
     """Verdict for one proof. Returns the process exit status."""
-    for line in lines:
-        match = OPEN_GOAL.match(line)
-        if match:
-            print("          open: %s" % match.group(1))
+    opened = open_goals(lines)
+    for verdict, goal, cached in opened:
+        suffix = " [%s%s]" % (verdict, ", cached" if cached else "")
+        print("          open: %s%s" % (goal, suffix))
 
     if status != 0:
         rc = unproven("frama-c exited %s; its own summary is not trusted" % status)
@@ -112,7 +141,18 @@ def report(log_path, lines, status, min_goals, src, unproved):
             "%d of %d proof obligations discharged, %d left open"
             % (proved, total, total - proved)
         )
-        print(SUFFIX_KEY)
+        resource = [g for g in opened if g[0] in RESOURCE_VERDICTS]
+        if resource:
+            kinds = ", ".join(sorted({g[0] for g in resource}))
+            print(RESOURCE_HINT % (len(resource), kinds))
+            if any(g[2] for g in resource):
+                print(CACHED_HINT)
+        # Compared against the count WP reported, not against the lines that
+        # parsed. An open obligation this could not classify still needs the
+        # key, and measuring against @opened would let one parsed timeout
+        # suppress the guidance for a second goal nobody read.
+        if len(resource) < total - proved:
+            print(SUFFIX_KEY)
         print("           Full prover output: %s" % log_path)
         return rc
 

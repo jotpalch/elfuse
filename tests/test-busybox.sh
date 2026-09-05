@@ -260,17 +260,53 @@ run_check find "hello.txt" "$TMPDIR" "-name" "hello.txt"
 
 # Networking
 printf '\n%s── Networking ──%s\n' "$BLUE" "$RESET"
-run_check nslookup "Address" "example.com"
+
+# nslookup queries live DNS, so a host that has momentarily lost its uplink
+# fails it for reasons that say nothing about busybox or about elfuse's socket
+# path. The wget guard below already draws that line; without the same one here
+# a dropped uplink turns make check red with a misleading verdict, which is what
+# it did on a hotspot that came back a minute later.
+#
+# The probe reaches the nameserver the guest will query, over TCP, rather than
+# asking the system resolver. dscacheutil goes through mDNSResponder, which
+# answers from cache, so on a dropped uplink it still returns the record it
+# holds while the guest's live UDP query gets nothing: the probe would pass and
+# the test would fail, which is the case this guard exists to prevent.
+#
+# Reachability of the resolver rather than a full lookup, so a nameserver that
+# is up but answering SERVFAIL still reaches the check and is reported. A
+# resolver that serves UDP but refuses TCP reads as unreachable and skips, which
+# loses coverage rather than inventing a failure.
+#
+# awk reads to EOF rather than exiting on the first match: under pipefail an
+# early exit closes the pipe while scutil is still writing, and the SIGPIPE
+# surfaces as 141 from the assignment, which set -e then treats as a failed run.
+nameserver=$(scutil --dns 2> /dev/null |
+    awk '/nameserver\[0\]/ && !seen {print $3; seen = 1}')
+if [ -n "$nameserver" ] && nc -z -w 2 "$nameserver" 53 2> /dev/null; then
+    run_check nslookup "Address" "example.com"
+else
+    run_skip nslookup "no reachable nameserver from this host"
+fi
 
 # wget pulls a real document from example.com. In sandboxed CI / corporate
-# networks where outbound HTTP is filtered, this fails with "No route to host"
-# through no fault of busybox itself. Probe TCP reachability from the host first
-# and skip cleanly rather than report a misleading failure. /dev/tcp/host/port
-# is bash-specific; nc -z is more portable here.
-if nc -z -w 2 example.com 80 2> /dev/null; then
+# networks where outbound HTTP is filtered, this fails through no fault of
+# busybox itself, so probe from the host first and skip cleanly rather than
+# report a misleading failure.
+#
+# The probe fetches the document rather than testing TCP reachability, because a
+# captive portal or transparent proxy accepts the connection and answers with
+# its own page: a port probe passes while the guest sees content that never came
+# from example.com, the same trap the nameserver guard above avoids by not
+# asking a cache. It matches "Example Domain" where the guest check greps the
+# bare "Example", so a portal page carrying that word cannot arm a check the
+# guest then fails on different content. Measured on a network whose middlebox
+# answers port 80 with a 307 to a subscriber redirect.
+if host_page=$(curl -fsS --max-time 10 http://example.com/ 2> /dev/null) &&
+    printf '%s' "$host_page" | grep -q 'Example Domain'; then
     run_check wget "Example" "-q" "-O" "-" "http://example.com/"
 else
-    run_skip wget "external http unreachable from this host"
+    run_skip wget "no unintercepted http to example.com from this host"
 fi
 run_skip ping "needs raw socket / setuid"
 run_nc_http_check

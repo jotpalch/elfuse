@@ -53,8 +53,8 @@ static unsigned char page_marker(int page)
  */
 static int make_seed_file(char *out, size_t out_sz)
 {
-    snprintf(out, out_sz, "/tmp/elfuse-mmap-ro-%ld", (long) getpid());
-    int fd = open(out, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    snprintf(out, out_sz, "/tmp/elfuse-mmap-ro-XXXXXX");
+    int fd = mkstemp(out);
     if (fd < 0)
         return -1;
     for (int p = 0; p < NPAGES; p++) {

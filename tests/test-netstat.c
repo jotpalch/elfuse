@@ -169,34 +169,52 @@ int main(void)
     struct sockaddr_in taddr = {0};
     taddr.sin_family = AF_INET;
     taddr.sin_addr.s_addr = htonl(0x7f000001); /* 127.0.0.1 */
-    taddr.sin_port = htons(7777);
+    /* A fixed port is owned by the host, not by this process, so a concurrent
+     * run of this test took it first and every later one died on EADDRINUSE.
+     */
+    taddr.sin_port = htons(0);
     if (bind(tcp_fd, (struct sockaddr *) &taddr, sizeof(taddr)) < 0) {
         perror("bind(TCP)");
         return 1;
     }
+    socklen_t tlen = sizeof(taddr);
+    if (getsockname(tcp_fd, (struct sockaddr *) &taddr, &tlen) < 0) {
+        perror("getsockname(TCP)");
+        return 1;
+    }
+    unsigned tcp_port = ntohs(taddr.sin_port);
     if (listen(tcp_fd, 1) < 0) {
         perror("listen");
         return 1;
     }
 
-    /* UDP socket on 0.0.0.0:8888 */
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_fd < 0) {
         perror("socket(UDP)");
         return 1;
     }
     struct sockaddr_in uaddr = {0};
-    uaddr.sin_family = AF_INET, uaddr.sin_port = htons(8888);
+    uaddr.sin_family = AF_INET;
+    uaddr.sin_port = htons(0);
     if (bind(udp_fd, (struct sockaddr *) &uaddr, sizeof(uaddr)) < 0) {
         perror("bind(UDP)");
         return 1;
     }
+    socklen_t ulen = sizeof(uaddr);
+    if (getsockname(udp_fd, (struct sockaddr *) &uaddr, &ulen) < 0) {
+        perror("getsockname(UDP)");
+        return 1;
+    }
+    unsigned udp_port = ntohs(uaddr.sin_port);
 
     /* 3. Verify /proc/net/tcp */
     if (read_proc_file("/proc/net/tcp", buf, sizeof(buf)) == 0) {
-        /* 7777 = 0x1E61, 127.0.0.1 = 0100007F in /proc/net format */
-        if (strstr(buf, "0100007F:1E61") && strstr(buf, " 0A ")) {
-            printf("PASS: /proc/net/tcp shows TCP LISTEN on 127.0.0.1:7777\n");
+        /* 127.0.0.1 is 0100007F in /proc/net format. */
+        char want[32];
+        snprintf(want, sizeof(want), "0100007F:%04X", tcp_port);
+        if (strstr(buf, want) && strstr(buf, " 0A ")) {
+            printf("PASS: /proc/net/tcp shows TCP LISTEN on 127.0.0.1:%u\n",
+                   tcp_port);
             pass++;
         } else {
             printf("FAIL: /proc/net/tcp missing TCP listener\n  got: %s", buf);
@@ -208,9 +226,10 @@ int main(void)
 
     /* 4. Verify /proc/net/udp */
     if (read_proc_file("/proc/net/udp", buf, sizeof(buf)) == 0) {
-        /* 8888 = 0x22B8 */
-        if (strstr(buf, "00000000:22B8")) {
-            printf("PASS: /proc/net/udp shows UDP on 0.0.0.0:8888\n");
+        char want[32];
+        snprintf(want, sizeof(want), "00000000:%04X", udp_port);
+        if (strstr(buf, want)) {
+            printf("PASS: /proc/net/udp shows UDP on 0.0.0.0:%u\n", udp_port);
             pass++;
         } else {
             printf("FAIL: /proc/net/udp missing UDP socket\n  got: %s", buf);

@@ -1215,6 +1215,36 @@ int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out)
     return host;
 }
 
+int fd_snapshot_and_dup_or_share_dir(int guest_fd,
+                                     fd_entry_t *out,
+                                     bool *out_shared_dir)
+{
+    *out_shared_dir = false;
+    out->type = FD_CLOSED;
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return -1;
+    pthread_mutex_lock(&fd_lock);
+    if (!fd_snapshot_locked(guest_fd, out, false)) {
+        pthread_mutex_unlock(&fd_lock);
+        return -1;
+    }
+
+    /* Reference and descriptor are taken in the one window that proved the slot
+     * is still this directory, so a sibling close cannot free the stream
+     * between the snapshot and the reference that keeps it alive.
+     */
+    int host;
+    if (out->type == FD_DIR && out->dir) {
+        dir_stream_ref_locked(out->dir);
+        *out_shared_dir = true;
+        host = out->host_fd;
+    } else {
+        host = (out->host_fd >= 0) ? dup(out->host_fd) : -1;
+    }
+    pthread_mutex_unlock(&fd_lock);
+    return host;
+}
+
 int fd_get_type(int guest_fd)
 {
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))

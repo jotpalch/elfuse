@@ -26,5 +26,7 @@ uint64_t gdb_parse_hex(const char **pp);
 
 int gdb_rsp_send(int fd, const char *data, size_t len);
 void gdb_rsp_reset(gdb_rsp_ctx_t *ctx);
+/* Unconsumed bytes may contain acknowledgments or an incomplete packet. */
+bool gdb_rsp_pending(const gdb_rsp_ctx_t *ctx);
 void gdb_rsp_set_noack(gdb_rsp_ctx_t *ctx, bool enabled);
 int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz);

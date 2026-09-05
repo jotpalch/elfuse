@@ -52,9 +52,10 @@ test-comprehensive
 
 [section] elfuse-internal implementation tests
 # These probe elfuse's own EL1 shim fast paths (identity cache, urandom
-# ring, shim_data privilege) and procfs sendfile/copy_file_range
-# interception -- plumbing with no Linux-kernel counterpart, so they are
-# never part of test-matrix.sh (see each file's own header comment).
+# ring, shim_data privilege), the register state a ptrace-stop taken inside
+# that shim reports, and procfs sendfile/copy_file_range interception --
+# plumbing with no Linux-kernel counterpart, so they are never part of
+# test-matrix.sh (see each file's own header comment).
 test-oom-proc
 test-shim-identity
 test-shim-identity-attention
@@ -63,6 +64,9 @@ test-shim-data-el1
 test-shim-urandom-smp
 test-shim-urandom-toctou
 test-shim-urandom-wrap
+test-shim-futex-fast
+test-shim-futex-toctou
+test-ptrace-interrupt
 
 [section] I/O subsystem tests
 test-eventfd
@@ -79,6 +83,7 @@ test-epoll-dup
 test-epoll-refcount
 test-epoll-del-leak
 test-timerfd
+test-timerfd-overflow
 test-large-io-boundary
 test-ioctl-cloexec
 test-pty
@@ -109,6 +114,7 @@ test-mprotect-mt               # diff=skip
 
 [section] Signal + thread tests
 test-signal-thread
+test-signal-in-shim           # diff=skip
 test-sigsuspend
 test-fault-signal-mt           # diff=skip
 test-exit-group-worker
@@ -152,6 +158,18 @@ test-futex-pi                  # diff=skip
 
 [section] futex_waitv (SYS 449) tests
 test-futex-waitv               # diff=skip
+
+[section] Timed futex wait ordering
+test-futex-timed
+
+[section] FUTEX_WAKE_OP operand decode
+test-futex-wake-op
+
+[section] FUTEX_WAKE with no waiter
+test-futex-wake-nowaiter
+
+[section] FUTEX_REQUEUE accounting
+test-futex-requeue-account
 
 [section] Robust futex tests
 test-robust-futex

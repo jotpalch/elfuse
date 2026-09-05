@@ -28,6 +28,7 @@
 #include "debug/log.h"
 #include <sys/event.h>
 
+#include "proved/timespec.h"
 #include "syscall/linux-wire.h"
 #include "syscall/fd.h"
 #include "syscall/internal.h"
@@ -47,7 +48,10 @@ static void eventfd_close(int guest_fd);
 static void signalfd_close(int guest_fd);
 
 #define NS_PER_SEC 1000000000LL
-#define US_PER_SEC 1000000LL
+
+_Static_assert(
+    NS_PER_SEC == TIMESPEC_NSEC_PER_SEC,
+    "timerfd and proved timespec conversions must use the same scale");
 
 /* All special-FD state arrays store guest_fd as their first field. Keep the
  * common slot walk in one place so timerfd/eventfd/signalfd stay consistent.
@@ -271,7 +275,7 @@ int64_t sys_timerfd_settime(guest_t *g,
 
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t now_ns = now.tv_sec * NS_PER_SEC + now.tv_nsec;
+            int64_t now_ns = timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
             int64_t remaining = timerfd_remaining_ns_locked(slot, now_ns);
             if (remaining > 0) {
                 old.it_value_sec = remaining / NS_PER_SEC;
@@ -293,26 +297,21 @@ int64_t sys_timerfd_settime(guest_t *g,
                              ? CLOCK_REALTIME
                              : CLOCK_MONOTONIC;
         clock_gettime(host_clock, &now);
-        int64_t target_sec = its.it_value_sec;
-        if (target_sec > INT64_MAX / NS_PER_SEC)
-            target_sec = INT64_MAX / NS_PER_SEC;
-        int64_t target_ns = target_sec * NS_PER_SEC + its.it_value_nsec;
-        int64_t now_ns = now.tv_sec * NS_PER_SEC + now.tv_nsec;
+        int64_t target_ns =
+            timespec_to_ns_sat(its.it_value_sec, its.it_value_nsec);
+        int64_t now_ns = timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
         int64_t relative_ns = target_ns > now_ns ? target_ns - now_ns : 1;
         its.it_value_sec = relative_ns / NS_PER_SEC;
         its.it_value_nsec = relative_ns % NS_PER_SEC;
     }
 
-    /* Clamp large seconds values to prevent signed integer overflow. INT64_MAX
-     * / 1e6 is about 9.2e12 seconds; INT64_MAX / 1e9 is about 9.2e9 seconds.
+    /* Derive the host timeout and stored timer state from the same saturating
+     * nanosecond conversion.
      */
-    int64_t val_sec = its.it_value_sec, int_sec = its.it_interval_sec;
-    if (val_sec > INT64_MAX / US_PER_SEC)
-        val_sec = INT64_MAX / US_PER_SEC;
-    if (int_sec > INT64_MAX / NS_PER_SEC)
-        int_sec = INT64_MAX / NS_PER_SEC;
-    int64_t value_us = val_sec * US_PER_SEC + its.it_value_nsec / 1000;
-    int64_t interval_ns = int_sec * NS_PER_SEC + its.it_interval_nsec;
+    int64_t value_ns = timespec_to_ns_sat(its.it_value_sec, its.it_value_nsec);
+    int64_t value_us = value_ns / 1000;
+    int64_t interval_ns =
+        timespec_to_ns_sat(its.it_interval_sec, its.it_interval_nsec);
 
     log_debug(
         "timerfd_settime: gfd=%d value=%lld.%09lld "
@@ -352,20 +351,14 @@ int64_t sys_timerfd_settime(guest_t *g,
         timerfd_state[slot].armed = true;
         timerfd_state[slot].interval_ns = interval_ns;
 
-        /* Use separate clamping for nanosecond computation: val_sec is clamped
-         * for microsecond use (INT64_MAX / 1e6), which overflows when * 1e9.
-         */
-        int64_t init_sec = its.it_value_sec;
-        if (init_sec > INT64_MAX / NS_PER_SEC)
-            init_sec = INT64_MAX / NS_PER_SEC;
-        timerfd_state[slot].initial_ns =
-            init_sec * NS_PER_SEC + its.it_value_nsec;
+        timerfd_state[slot].initial_ns = value_ns;
         timerfd_state[slot].expirations = 0;
 
         /* Record arm time for gettime remaining-time calculation */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        timerfd_state[slot].arm_time_ns = now.tv_sec * NS_PER_SEC + now.tv_nsec;
+        timerfd_state[slot].arm_time_ns =
+            timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
     }
 
 unlock:
@@ -389,7 +382,7 @@ int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva)
 
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t now_ns = now.tv_sec * NS_PER_SEC + now.tv_nsec;
+        int64_t now_ns = timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
         int64_t remaining = timerfd_remaining_ns_locked(slot, now_ns);
 
         if (remaining <= 0) {
@@ -510,7 +503,8 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
         /* Update arm time for gettime remaining-time calculation */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        timerfd_state[slot].arm_time_ns = now.tv_sec * NS_PER_SEC + now.tv_nsec;
+        timerfd_state[slot].arm_time_ns =
+            timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
         timerfd_state[slot].initial_ns = intv; /* Next fire is one interval */
     }
     pthread_mutex_unlock(&sfd_lock);
@@ -1458,7 +1452,7 @@ bool timerfd_fdinfo_snapshot(int guest_fd,
     if (timerfd_state[slot].armed) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t now_ns = (int64_t) now.tv_sec * NS_PER_SEC + now.tv_nsec;
+        int64_t now_ns = timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
         value_ns = timerfd_remaining_ns_locked(slot, now_ns);
     }
     *value_ns_out = value_ns;

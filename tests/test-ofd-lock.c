@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -47,11 +48,14 @@ static int ofd_lock_with_pid(int fd, int cmd, short type, pid_t pid)
 int main(void)
 {
     int passes = 0, fails = 0;
-    const char *path = "/tmp/elfuse-test-ofd-lock.db";
 
-    int fd1 = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    /* Unique per invocation: OFD locks contend across processes on one inode.
+     */
+    char path[] = "/tmp/elfuse-test-ofd-lock.XXXXXX";
+
+    int fd1 = mkstemp(path);
     if (fd1 < 0) {
-        perror("open fd1");
+        perror("mkstemp");
         return 1;
     }
 
@@ -59,9 +63,11 @@ int main(void)
      * taken on fd1 can conflict with a query made through fd2 even though both
      * fds live in the same process.
      */
-    int fd2 = open(path, O_RDWR, 0644);
+    int fd2 = open(path, O_RDWR);
     if (fd2 < 0) {
         perror("open fd2");
+        close(fd1);
+        unlink(path);
         return 1;
     }
 

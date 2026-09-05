@@ -74,8 +74,8 @@ static void test_modify_event(void)
 {
     TEST("detect IN_MODIFY event");
 
-    const char *path = "/tmp/elfuse-test-inotify-modify.txt";
-    int tfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    char path[] = "/tmp/elfuse-inotify-modify-XXXXXX";
+    int tfd = mkstemp(path);
     if (tfd < 0) {
         FAIL("create temp file");
         return;
@@ -164,19 +164,31 @@ static void test_dir_create(void)
         return;
     }
 
-    int wd = inotify_add_watch(fd, "/tmp", IN_CREATE);
-    if (wd < 0) {
-        FAIL("inotify_add_watch /tmp");
+    /* A private directory, not all of /tmp, so a concurrent run's file
+     * creations stay out of this run's event stream.
+     */
+    char dir[] = "/tmp/elfuse-inotify-create-XXXXXX";
+    if (!mkdtemp(dir)) {
+        FAIL("mkdtemp");
         close(fd);
         return;
     }
 
-    const char *path = "/tmp/elfuse-test-inotify-create.txt";
-    unlink(path);
+    int wd = inotify_add_watch(fd, dir, IN_CREATE);
+    if (wd < 0) {
+        FAIL("inotify_add_watch");
+        close(fd);
+        rmdir(dir);
+        return;
+    }
+
+    char path[128];
+    snprintf(path, sizeof(path), "%s/child.txt", dir);
     int tfd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (tfd < 0) {
         FAIL("create file in watched dir");
         close(fd);
+        rmdir(dir);
         return;
     }
     close(tfd);
@@ -191,6 +203,7 @@ static void test_dir_create(void)
     unlink(path);
     inotify_rm_watch(fd, wd);
     close(fd);
+    rmdir(dir);
 }
 
 /* Drain events by reading (which drives elfuse's diff), retrying until a named

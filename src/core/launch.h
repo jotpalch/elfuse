@@ -77,7 +77,7 @@ typedef struct {
     int gdb_port;
     bool gdb_stop_on_entry;
 
-    /* Per-iteration vCPU run timeout. 0 disables (no alarm()). */
+    /* vCPU watchdog period in seconds. 0 disables it. */
     int timeout_sec;
 
     bool verbose;

@@ -381,44 +381,47 @@ int translate_ip_cmsg_to_linux(int mac_type)
     }
 }
 
+/* Which Linux message flag means which macOS one. One table walked in both
+ * directions, so a flag added here cannot reach only one of them.
+ *
+ * clang-format off
+ */
+#define MSG_FLAG_MAP(_)                   \
+    _(LINUX_MSG_OOB, MSG_OOB)             \
+    _(LINUX_MSG_PEEK, MSG_PEEK)           \
+    _(LINUX_MSG_DONTROUTE, MSG_DONTROUTE) \
+    _(LINUX_MSG_DONTWAIT, MSG_DONTWAIT)   \
+    _(LINUX_MSG_EOR, MSG_EOR)             \
+    _(LINUX_MSG_WAITALL, MSG_WAITALL)
+/* clang-format on */
+
 int translate_msg_flags(int linux_flags)
 {
     int mac_flags = 0;
-    if (linux_flags & 0x01)
-        mac_flags |= MSG_OOB;
-    if (linux_flags & 0x02)
-        mac_flags |= MSG_PEEK;
-    if (linux_flags & 0x04)
-        mac_flags |= MSG_DONTROUTE;
-    if (linux_flags & 0x40)
-        mac_flags |= MSG_DONTWAIT;
-    if (linux_flags & 0x80)
-        mac_flags |= MSG_EOR;
-    if (linux_flags & 0x100)
-        mac_flags |= MSG_WAITALL;
-
+#define _(lf, mf)           \
+    if (linux_flags & (lf)) \
+        mac_flags |= (mf);
+    MSG_FLAG_MAP(_)
+#undef _
     return mac_flags;
 }
 
 int mac_to_linux_msg_flags(int mac_flags)
 {
     int linux_flags = 0;
-    if (mac_flags & MSG_OOB)
-        linux_flags |= 0x01;
-    if (mac_flags & MSG_PEEK)
-        linux_flags |= 0x02;
-    if (mac_flags & MSG_DONTROUTE)
-        linux_flags |= 0x04;
+#define _(lf, mf)         \
+    if (mac_flags & (mf)) \
+        linux_flags |= (lf);
+    MSG_FLAG_MAP(_)
+#undef _
+
+    /* Output-only, so they appear in this direction alone: the kernel reports
+     * them in msg_flags after a recv, and a caller never passes them in.
+     */
     if (mac_flags & MSG_CTRUNC)
-        linux_flags |= 0x08;
+        linux_flags |= LINUX_MSG_CTRUNC;
     if (mac_flags & MSG_TRUNC)
-        linux_flags |= 0x20;
-    if (mac_flags & MSG_DONTWAIT)
-        linux_flags |= 0x40;
-    if (mac_flags & MSG_EOR)
-        linux_flags |= 0x80;
-    if (mac_flags & MSG_WAITALL)
-        linux_flags |= 0x100;
+        linux_flags |= LINUX_MSG_TRUNC;
     return linux_flags;
 }
 

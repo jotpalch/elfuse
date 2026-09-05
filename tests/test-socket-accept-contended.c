@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -44,7 +45,6 @@ int passes = 0, fails = 0;
  * the harness's 60.
  */
 #define ACCEPT_DEADLINE_MS 10000
-#define SOCK_PATH "/tmp/elfuse-accept-contended.sock"
 
 static int lfd;
 static atomic_int eagains, accepted, stop;
@@ -70,15 +70,24 @@ int main(void)
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
-    strncpy(sa.sun_path, SOCK_PATH, sizeof(sa.sun_path) - 1);
-    unlink(SOCK_PATH);
+
+    /* A private directory per run: the fixed name it replaces was shared with
+     * every concurrent run, and the unlink() before bind() removed whichever
+     * listener got there first.
+     */
+    char sock_dir[] = "/tmp/elfuse-accept-contended-XXXXXX";
+    if (!mkdtemp(sock_dir)) {
+        FAIL("mkdtemp failed");
+        SUMMARY("test-socket-accept-contended");
+        return 1;
+    }
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s/s", sock_dir);
 
     lfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (lfd < 0 || bind(lfd, (struct sockaddr *) &sa, sizeof(sa)) != 0 ||
         listen(lfd, 64) != 0) {
         FAIL("listener setup failed");
-        SUMMARY("test-socket-accept-contended");
-        return 1;
+        goto fail;
     }
 
     int wake_fds[2];
@@ -88,10 +97,8 @@ int main(void)
             while (i > 0)
                 close(wake_fds[--i]);
             close(lfd);
-            unlink(SOCK_PATH);
             FAIL("wake socket setup failed");
-            SUMMARY("test-socket-accept-contended");
-            return 1;
+            goto fail;
         }
     }
 
@@ -99,8 +106,7 @@ int main(void)
     if (pthread_create(&a, NULL, acceptor, NULL) != 0 ||
         pthread_create(&b, NULL, acceptor, NULL) != 0) {
         FAIL("pthread_create failed");
-        SUMMARY("test-socket-accept-contended");
-        return 1;
+        goto fail;
     }
 
     /* Count what the client actually got onto the listener. The assertion below
@@ -167,7 +173,8 @@ int main(void)
     }
     pthread_join(a, NULL);
     pthread_join(b, NULL);
-    unlink(SOCK_PATH);
+    unlink(sa.sun_path);
+    rmdir(sock_dir);
 
     TEST("a blocking accept never reports EAGAIN to the guest");
     EXPECT_TRUE(atomic_load(&eagains) == 0,
@@ -181,4 +188,10 @@ int main(void)
     close(lfd);
     SUMMARY("test-socket-accept-contended");
     return fails ? 1 : 0;
+
+fail:
+    unlink(sa.sun_path);
+    rmdir(sock_dir);
+    SUMMARY("test-socket-accept-contended");
+    return 1;
 }

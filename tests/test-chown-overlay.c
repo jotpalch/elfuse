@@ -28,6 +28,7 @@
 
 int passes = 0, fails = 0;
 
+static char tmp_root[] = "/tmp/elfuse-chown-XXXXXX";
 static char tmp_file[256];
 static char tmp_link[256];
 static char tmp_target[256];
@@ -35,14 +36,14 @@ static char tmp_dir[256];
 
 static int setup_fixtures(void)
 {
-    snprintf(tmp_file, sizeof(tmp_file), "/tmp/elfuse-chown-%d.txt",
-             (int) getpid());
-    snprintf(tmp_target, sizeof(tmp_target), "/tmp/elfuse-chown-tgt-%d.txt",
-             (int) getpid());
-    snprintf(tmp_link, sizeof(tmp_link), "/tmp/elfuse-chown-link-%d",
-             (int) getpid());
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/elfuse-chown-dir-%d",
-             (int) getpid());
+    if (!mkdtemp(tmp_root)) {
+        perror("setup: mkdtemp");
+        return -1;
+    }
+    snprintf(tmp_file, sizeof(tmp_file), "%s/file.txt", tmp_root);
+    snprintf(tmp_target, sizeof(tmp_target), "%s/target.txt", tmp_root);
+    snprintf(tmp_link, sizeof(tmp_link), "%s/link", tmp_root);
+    snprintf(tmp_dir, sizeof(tmp_dir), "%s/dir", tmp_root);
 
     int fd = open(tmp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -63,7 +64,6 @@ static int setup_fixtures(void)
     }
     close(fd);
 
-    unlink(tmp_link);
     if (symlink(tmp_target, tmp_link) < 0) {
         perror("setup: symlink");
         return -1;
@@ -81,6 +81,7 @@ static void teardown_fixtures(void)
     unlink(tmp_link);
     unlink(tmp_target);
     rmdir(tmp_dir);
+    rmdir(tmp_root);
 }
 
 static void test_chown_then_stat(void)
@@ -267,6 +268,11 @@ int main(void)
 
     if (setup_fixtures() < 0) {
         printf("test-chown-overlay: fixture setup failed\n");
+
+        /* Safe on paths never created, and the only thing that removes tmp_root
+         * after a partial setup.
+         */
+        teardown_fixtures();
         return 1;
     }
     test_chown_then_stat();

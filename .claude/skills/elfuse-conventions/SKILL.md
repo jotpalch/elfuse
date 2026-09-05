@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that CONTRIBUTING.md does not carry: the register a comment or commit message is written in, comment brevity, the type and return conventions at the ABI boundary, how shared mutable state is declared and which memory order a site states, PR etiquette, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, touching an atomic or a lock-free access, or wiring the build to anything a fresh clone would not have.
+description: elfuse conventions outside CONTRIBUTING.md. Use when adding, reviewing, or reducing prose in source comments, docstrings, README.md, or docs/*.md; drafting a commit message, PR description, or review reply; adding a file or type; touching an atomic or lock-free access; handling untracked working docs; or wiring the build to a tool absent from a fresh clone.
 ---
 
 # elfuse conventions
@@ -44,19 +44,29 @@ gate-protected the way a `src/` path is. Renaming it is a manual sweep.
 
 ## Style
 
-Source comments and commit messages are ASCII only, with no markdown syntax:
-no inline backticks, no non-ASCII arrows. Write code, path, and symbol
-references as plain text (EPOLL_CTL_MOD, tests/foo.c). Markdown files are
-exempt and use normal GitHub Markdown, so do not strip backticks out of a
-`.md` file in its name.
+Source comments and commit messages are ASCII, with no markdown syntax: no
+inline backticks, no non-ASCII arrows. Write code, path, and symbol references
+as plain text (EPOLL_CTL_MOD, tests/foo.c). Markdown files are exempt and use
+normal GitHub Markdown, so do not strip backticks out of a `.md` file in its
+name.
+
+One exception, in source only: a comment diagram may draw with the Box Drawing
+block (U+2500 to U+257F) and the four small triangle arrowheads (U+25B4,
+U+25B8, U+25BE, U+25C2). Eight files already do, and the diagrams are worth
+more than the rule they break. `make check-ascii` fails on every other
+non-ASCII character, so the rest of this is now a gate rather than a habit;
+`scripts/check-ascii.py --self-test` states the classes it catches.
 
 The em dash (U+2014) is banned on every surface, markdown included: comments,
 commit messages, `docs/`, these skill files, PR bodies, and review replies.
 In an otherwise-ASCII tree it is the clearest mark of machine-written prose,
-rejected on sight (PR#209). Write the character as its codepoint, never the
-glyph, so `grep -rnPI '\x{2014}'` stays a clean check; `-P` with the codepoint
-is required, since `grep $'\u2014'` matches nothing and reports a false
-all-clear.
+rejected on sight (PR#209). Two gates catch it: `make check-ascii` over the C
+sources, and `scripts/git-commit-msg.sh`, which requires a printable-ASCII
+commit message and which `scripts/check-commit-log.sh` runs over every commit
+in a PR. `docs/` and PR replies have no gate, so there it is still on the
+writer; write the character as its codepoint rather than the glyph when you
+have to name it, since a literal em dash in a grep pattern matches nothing and
+reports a false all-clear.
 
 A spaced double hyphen is not the way around it, on any of those surfaces.
 It carries the register the em dash carries, so a comment, a commit body, a
@@ -77,6 +87,10 @@ prompt echo, effort claims, inflation words, coined vocabulary, trailing
 `references/prose-register.md` before writing a comment block, a commit body,
 a PR reply, or a paragraph of `docs/`, and treat it as the one place those
 classes are defined.
+
+When a prose task extends beyond a local sentence, read
+`references/prose-reduction.md` to decide what survives and where it belongs.
+The register reference above still settles how each survivor is written.
 
 Comments and commit messages are third-person: name the subject (the caller,
 this function) or use imperative phrasing.
@@ -119,8 +133,7 @@ selects already formats to itself, and every file commentflow selects already
 reflows to itself. That was not free. The tree's comments were wrapped by hand
 before the tool existed, and the one-time reflow rewrote 142 of the 353 C and
 header files, both assembly files, and 36 of the 41 shell scripts. It landed as
-its own commit because a mechanical change with no behavior in it cannot be
-reviewed alongside one that has some.
+its own commit, under the rule the commit section states.
 
 The gate is what keeps it a no-op. If `make indent` ever hands you a diff in a
 file you did not touch, something reintroduced hand-wrapping, or your
@@ -259,14 +272,15 @@ block and rewrite what no longer reads cleanly.
 Mechanics: `/* */` only in `.c`, `.h`, and `.S`, no `//`, no Doxygen tags;
 multi-line blocks align on ` * `, close with `*/` on its own line, indented
 to the body; American English; `@name` references a parameter in prose. A
-new file opens with title, copyright, SPDX identifier, a blank `*` line,
-then one prose paragraph on what the module is for (`src/syscall/signal.h`
-is the model). `#` comments in shell, Python, and Make obey the same rules.
-Update or delete a comment in the commit that changes its code: a stale
-comment is worse than none, because it is believed. A comment asserting a
-number or a guarantee is the case that rots silently, so recompute it before
-carrying it into an edit; `elfuse-refactor` reads the same rule from the
-reviewer's side.
+new file follows the surrounding legal-header form. Omit a title or synopsis
+when the filename, module name, primary type, or entry point already states
+it. Keep one short module paragraph only for a stable file-wide constraint
+with no narrower owner. `#` comments in shell, Python, and Make obey the same
+content rules. Update or delete a comment in the commit that changes its code:
+a stale comment is worse than none, because it is believed. A comment
+asserting a number or a guarantee is the case that rots silently, so recompute
+it before carrying it into an edit; `elfuse-refactor` reads the same rule from
+the reviewer's side.
 
 ## docs/
 
@@ -323,13 +337,18 @@ Stop nl_put_attr truncating its own extent
 Prove the netlink walk loops
 Count the shared pty declarations correctly
 Give a pty's slave accounting one home
-Say what the proof matrix cache actually costs
+Name the SysV message size ceiling
 ```
 
 Note what is absent: no Conventional Commits prefix (`fix:`, `feat:`, `chore:`),
 no area tag, no ticket number in the subject. The subject is a sentence about
 behavior. A commit that removes something says what stops happening; a commit
 that adds a proof says what is now proved.
+
+A subject does not open with "Say". It names the act of writing rather than
+what changed, so every prose commit takes the same verb and the log stops
+telling them apart. Name the rule that now holds or the mechanism now stated
+instead. The ones already in the log stay; rewriting them is not a task.
 
 The body is where the reasoning goes: what the old code claimed, why that
 was wrong, what breaks if you do it the obvious other way. Substantial is
@@ -354,6 +373,11 @@ classes were written for.
 
 Merge commits keep git's generated subject and are exempt.
 
+A change with no behavior in it lands as its own commit, whether it is a
+mechanical sweep or a reshape a feature is waiting on; the reshape lands before
+the feature. Combined, neither half is reviewable. The one-time `commentflow`
+reflow is the precedent.
+
 ## Pull requests
 
 A PR thread is human collaboration, and agent-shaped artifacts are rejected
@@ -364,6 +388,14 @@ trackers.", PR#90), no re-summarizing the diff git already shows. Close
 addressed threads with "Resolve conversation"; a reply carries the
 correction, the measurement, or nothing. A concise what and why belongs in
 the commit body, not the thread.
+
+A reply that hands the choice back to the reviewer is the same artifact in
+a politer form. "If you would rather the source read uniformly one way or
+the other, say so and I will move the remaining three" asks for an
+instruction where a technical answer belongs ("Let's concentrate on real
+discussions!", PR#350). A tradeoff already measured is settled in the
+reply, with the measurement as the reason. Ask the reviewer a question only
+where the code leaves one open.
 
 The body is intent plus reproduction and commands: for a bug, a minimal
 reproduction with host macOS and SDK version, hardware, and `make check`

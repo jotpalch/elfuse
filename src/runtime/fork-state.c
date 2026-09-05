@@ -439,7 +439,15 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         return -1;
     }
 
+    /* One row per open file description the parent had, so the slots that
+     * aliased it in the parent alias it in the child too. The directory stream
+     * and the descriptor it owns are carried alongside the identity because a
+     * repeat has to reuse them rather than build a second set; see the FD_DIR
+     * arm below.
+     */
     uint64_t parent_ofds[FD_TABLE_SIZE], child_ofds[FD_TABLE_SIZE];
+    void *ofd_dirs[FD_TABLE_SIZE];
+    int ofd_dir_hosts[FD_TABLE_SIZE];
     uint32_t ofd_maps = 0;
 
     for (uint32_t i = 0; i < num_fds; i++) {
@@ -455,9 +463,13 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         }
 
         uint64_t child_ofd = 0;
+        void *shared_dir = NULL;
+        int shared_dir_host = -1;
         for (uint32_t j = 0; j < ofd_maps; j++) {
             if (parent_ofds[j] == fd_entries[i].ofd_id) {
                 child_ofd = child_ofds[j];
+                shared_dir = ofd_dirs[j];
+                shared_dir_host = ofd_dir_hosts[j];
                 break;
             }
         }
@@ -489,6 +501,29 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         } else {
             void (*cleanup)(int) = fd_cleanup_for_type(fd_entries[i].type);
 
+            /* A second slot on a description whose directory stream this loop
+             * has already built shares that stream, the way dup/dup2/F_DUPFD
+             * share one in-process (fd_snapshot_and_dup_or_share_dir). The
+             * sharing did not use to survive a fork: each inherited descriptor
+             * arrives on its own over SCM_RIGHTS, and a wrapper per descriptor
+             * gave the child two locks, two DIR* read-ahead buffers and two
+             * positions over one description, so its two aliases split the
+             * listing at a host buffer boundary and the first ended at a clean
+             * 0 with names only the second could still reach.
+             *
+             * The redundant descriptor goes back here rather than to the slot:
+             * a stream owns the descriptor it was opened on and only closedir()
+             * gives it back (see dir_stream_t in syscall/internal.h), so the
+             * alias has to name the one the shared stream holds. That is also
+             * what keeps the fork side to one host descriptor per guest fd,
+             * which tests/test-dir-fd-budget-union asserts.
+             */
+            int host_fd = host_fds[i];
+            if (fd_entries[i].type == FD_DIR && shared_dir) {
+                close(host_fds[i]);
+                host_fd = shared_dir_host;
+            }
+
             /* Every descriptor here aliases a description the parent already
              * had, so the allocator takes the parent's answers rather than
              * probing: a slot that aliases the launcher's stdio must not have
@@ -497,8 +532,8 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_alias_spec_t spec =
                 fd_alias_carried(fd_entries[i].foreign_description != 0,
                                  fd_entries[i].nonblock_owned != 0);
-            fd_alloc_alias_at(&spec, gfd, fd_entries[i].type, host_fds[i],
-                              cleanup, NULL);
+            fd_alloc_alias_at(&spec, gfd, fd_entries[i].type, host_fd, cleanup,
+                              NULL);
             fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
             fd_refresh_urandom_bitmap(gfd);
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,
@@ -525,14 +560,33 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
                  * fd_retire_published close it -- and it must, because a slot
                  * left published as FD_DIR with a NULL dir owns its descriptor
                  * the ordinary way (see fd_cleanup_entry).
+                 *
+                 * The inherited form, not dir_stream_open: the parent's stream
+                 * has already read this description to its end, so the child's
+                 * listing is over before it starts and its union state has to
+                 * say so too. A fresh one re-drained the backing and handed the
+                 * child names the parent still owed. See internal.h.
                  */
-                void *ds = dir_stream_open(host_fds[i]);
-                if (!ds) {
-                    log_error(
-                        "fork-child: dir_stream_open failed for gfd %d: %s",
-                        gfd, strerror(errno));
-                    fd_retire_published(gfd, host_fds[i]);
-                    continue;
+                void *ds;
+                if (shared_dir) {
+                    /* No fd_lock: the child is the only thread alive at this
+                     * point in the rebuild, so nothing can be releasing the
+                     * stream underneath this reference. Every other caller of
+                     * dir_stream_ref_locked takes the lock because a sibling
+                     * close could.
+                     */
+                    dir_stream_ref_locked(shared_dir);
+                    ds = shared_dir;
+                } else {
+                    ds = dir_stream_open_inherited(host_fd);
+                    if (!ds) {
+                        log_error(
+                            "fork-child: dir_stream_open_inherited failed for "
+                            "gfd %d: %s",
+                            gfd, strerror(errno));
+                        fd_retire_published(gfd, host_fd);
+                        continue;
+                    }
                 }
                 fd_table[gfd].dir = ds;
             }
@@ -541,6 +595,9 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         if (!child_ofd && fd_entries[i].ofd_id) {
             child_ofd = fd_table[gfd].ofd_id;
             parent_ofds[ofd_maps] = fd_entries[i].ofd_id;
+            ofd_dirs[ofd_maps] =
+                fd_entries[i].type == FD_DIR ? fd_table[gfd].dir : NULL;
+            ofd_dir_hosts[ofd_maps] = fd_table[gfd].host_fd;
             child_ofds[ofd_maps++] = child_ofd;
         }
         if (child_ofd)

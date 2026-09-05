@@ -5,10 +5,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <fcntl.h>
+#include <limits.h>
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "debug/log.h"
 
@@ -19,6 +24,7 @@
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
+#include "syscall/usbdev.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "utils.h"
@@ -146,6 +152,19 @@ static int write_linux_statx(guest_t *g,
     return guest_write_small(g, statx_gva, &sx, sizeof(sx));
 }
 
+/* Whether a descriptor's identity comes from the stamp rather than from the
+ * host object underneath it: O_PATH, /sys and /dev/bus do, /proc does not. See
+ * docs/internals.md, "Filesystem Identity Of A Descriptor", for why.
+ */
+static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
+{
+    if (snap->proc_path[0] == '\0')
+        return false;
+    return snap->type == FD_PATH ||
+           path_prefix_match(snap->proc_path, "/sys", 4) ||
+           path_prefix_match(snap->proc_path, "/dev/bus", 8);
+}
+
 static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
 {
     memset(lin, 0, sizeof(*lin));
@@ -160,6 +179,105 @@ static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
     lin->f_fsid[1] = mac->f_fsid.val[1];
     lin->f_namelen = 255;
     lin->f_frsize = mac->f_bsize;
+}
+
+/* Stat the descriptor an *at-style call names with AT_EMPTY_PATH and an empty
+ * path.
+ *
+ * The empty path names the descriptor rather than anything beneath it, so it
+ * resolves nothing and must be answered before a resolver ever sees it. A
+ * resolver measures a relative name against dirfd, and the empty path is
+ * relative, so it owes ENOTDIR for a dirfd that is not a directory -- correct
+ * for a name, wrong for the descriptor itself, and glibc has spelled fstat(fd)
+ * as fstatat(fd, "", AT_EMPTY_PATH) since 2.33. sys_fchmodat and sys_fchownat
+ * short-circuit ahead of translation for the same reason.
+ *
+ * The order mirrors sys_fstat, since this answers the same question: the FUSE
+ * shim first, because a FUSE descriptor is answered by the emulation layer
+ * rather than by a host file; then the /proc intercept, which an O_PATH
+ * descriptor needs because its host fd cannot be stat'ed for the emulated
+ * object; then the host.
+ *
+ * sys_fstat calls this rather than keeping a body of its own, since glibc's
+ * spelling makes this the form most fstat() calls arrive in and there is no
+ * second policy worth having. The classification and the descriptor come from
+ * one fd_lock window here, so a sibling thread cannot close and reuse the slot
+ * between the two: answering the /proc intercept for one object and then
+ * stat'ing another is what separate reads allow.
+ *
+ * AT_FDCWD is not handled here -- it names the current directory, which always
+ * has a base path to resolve against, so the caller keeps answering it the way
+ * Linux specifies it.
+ *
+ * Returns 0 on success or a negative Linux errno.
+ */
+static int64_t stat_empty_path_fd(int dirfd, struct stat *mac_st)
+{
+    int frc = fuse_fstat_fd(dirfd, mac_st);
+    if (frc == 0)
+        return 0;
+    if (frc != -LINUX_EBADF)
+        return frc;
+
+    fd_entry_t snap;
+    host_fd_ref_t ref = HOST_FD_REF_INIT;
+    if (thread_is_single_active()) {
+        /* No sibling can mutate the slot, so the pin has nothing to defend
+         * against and the snapshot alone is already consistent -- the rule
+         * fd_block_state states for the same reason. A closed slot, or one
+         * carrying no host descriptor, is the EBADF that fd_to_host would have
+         * reported on this path before.
+         */
+        if (!fd_snapshot(dirfd, &snap) || snap.host_fd < 0)
+            return -LINUX_EBADF;
+        ref.fd = snap.host_fd;
+    } else {
+        /* Pin, not dup: the descriptor has to stay valid across the stat, not
+         * become private, and retiring a dup would drop the guest's record
+         * locks on the file (fcntl(2)).
+         */
+        if (fd_host_ref_acquire(dirfd, &snap, &ref.lifetime) < 0)
+            return linux_errno(); /* EBADF or ENOMEM; the helper picks. */
+        ref.fd = snap.host_fd;
+    }
+
+    int64_t rc = 0;
+
+    /* usbdevfs fds are char device 189:minor and the host fd behind them is a
+     * pipe, whose fstat must not leak through. Ahead of the stamp branch for
+     * the same reason the FUSE shim is ahead of both: the descriptor is
+     * answered by the emulation layer that owns it, not by re-resolving the
+     * name it was opened under. Behind it the branch was unreachable -- every
+     * FD_USBDEV fd carries a /dev/bus stamp, so fd_stat_answers_from_stamp
+     * claimed all of them and answered from the path.
+     */
+    if (snap.type == FD_USBDEV) {
+        rc = usbdev_fstat(dirfd, mac_st);
+        goto done;
+    }
+
+    if (fd_stat_answers_from_stamp(&snap)) {
+        /* The descriptor already names one object: an O_PATH open that followed
+         * refers to the target, one made with O_NOFOLLOW to the link itself, so
+         * the open's flag is what selects here.
+         */
+        bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
+        int intercepted =
+            proc_intercept_stat_at(snap.proc_path, mac_st, follow);
+        if (intercepted == 0)
+            goto done;
+        if (intercepted == -1) {
+            rc = linux_errno();
+            goto done;
+        }
+    }
+
+    if (fstat(ref.fd, mac_st) < 0)
+        rc = linux_errno();
+
+done:
+    host_fd_ref_close(&ref);
+    return rc;
 }
 
 /* Resolve the directory + path arguments of a *at-style stat operation and fill
@@ -191,6 +309,10 @@ static int64_t stat_at_path(guest_t *g,
     if (guest_read_path(g, path_gva, short_path, sizeof(short_path), path,
                         sizeof(path), &pathp) < 0)
         return -LINUX_EFAULT;
+
+    if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0' &&
+        dirfd != LINUX_AT_FDCWD)
+        return stat_empty_path_fd(dirfd, mac_st);
 
     if (pathp[0] == '/' && fuse_path_matches_mount(pathp)) {
         int frc = fuse_stat_path(pathp, mac_st, flags);
@@ -224,46 +346,15 @@ static int64_t stat_at_path(guest_t *g,
     host_fd_ref_t dir_ref = HOST_FD_REF_INIT;
     if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0') {
         /* Linux: AT_EMPTY_PATH with dirfd == AT_FDCWD operates on the current
-         * working directory.
+         * working directory. Every other descriptor was answered by
+         * stat_empty_path_fd above, before anything tried to resolve the empty
+         * path against it.
          */
-        if (dirfd == LINUX_AT_FDCWD) {
-            dir_ref.fd = AT_FDCWD;
-            int mac_flags = translate_at_flags(flags);
-            if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0) {
-                rc = linux_errno();
-                goto done;
-            }
-        } else {
-            /* Pin, not dup: fstatat needs the descriptor to stay valid, not to
-             * be private, and retiring a dup would drop the guest's record
-             * locks on the file (fcntl(2)).
-             */
-            fd_entry_t snap;
-            if (fd_host_ref_acquire(dirfd, &snap, &dir_ref.lifetime) < 0) {
-                /* EBADF or ENOMEM; the helper distinguishes them. */
-                rc = linux_errno();
-                goto done;
-            }
-            dir_ref.fd = snap.host_fd;
-            if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
-                /* The descriptor already names one object: an O_PATH open that
-                 * followed refers to the target, one made with O_NOFOLLOW to
-                 * the link itself, so the open's flag is what selects here.
-                 */
-                bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
-                int intercepted =
-                    proc_intercept_stat_at(snap.proc_path, mac_st, follow);
-                if (intercepted == 0)
-                    goto done;
-                if (intercepted == -1) {
-                    rc = linux_errno();
-                    goto done;
-                }
-            }
-            if (fstat(dir_ref.fd, mac_st) < 0) {
-                rc = linux_errno();
-                goto done;
-            }
+        dir_ref.fd = AT_FDCWD;
+        int mac_flags = translate_at_flags(flags);
+        if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0) {
+            rc = linux_errno();
+            goto done;
         }
     } else {
         int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
@@ -305,52 +396,20 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
      * from it.
      */
     struct stat mac_st = {0};
-    int frc = fuse_fstat_fd(fd, &mac_st);
-    if (frc == 0) {
-        if (write_linux_stat(g, stat_gva, &mac_st) < 0)
-            return -LINUX_EFAULT;
-        return 0;
-    }
-    if (frc != -LINUX_EBADF)
-        return frc;
 
-    fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH &&
-        snap.proc_path[0] != '\0') {
-        /* As in stat_at_path's AT_EMPTY_PATH branch: the open already chose
-         * between the link and its target, so replay that choice here.
-         */
-        bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
-        int intercepted =
-            proc_intercept_stat_at(snap.proc_path, &mac_st, follow);
-        if (intercepted == 0) {
-            if (write_linux_stat(g, stat_gva, &mac_st) < 0)
-                return -LINUX_EFAULT;
-            return 0;
-        }
-        if (intercepted == -1)
-            return linux_errno();
+    /* fstat(fd) and fstatat(fd, "", AT_EMPTY_PATH) are the same question --
+     * glibc has spelled the first as the second since 2.33 -- so they are
+     * answered by one body rather than two that can drift.
+     */
+    int64_t rc = stat_empty_path_fd(fd, &mac_st);
+    if (rc < 0) {
+        log_debug("fstat(%d): failed rc=%lld", fd, (long long) rc);
+        return rc;
     }
 
-    host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
-    if (ref_err < 0) {
-        log_debug("fstat(%d): invalid guest fd", fd);
-        return ref_err;
-    }
-    if (fstat(host_ref.fd, &mac_st) < 0) {
-        log_debug("fstat(%d->%d): host fstat failed errno=%d", fd, host_ref.fd,
-                  errno);
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
-    }
-
-    if (write_linux_stat(g, stat_gva, &mac_st) < 0) {
-        host_fd_ref_close(&host_ref);
+    if (write_linux_stat(g, stat_gva, &mac_st) < 0)
         return -LINUX_EFAULT;
-    }
 
-    host_fd_ref_close(&host_ref);
     return 0;
 }
 
@@ -465,17 +524,10 @@ static void fill_proc_statfs(linux_statfs_t *lin)
 /* Boundary-checked "/sys or under it", applied to the folded name, which is
  * also published so the caller can act on the same spelling it classified.
  *
- * Linux resolves the path before deciding which filesystem answers it, so
- * statfs("/sys/../etc") reports the filesystem behind /etc and not sysfs. The
- * intercept path arrives here unnormalized, so testing the "/sys" prefix as
- * spelled would hand SYSFS_MAGIC to every name that merely starts inside /sys
- * and then climbs back out of it. Fold '.' and '..' first and test what the
- * name actually resolves to.
- *
- * A relative name resolves the same way, against the cwd -- statfs("sys") from
- * / is statfs("/sys") to the kernel, and sd-device and libusb both reach sysfs
- * through relative walks. Refusing every name that did not start with '/' left
- * those on the pass-through, which on a host with no /sys is ENOENT.
+ * Fold before deciding, and resolve a relative name against the cwd first: the
+ * kernel decides which filesystem answers a path after resolving it, so
+ * statfs("/sys/../etc") is /etc's filesystem and statfs("sys") from / is
+ * /sys's. See docs/internals.md, "Filesystem Identity Of A Descriptor".
  *
  * path_openat2_normalize_in_root clamps '..' at the root, which is what the
  * kernel does with a leading "/..", and yields a root-relative spelling --
@@ -506,6 +558,41 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
         return false;
     int n = snprintf(abs, abssz, "/%s", folded);
     return n > 0 && (size_t) n < abssz;
+}
+
+/* What the synthetic USB tree answers for a /dev/bus name: 0 when it serves the
+ * name, -1 with errno set when it owns the name and the lookup failed, and
+ * PROC_NOT_INTERCEPTED when the name is not ours at all.
+ *
+ * The tree has no host backing, so the pass-through statfs reported ENOENT for
+ * a node stat() and open() both answer for, while fstatfs on the descriptor
+ * open() handed back reported the filesystem of elfuse's staging file. Linux
+ * serves usbfs nodes from the devtmpfs that carries the rest of /dev and
+ * reports TMPFS_MAGIC for them (0x01021994, measured on 6.x alongside /dev and
+ * /dev/null, which report the same). Both entry points ask this one question so
+ * they agree on every /dev/bus name either can reach.
+ *
+ * The last two answers stay distinct because collapsing them is the bug
+ * sys_faccessat had: a sysroot carrying a name inside /dev/bus/usb -- on a bus
+ * number no device has -- would otherwise have its file answer statfs while
+ * open, stat and access all report ENOENT for the same path. Only
+ * PROC_NOT_INTERCEPTED means "ask the backing".
+ */
+static int statfs_dev_bus_class(const char *path)
+{
+    if (!path || !path_prefix_match(path, "/dev/bus", 8))
+        return PROC_NOT_INTERCEPTED;
+    struct stat st;
+    return proc_intercept_stat_at(path, &st, true);
+}
+
+static void fill_dev_statfs(linux_statfs_t *lin)
+{
+    memset(lin, 0, sizeof(*lin));
+    lin->f_type = 0x01021994; /* TMPFS_MAGIC, what devtmpfs reports */
+    lin->f_bsize = 4096;
+    lin->f_namelen = 255;
+    lin->f_frsize = 4096;
 }
 
 static void fill_sysfs_statfs(linux_statfs_t *lin)
@@ -612,6 +699,17 @@ static int64_t sys_statfs_impl(guest_t *g,
         return 0;
     }
 
+    int dev_bus = statfs_dev_bus_class(tx.intercept_path);
+    if (dev_bus == -1)
+        return linux_errno();
+    if (dev_bus == 0) {
+        linux_statfs_t lin_st;
+        fill_dev_statfs(&lin_st);
+        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
     /* glibc's posix_openpt() opens /dev/ptmx and then confirms devpts is
      * mounted before handing the master back (sysdeps/unix/sysv/linux/getpt.c).
      * /dev/pts has no host backing here, so a pass-through statfs fails and
@@ -676,16 +774,56 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
     return sys_statfs_impl(g, path, buf_gva, 0);
 }
 
+/* Widen the window between reading a descriptor's stamp and pinning the host fd
+ * it names, off unless ELFUSE_FD_IDENTITY_WINDOW_US is set to a positive
+ * microsecond count.
+ *
+ * The window is real and far too narrow to reach from a test: unaided, over 160
+ * runs at four delays, a sibling close-and-reopen between the two lookups was
+ * never distinguishable in the answer. What lives in it is a guest fd number
+ * whose slot can be replaced while this call is deciding what filesystem to
+ * report for it, so the identity would come from one description and the
+ * descriptor from another. tests/test-fstatfs-fd-identity drives it. Same shape
+ * and the same reasoning as dir_backing_window_delay in syscall/fs.c; no effect
+ * at all when unset.
+ */
+static void fd_identity_window_delay(void)
+{
+    static _Atomic long cached = -1; /* -1 = unread */
+    long v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v < 0) {
+        const char *env = getenv("ELFUSE_FD_IDENTITY_WINDOW_US");
+        long long n = env ? strtoll(env, NULL, 10) : 0;
+        v = (n > 0 && n < 1000000) ? (long) n : 0;
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+    }
+    if (v > 0)
+        usleep((useconds_t) v);
+}
+
 int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
 {
     /* Deliberately no devpts case for a pty master fd: Linux answers from
      * whatever filesystem provides /dev/ptmx, which is devpts only when it is
      * the bind-mounted /dev/pts/ptmx and tmpfs or devtmpfs otherwise. There is
-     * no single correct value to report, and nothing needs one.
+     * no single correct value to report, and nothing needs one. The stamp and
+     * the descriptor come out of one fd_lock window. They are two facts about
+     * one open file description, and read separately a close and reopen between
+     * them gave the stamp of the description the caller named and the
+     * descriptor of whatever took the number afterwards -- so every branch
+     * below, /proc included, could answer for an object this call is not
+     * holding. Measured with the window widened: a plain sysroot file whose
+     * slot was replaced mid-call by a /sys descriptor was reported as sysfs.
      */
     fd_entry_t snap;
-    memset(&snap, 0, sizeof(snap));
-    if (fd_snapshot(fd, &snap) && statfs_path_is_proc(snap.proc_path)) {
+    host_fd_ref_t host_ref;
+    int64_t ref_err = host_fd_ref_open_entry(fd, &host_ref, &snap);
+    if (ref_err < 0)
+        return ref_err;
+    fd_identity_window_delay();
+
+    if (statfs_path_is_proc(snap.proc_path)) {
+        host_fd_ref_close(&host_ref);
         linux_statfs_t proc_st;
         fill_proc_statfs(&proc_st);
         if (guest_write_small(g, buf_gva, &proc_st, sizeof(proc_st)) < 0)
@@ -693,14 +831,27 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
         return 0;
     }
 
-    /* Descriptors opened under /sys are scratch-dir backed; the host fstatfs
-     * would leak the /tmp filesystem's magic. systemd's sd-device gates every
-     * enumerated syspath on fstatfs(fd) == SYSFS_MAGIC, so answer as sysfs
-     * exactly like path statfs("/sys") does.
+    /* Descriptors under /sys are sysfs whichever side served them, and the
+     * spelling to test comes from the stamp when the fd carries one and from
+     * the descriptor's own host path otherwise -- a fall-through open stamps
+     * nothing. Both go to statfs_path_is_sysfs, the test the path side uses.
+     * See docs/internals.md, "Filesystem Identity Of A Descriptor".
      */
+    char fd_guest[LINUX_PATH_MAX];
+    const char *fd_name = NULL;
+    if (snap.proc_path[0]) {
+        fd_name = snap.proc_path;
+    } else {
+        char fd_host[PATH_MAX];
+        if (fcntl(host_ref.fd, F_GETPATH, fd_host) == 0 &&
+            path_host_to_guest(fd_host, fd_guest, sizeof(fd_guest)) == 0)
+            fd_name = fd_guest;
+    }
+
     char fd_sys_abs[LINUX_PATH_MAX];
-    if (snap.proc_path[0] &&
-        statfs_path_is_sysfs(snap.proc_path, fd_sys_abs, sizeof(fd_sys_abs))) {
+    if (fd_name &&
+        statfs_path_is_sysfs(fd_name, fd_sys_abs, sizeof(fd_sys_abs))) {
+        host_fd_ref_close(&host_ref);
         linux_statfs_t sys_st;
         fill_sysfs_statfs(&sys_st);
         if (guest_write_small(g, buf_gva, &sys_st, sizeof(sys_st)) < 0)
@@ -708,10 +859,18 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
         return 0;
     }
 
-    host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
-    if (ref_err < 0)
-        return ref_err;
+    /* Only the "we serve it" answer applies here: an open descriptor stays a
+     * valid one whatever became of its name, so a claimed-and-failed lookup is
+     * no reason to fail fstatfs, and the host answers as it did before.
+     */
+    if (fd_name && statfs_dev_bus_class(fd_name) == 0) {
+        host_fd_ref_close(&host_ref);
+        linux_statfs_t dev_st;
+        fill_dev_statfs(&dev_st);
+        if (guest_write_small(g, buf_gva, &dev_st, sizeof(dev_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
 
     struct statfs mac_st;
     if (fstatfs(host_ref.fd, &mac_st) < 0) {

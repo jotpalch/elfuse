@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,16 +28,14 @@
 
 int passes = 0, fails = 0;
 
-static char tmp_file[256];
-static char tmp_dir[256];
+static char tmp_file[] = "/tmp/elfuse-fchownat-empty-XXXXXX";
+static char tmp_dir[] = "/tmp/elfuse-fchownat-empty-dir-XXXXXX";
 
 static int setup_fixtures(void)
 {
-    snprintf(tmp_file, sizeof(tmp_file), "/tmp/elfuse-fchownat-empty-%d.txt",
-             (int) getpid());
-    int fd = open(tmp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = mkstemp(tmp_file);
     if (fd < 0) {
-        perror("setup: open tmp_file");
+        perror("setup: mkstemp tmp_file");
         return -1;
     }
     close(fd);
@@ -44,10 +43,8 @@ static int setup_fixtures(void)
     /* The AT_FDCWD case below needs a writable cwd; the process's inherited cwd
      * may not be (e.g. a read-only rootfs in a VM test image).
      */
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/elfuse-fchownat-empty-dir-%d",
-             (int) getpid());
-    if (mkdir(tmp_dir, 0755) < 0) {
-        perror("setup: mkdir tmp_dir");
+    if (!mkdtemp(tmp_dir)) {
+        perror("setup: mkdtemp tmp_dir");
         return -1;
     }
     if (chdir(tmp_dir) < 0) {

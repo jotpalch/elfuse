@@ -14,13 +14,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/random.h>
 
 #include "proved/stack.h"
 #include "core/stack.h"
 #include "debug/log.h"
-#include "syscall/linux-wire.h" /* GUEST_UID, GUEST_GID */
 #include "syscall/proc.h"
+#include "linux-limits.h"
 
 /* Linux aarch64 HWCAP bits (from asm/hwcap.h). Only the bits the VZ-sanitized
  * ID registers actually advertise are listed here; HWCAP bits left out (e.g.,
@@ -165,11 +164,6 @@ uint64_t build_linux_stack(guest_t *g,
             envc++;
     }
 
-/* Bounds-check: Linux returns E2BIG for oversized argument/environment. ARG_MAX
- * on Linux is typically 2MiB; stack setup caps at reasonable stack limits.
- */
-#define MAX_ARGS 131072
-#define MAX_ENVS 131072
 
     /* argc is bounded below as well as above, and the lower bound is the one
      * that matters here: a negative argc makes the (uint64_t) total_entries
@@ -180,7 +174,8 @@ uint64_t build_linux_stack(guest_t *g,
      * discharge the precondition instead of leaving it as an argument about
      * other files.
      */
-    if (argc < 0 || argc > MAX_ARGS || envc > MAX_ENVS)
+    if (argc < 0 || argc > ELFUSE_MAX_ARG_STRINGS ||
+        envc > ELFUSE_MAX_ARG_STRINGS)
         return 0; /* Caller treats 0 as failure */
 
     /* Phase 1: Write strings and random data at the top of the stack. stack
@@ -206,9 +201,14 @@ uint64_t build_linux_stack(guest_t *g,
     if (!stack_take(&str_ptr, stack_floor, 16))
         return 0;
     uint64_t random_ptr = str_ptr;
+
+    /* glibc and musl derive the stack canary and the pointer guard from these
+     * 16 bytes, so they must never be predictable. arc4random_buf returns void
+     * and cannot fail, which leaves no error path to substitute a constant on.
+     * sys.c serves getrandom(2) from it for the same reason.
+     */
     uint8_t random_bytes[16];
-    if (getentropy(random_bytes, 16) != 0)
-        memset(random_bytes, 0x42, 16); /* Fallback: deterministic fill */
+    arc4random_buf(random_bytes, sizeof(random_bytes));
     int str_err = 0;
     str_err |=
         guest_write_small(g, random_ptr, random_bytes, sizeof(random_bytes));
@@ -289,64 +289,20 @@ uint64_t build_linux_stack(guest_t *g,
     str_ptr = stack_align_down(str_ptr);
     uint64_t sp = str_ptr;
 
-    /* Count auxv entries: base 15 (always) + AT_EXECFN (always) + AT_BASE
-     * (always, matching Linux kernel; see commit ba0b177) + optional
-     * AT_SYSINFO_EHDR + optional AT_EXECFD. Each auxv entry = 2 words. Plus
-     * AT_NULL = 2 words. Total words from auxv = (num_auxv_entries + 1) * 2.
-     * Plus envp_null(1) + envp_ptrs(envc) + argv_null(1) + argv_ptrs(argc) +
-     * argc(1).
+    /* Serialize auxv once here, before the word count is taken, and push it in
+     * reverse below so guest memory and /proc/self/auxv expose the same bytes.
+     * The count is read off auxv.nwords rather than tallied beside this list,
+     * so adding an entry cannot leave the two disagreeing.
      *
-     * Base auxv: 15 entries = 30 words, AT_NULL = 2 words = 32. Always:
-     * AT_EXECFN = +2, AT_BASE = +2. Optional: AT_SYSINFO_EHDR (if vdso_base !=
-     * 0) = +2,
-     *           AT_EXECFD (if execfd >= 0) = +2.
-     * Plus envp_null(1) + envp(envc) + argv_null(1) + argv(argc) + argc(1) = 3.
-     * Total = 32 + extra + 3 + envc + argc = 35 + extra + envc + argc. For
-     * 16-byte alignment: total must be even.
-     */
-    int extra = 2 + 2; /* AT_EXECFN + AT_BASE (both always present) */
-    if (vdso_base != 0)
-        extra += 2; /* AT_SYSINFO_EHDR */
-    if (execfd >= 0)
-        extra += 2; /* AT_EXECFD (binfmt_misc binary fd) */
-    int total_entries = 35 + extra + argc + envc;
-
-    /* Where SP must land, computed before a single word is pushed.
-     *
-     * total_entries is a hand-maintained count of the pushes below. Adding an
-     * AUX() entry without updating it would leave SP misaligned or short of
-     * argc, and nothing would say so: the guest would just read argv from the
-     * wrong offset. Comparing against this at the end turns that into a clean
-     * failure. stack_final_sp proves the value is 16-byte aligned and inside
-     * the region, given a 16-aligned base and an even word count.
-     */
-    uint64_t pushed_words = stack_pushed_words((uint64_t) total_entries);
-    uint64_t expect_sp = 0;
-    if (!stack_final_sp(str_ptr, stack_floor, pushed_words, &expect_sp))
-        goto out;
-
-    /* Track cumulative write errors. Any failure means the stack is incomplete.
-     *
-     * Return 0 so the caller sees the failure.
-     */
-    int stack_err = str_err;
-
-    if (pushed_words != (uint64_t) total_entries)
-        stack_err |= push_u64(g, &sp, 0); /* alignment padding */
-
-#define PUSH(val)                             \
-    do {                                      \
-        stack_err |= push_u64(g, &sp, (val)); \
-    } while (0)
-
-    /* Serialize auxv once, then push it in reverse so guest memory and
-     * /proc/self/auxv expose the same bytes.
+     * The bound is what keeps an added entry inside words[].
      */
     linux_stack_auxv_t auxv = {.nwords = 0};
-#define AUX(k, v)                        \
-    do {                                 \
-        auxv.words[auxv.nwords++] = (k); \
-        auxv.words[auxv.nwords++] = (v); \
+#define AUX(k, v)                                         \
+    do {                                                  \
+        if (auxv.nwords + 2 > LINUX_STACK_AUXV_WORDS_MAX) \
+            goto out;                                     \
+        auxv.words[auxv.nwords++] = (k);                  \
+        auxv.words[auxv.nwords++] = (v);                  \
     } while (0)
     if (execfd >= 0)
         AUX(AT_EXECFD, (uint64_t) execfd);
@@ -377,11 +333,48 @@ uint64_t build_linux_stack(guest_t *g,
     AUX(AT_HWCAP2, query_hwcap2());
     AUX(AT_HWCAP, query_hwcap());
     AUX(AT_CLKTCK, 100);
+
+    /* glibc 2.34+ sizes SIGSTKSZ and MINSIGSTKSZ from this rather than from a
+     * compile-time constant. The frame elfuse pushes needs less, but reporting
+     * that would hand the guest a number its own sigaltstack then refuses:
+     * sys_sigaltstack rejects anything below LINUX_MINSIGSTKSZ.
+     */
+    AUX(AT_MINSIGSTKSZ, LINUX_MINSIGSTKSZ);
     AUX(AT_RANDOM, random_ptr);
     AUX(AT_EXECFN, execfn_ptr);
     AUX(AT_PLATFORM, platform_ptr);
     AUX(AT_NULL, 0);
 #undef AUX
+
+    /* Three more words than the auxv: the two NULL terminators and argc. */
+    int total_entries = (int) auxv.nwords + 3 + argc + envc;
+
+    /* Where SP must land, computed before a single word is pushed. A push the
+     * count does not know about would leave SP misaligned or short of argc, and
+     * nothing would say so: the guest would just read argv from the wrong
+     * offset. Comparing against this at the end turns that into a clean
+     * failure. stack_final_sp proves the value is 16-byte aligned and inside
+     * the region, given a 16-aligned base and an even word count.
+     */
+    uint64_t pushed_words = stack_pushed_words((uint64_t) total_entries);
+    uint64_t expect_sp = 0;
+    if (!stack_final_sp(str_ptr, stack_floor, pushed_words, &expect_sp))
+        goto out;
+
+    /* Track cumulative write errors. Any failure means the stack is incomplete.
+     *
+     * Return 0 so the caller sees the failure.
+     */
+    int stack_err = str_err;
+
+    if (pushed_words != (uint64_t) total_entries)
+        stack_err |= push_u64(g, &sp, 0); /* alignment padding */
+
+#define PUSH(val)                             \
+    do {                                      \
+        stack_err |= push_u64(g, &sp, (val)); \
+    } while (0)
+
 
     for (size_t i = auxv.nwords; i > 0; i--)
         PUSH(auxv.words[i - 1]);

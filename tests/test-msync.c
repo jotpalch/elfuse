@@ -7,7 +7,7 @@
  *
  * Tests: MAP_SHARED write-back to shm backing files.
  *
- * Syscalls exercised: shm_open/openat, ftruncate, mmap, msync, pread64
+ * Syscalls exercised: openat, ftruncate, mmap, msync, pread64
  */
 
 #include <fcntl.h>
@@ -28,35 +28,21 @@
 
 int passes = 0, fails = 0;
 
-/* glibc 2.28 static: shm_open is broken (returns ENOSYS without trying).
- * Implement directly via openat on /dev/shm/.
+/* These tests open /dev/shm paths directly rather than calling shm_open, which
+ * returns ENOSYS without trying on glibc 2.28 static.
  */
-static int my_shm_open(const char *name, int oflag, int mode)
-{
-    char path[128];
-    snprintf(path, sizeof(path), "/dev/shm%s", name);
-    return open(path, oflag, mode);
-}
-
-static int my_shm_unlink(const char *name)
-{
-    char path[128];
-    snprintf(path, sizeof(path), "/dev/shm%s", name);
-    return unlink(path);
-}
 
 static void test_shared_msync_writes_file(void)
 {
     TEST("MAP_SHARED msync writes backing file");
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-msync-%ld", (long) getpid());
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[] = "/dev/shm/elfuse-msync-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("shm_open failed");
+        FAIL("mkstemp /dev/shm failed");
         return;
     }
-    my_shm_unlink(name);
+    unlink(name);
 
     if (ftruncate(fd, 4096) != 0) {
         FAIL("ftruncate failed");
@@ -98,14 +84,13 @@ static void test_shared_msync_refreshes_peer_mapping(void)
 {
     TEST("MAP_SHARED msync refreshes peer mapping");
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-msync-peer-%ld", (long) getpid());
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[] = "/dev/shm/elfuse-msync-peer-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("shm_open failed");
+        FAIL("mkstemp /dev/shm failed");
         return;
     }
-    my_shm_unlink(name);
+    unlink(name);
 
     if (ftruncate(fd, 4096) != 0) {
         FAIL("ftruncate failed");
@@ -143,14 +128,13 @@ static void test_shared_msync_preserves_alias_writes(void)
 {
     TEST("MAP_SHARED msync preserves peer alias writes");
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-msync-alias-%ld", (long) getpid());
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[] = "/dev/shm/elfuse-msync-alias-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("shm_open failed");
+        FAIL("mkstemp /dev/shm failed");
         return;
     }
-    my_shm_unlink(name);
+    unlink(name);
 
     if (ftruncate(fd, 4096) != 0) {
         FAIL("ftruncate failed");
@@ -194,24 +178,19 @@ static void test_shm_name_visible_after_fork(void)
 {
     TEST("/dev/shm name visible after fork");
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-msync-fork-%ld", (long) getpid());
-
-    /* Best-effort cleanup of stale shm objects from a previous run that was
-     * killed between create and the final unlink. macOS shm objects persist
-     * across process death, so without this O_EXCL fails with EEXIST and the
-     * test reports a spurious shm_open failure.
+    /* The name outlives the fork: it is not unlinked until the child has opened
+     * it.
      */
-    my_shm_unlink(name);
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[] = "/dev/shm/elfuse-msync-fork-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("parent shm_open failed");
+        FAIL("parent mkstemp /dev/shm failed");
         return;
     }
 
     if (ftruncate(fd, 4096) != 0) {
         FAIL("ftruncate failed");
-        my_shm_unlink(name);
+        unlink(name);
         close(fd);
         return;
     }
@@ -219,7 +198,7 @@ static void test_shm_name_visible_after_fork(void)
     char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
         FAIL("parent mmap failed");
-        my_shm_unlink(name);
+        unlink(name);
         close(fd);
         return;
     }
@@ -230,7 +209,7 @@ static void test_shm_name_visible_after_fork(void)
     if (child < 0) {
         FAIL("fork failed");
     } else if (child == 0) {
-        int cfd = my_shm_open(name, O_RDWR, 0600);
+        int cfd = open(name, O_RDWR);
         if (cfd < 0)
             _exit(2);
         char *cp = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
@@ -261,7 +240,7 @@ static void test_shm_name_visible_after_fork(void)
 
     munmap(p, 4096);
     close(fd);
-    my_shm_unlink(name);
+    unlink(name);
 }
 
 /* Real MAP_SHARED requires that host writes to the backing file are observable
@@ -273,14 +252,13 @@ static void test_shared_host_write_visible_without_msync(void)
 {
     TEST("MAP_SHARED host pwrite visible without msync");
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-msync-host-%ld", (long) getpid());
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[] = "/dev/shm/elfuse-msync-host-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("shm_open failed");
+        FAIL("mkstemp /dev/shm failed");
         return;
     }
-    my_shm_unlink(name);
+    unlink(name);
 
     if (ftruncate(fd, 4096) != 0) {
         FAIL("ftruncate failed");
@@ -348,14 +326,13 @@ static void test_shared_guest_write_lands_in_file(void)
 {
     TEST("MAP_SHARED guest write lands in file without msync");
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-msync-guest-%ld", (long) getpid());
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[] = "/dev/shm/elfuse-msync-guest-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("shm_open failed");
+        FAIL("mkstemp /dev/shm failed");
         return;
     }
-    my_shm_unlink(name);
+    unlink(name);
 
     if (ftruncate(fd, 4096) != 0) {
         FAIL("ftruncate failed");
@@ -398,14 +375,13 @@ static void test_shared_adjacent_fixed_mapping_does_not_alias_file(void)
     size_t hps = (size_t) sysconf(_SC_PAGESIZE);
     size_t file_len = hps > 8192 ? hps : 8192;
 
-    char name[64];
-    snprintf(name, sizeof(name), "/elfuse-msync-alias-%ld", (long) getpid());
-    int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    char name[] = "/dev/shm/elfuse-msync-neighbor-XXXXXX";
+    int fd = mkstemp(name);
     if (fd < 0) {
-        FAIL("shm_open failed");
+        FAIL("mkstemp /dev/shm failed");
         return;
     }
-    my_shm_unlink(name);
+    unlink(name);
 
     if (ftruncate(fd, (off_t) file_len) != 0) {
         FAIL("ftruncate failed");
@@ -460,8 +436,8 @@ static void test_shared_large_mapping_crosses_split_hvf_segments(void)
     const size_t reserve_len = 8u * 1024u * 1024u;
     const size_t large_len = 4u * 1024u * 1024u;
     const size_t split_offset = 2u * 1024u * 1024u;
-    char small_name[64];
-    char large_name[64];
+    char small_name[] = "/dev/shm/elfuse-msync-split-XXXXXX";
+    char large_name[] = "/dev/shm/elfuse-msync-large-XXXXXX";
     int small_fd = -1;
     int large_fd = -1;
     char *reserve;
@@ -479,19 +455,14 @@ static void test_shared_large_mapping_crosses_split_hvf_segments(void)
         return;
     }
 
-    snprintf(small_name, sizeof(small_name), "/elfuse-msync-split-%ld",
-             (long) getpid());
-    snprintf(large_name, sizeof(large_name), "/elfuse-msync-large-%ld",
-             (long) getpid());
-    my_shm_unlink(small_name);
-    my_shm_unlink(large_name);
-
-    small_fd = my_shm_open(small_name, O_CREAT | O_EXCL | O_RDWR, 0600);
-    large_fd = my_shm_open(large_name, O_CREAT | O_EXCL | O_RDWR, 0600);
-    my_shm_unlink(small_name);
-    my_shm_unlink(large_name);
+    small_fd = mkstemp(small_name);
+    large_fd = mkstemp(large_name);
+    if (small_fd >= 0)
+        unlink(small_name);
+    if (large_fd >= 0)
+        unlink(large_name);
     if (small_fd < 0 || large_fd < 0) {
-        FAIL("shm_open failed");
+        FAIL("mkstemp /dev/shm failed");
         goto out;
     }
     if (ftruncate(small_fd, 4096) != 0 ||

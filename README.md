@@ -42,6 +42,13 @@ linker resolved against an external sysroot via `--sysroot`.
 - Self-contained test matrix that cross-checks elfuse against QEMU
   and exercises a separate Rosetta acceptance suite
 
+## OCI Images
+
+`elfuse-oci` is a separate Go binary that pulls OCI images into a local
+OCI image layout. It does not add container isolation. See
+[docs/usage.md](docs/usage.md#oci-images) and
+[docs/oci-images.md](docs/oci-images.md).
+
 ## Positioning
 
 `elfuse` is intentionally narrow. It runs single Linux binaries (and
@@ -143,6 +150,8 @@ The build signs `build/elfuse` before use. Override the signing identity with
 - [docs/testing.md](docs/testing.md): build prerequisites, the
   `make check` flow, the QEMU and Rosetta cross-check matrices, and
   fixture handling.
+- [docs/oci-images.md](docs/oci-images.md): the `elfuse-oci` store,
+  pull behavior, and validation.
 - [docs/filenames.md](docs/filenames.md): how a guest filename becomes a
   name on disk and back: case folding and normalization on the sysroot
   volume, the escape encoding, and the length limits both systems impose.
@@ -218,7 +227,7 @@ seven commit-message rules the log is written to.
 Two things settle most review comments before they are written:
 
 ```sh
-make indent        # apply every formatter, comment reflow included
+make indent        # clang-format and comment reflow (FORMAT_SHELL/FORMAT_PY add the rest)
 make check-format  # verify without rewriting
 ```
 

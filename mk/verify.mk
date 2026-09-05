@@ -1,7 +1,7 @@
 # Frama-C WP proofs
 
 .PHONY: verify check-contracts verify-mutants check-char-signedness \
-        check-stub-constants print-verify-targets
+        check-stub-constants check-stub-shadow print-verify-targets
 
 # Frama-C proof of the ELF parsing core. ELF headers come from untrusted
 # binaries, so every offset and extent computed from them is discharged as a
@@ -145,8 +145,10 @@ VERIFY_UTILS_FCTS := hex_nibble
 VERIFY_ELF_SRC   := src/core/elf.c
 VERIFY_ELF_FCTS  := elf_add_no_wrap elf_phdr_gpa_in_segment \
                     elf_phdr_table_bytes elf_phdr_fetch elf_segment_extent \
+                    elf_place_segment elf_check_placement elf_record_load \
+                    elf_read_interp \
                     $(VERIFY_UTILS_FCTS)
-VERIFY_ELF_MIN_GOALS ?= 78
+VERIFY_ELF_MIN_GOALS ?= 156
 VERIFY_ELF_MODEL := caveat
 
 # Includes utils.h and elf.h: elf.c includes both, and utils.h already carries
@@ -259,6 +261,35 @@ reply buffer state
 VERIFY_NETLINKWALK_UNPROVED := the reply builders, the socket I/O, and whether \
 their callers honor these preconditions stay test-covered
 
+# The deadline arithmetic in futex.c is proved in place because
+# futex_remaining_ns reads the clock. Typed suffices; no function in the set
+# touches a byte buffer.
+#
+# The four proved/timespec.h helpers are re-proved here rather than assumed, the
+# same reason VERIFY_UTILS_FCTS exists: futex_remaining_ns rests on
+# timespec_to_ns_sat's saturation. All four, not just the two futex.c reaches:
+# check-acsl-coverage.py reads the whole of each scanned file, so a contracted
+# function left out of the set is an assumed axiom whether or not this target
+# calls it, and dropping timespec_to_poll_ms fails the gate by name.
+#
+# The cost is that verify-mutants lists those four as unmutated under this
+# target as well as under verify-timespec, where they are mutated. That is a
+# second target proving the same functions, not lost coverage.
+VERIFY_FUTEXDEADLINE_SRC  := src/runtime/futex.c
+VERIFY_FUTEXDEADLINE_FCTS := futex_remaining_ns futex_quantum_deadline \
+                             linux_timespec_is_valid futex_uaddr_is_aligned \
+                             timespec_valid timespec_valid_capped \
+                             timespec_to_ns_sat timespec_to_poll_ms
+VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 128
+VERIFY_FUTEXDEADLINE_MODEL := typed
+VERIFY_FUTEXDEADLINE_SCAN := src/runtime/futex.c src/proved/timespec.h
+VERIFY_FUTEXDEADLINE_CLAIM := for ANY guest deadline and ANY cap the wait \
+paths hand it
+VERIFY_FUTEXDEADLINE_UNPROVED := futex_make_deadline, which reads the guest \
+timespec through guest_read_small and so has no body the analyzer can follow, \
+the wait loops that consume the deadline, and whether their callers honor \
+these preconditions stay test-covered
+
 VERIFY_SIGFRAME_SRC  := src/proved/sigframe.h
 VERIFY_SIGFRAME_FCTS := sigframe_base sigframe_fpsimd_vreg_offset
 VERIFY_SIGFRAME_MIN_GOALS ?= 20
@@ -317,8 +348,8 @@ VERIFY_FDSET_CLAIM := for ANY nfds, fd_set bit, or fd-table slot index
 VERIFY_FDSET_UNPROVED := the poll translation and the result writeback stay test-covered
 
 VERIFY_TIMESPEC_SRC  := src/proved/timespec.h
-VERIFY_TIMESPEC_FCTS := timespec_valid timespec_to_ns_sat timespec_to_poll_ms
-VERIFY_TIMESPEC_MIN_GOALS ?= 35
+VERIFY_TIMESPEC_FCTS := timespec_valid timespec_valid_capped timespec_to_ns_sat timespec_to_poll_ms
+VERIFY_TIMESPEC_MIN_GOALS ?= 45
 VERIFY_TIMESPEC_MODEL := typed
 VERIFY_TIMESPEC_SCAN := src/proved/timespec.h
 VERIFY_TIMESPEC_CLAIM := for ANY timespec a guest can write
@@ -339,6 +370,26 @@ VERIFY_ALIGN_MODEL := typed
 VERIFY_ALIGN_SCAN := src/proved/align.h
 VERIFY_ALIGN_CLAIM := for ANY address, alignment, and search window
 VERIFY_ALIGN_UNPROVED := the region-array walk around them stays test-covered
+
+VERIFY_FUTEXHASH_SRC  := src/proved/futexhash.h
+VERIFY_FUTEXHASH_FCTS := futex_bucket_index
+VERIFY_FUTEXHASH_MIN_GOALS ?= 3
+# typed: the arithmetic takes scalars only, no buffer and no aliasing question,
+# so nothing here needs a model that assumes separation it cannot check.
+VERIFY_FUTEXHASH_MODEL := typed
+VERIFY_FUTEXHASH_SCAN := src/proved/futexhash.h
+VERIFY_FUTEXHASH_CLAIM := for ANY guest futex address and ANY table size
+VERIFY_FUTEXHASH_UNPROVED := the queue walks around it stay test-covered
+
+VERIFY_FUTEXOP_SRC  := src/proved/futexop.h
+VERIFY_FUTEXOP_FCTS := futex_op_sign_extend12 futex_op_shift_arg_mask
+VERIFY_FUTEXOP_MIN_GOALS ?= 6
+# typed: scalar arithmetic on one guest-supplied word, no buffer and no
+# aliasing question.
+VERIFY_FUTEXOP_MODEL := typed
+VERIFY_FUTEXOP_SCAN := src/proved/futexop.h
+VERIFY_FUTEXOP_CLAIM := for ANY guest-supplied val3 word
+VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-covered
 
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
@@ -419,7 +470,7 @@ $(foreach t,$(VERIFY_TARGETS),$(eval $(call verify-target-vars,$(t))))
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-$(VERIFY_RULES): check-stub-constants | $(BUILD_DIR)
+$(VERIFY_RULES): check-stub-constants check-stub-shadow | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -520,6 +571,17 @@ VERIFY_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || ech
 # another arm of the same linux_errno() switch, and only a review caught it.
 check-stub-constants:
 	$(Q)python3 scripts/check-stub-constants.py
+
+## Assert a shadow stub's rename still hits exactly one declaration
+#
+# frama-c-stubs/sys/socket.h and frama-c-stubs/pthread.h take the modeled libc
+# header whole and rename one name inside it. That is sound only while the
+# modeled header names it once. A second use would follow the rename into a
+# prototype and change a signature, and the file would still parse and the
+# proofs would still discharge, about a different program.
+check-stub-shadow:
+	$(Q)python3 scripts/check-stub-shadow.py --self-test
+	$(Q)python3 scripts/check-stub-shadow.py $(if $(FRAMAC),--frama-c $(FRAMAC))
 
 verify:
 	+@$(MAKE) --no-print-directory \
