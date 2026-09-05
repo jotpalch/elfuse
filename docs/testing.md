@@ -494,6 +494,51 @@ answers with its primary alone, because the backing half belongs to a stream
 that has gone. Both rows are load-bearing in pairs -- neither number alone
 separates the answers the site could give -- so both are printed.
 
+USB-layer coverage is split by what it needs. `test-uevent-socket` needs no
+hardware and runs in the matrix like any other unit test, and so do the two
+usbdevfs lanes: `test-usbdev-ioctl` drives the fd against
+`ELFUSE_USB_FIXTURE`, whose devices are modeled but have no IOKit service
+behind them, and `test-usbdev-urb-host` is a native binary over
+`src/syscall/usbdev-urb.h`, the URB bookkeeping that is decided before any
+transfer -- the disconnect-watch refcon, `SUBMITURB`'s argument gate, the
+transferred-count clamp, the `ZERO_PACKET` predicate and the endpoint start
+gate. That header exists because the fixture stops at the argument gate: the
+async engine's first review found five defects in code no lane executed, and
+the arithmetic half of it is testable on any machine.
+
+`test-usbdev-urb-loopback` covers the other half. IOKit publishes no loopback
+device, so the fixture becomes one: `ELFUSE_USB_FIXTURE=loopback` substitutes
+for the two IOKit COM vtables and for nothing above them (see
+[internals.md](internals.md#testing-the-engine-without-hardware)), which puts
+submit, the per-endpoint queue, the completion callback on the event thread,
+`DISCARDURB`, `REAPURB` blocking and non-blocking, poll and epoll readiness,
+the `CAP_REAP_AFTER_DISCONNECT` drain and the `ZERO_PACKET` trailing packet
+under assertion on any machine. `test-usbdev-ioctl-loopback` re-runs the
+fd-contract lane with that device present, which is the check that the seam did
+not reach a path it is not supposed to touch.
+
+What the loopback cannot answer stays on the board, and the list is short and
+worth keeping honest: real timing, NAKs, maxpacket segmentation, DMA alignment
+and throughput; that IOKit really delivers completions on the runloop, and the
+`IODispatchCalloutFromCFMessage` opacity that motivates the URB record's atomic
+owner (a timer callout is fully visible to ThreadSanitizer, so that
+justification is board-only); exclusive-access arbitration and kernel-driver
+binding, so `GETDRIVER` and `DISCONNECT_CLAIM` against a real driver; a real
+`SET_CONFIGURATION`, `SET_INTERFACE` pipe renumbering and port `RESET`; that a
+device actually receives the zero-length packet, as opposed to elfuse emitting
+it under the right predicate; and a physical unplug mid-transfer. Two of the
+engine's own answers are board-only for the same reason, and breaking either
+of them leaves the lane green: the `ZERO_PACKET` write's dropped `async_lock`
+and its bounded timeout only matter against an endpoint that NAKs, and the
+fixture answers a zero-length write immediately and ignores both timeout
+arguments; and so is the bystander window `ep_aborting` shuts, because the
+fixture retargets an aborted transfer's timer under its own lock and can never
+start a follower into an abort that is still running. The guest probes for
+those live out of tree. A hardware-dependent check that does move
+in must be gated on an environment variable naming the device and must skip
+with a stated reason when it is absent -- a skip is not a pass, and the
+skip lists above are the model: deliberate, explained, and checked.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

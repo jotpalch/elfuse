@@ -37,13 +37,14 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host test-elf-headers-host \
+        test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-matrix \
         test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
+        test-usbdev-urb-loopback test-usbdev-ioctl-loopback \
         test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
         test-fstatfs-fd-identity \
@@ -240,7 +241,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host test-elf-headers-host test-gdbstub-host)
+        test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
+        test-gdbstub-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -261,6 +263,7 @@ $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
+$(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
@@ -269,6 +272,8 @@ $(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point agains
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
 $(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
+$(call run-lane,test-usbdev-urb-loopback,the async URB engine over an IOKit loopback)
+$(call run-lane,test-usbdev-ioctl-loopback,the usbdevfs fd contract with a service behind one node)
 $(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
 $(call run-lane,test-dir-backing-drain-error,a lost union listing is reported not truncated)
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
@@ -1725,6 +1730,27 @@ test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_RETIRE_DELAY_US=20000 \
 		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 
+## The async URB engine, against a device that can complete a transfer
+# ELFUSE_USB_FIXTURE=loopback adds one device whose IOKit answers come from
+# src/syscall/usbdev-fixture.c: the two COM vtables are replaced and nothing
+# above them is, so submit, the per-endpoint queue, the completion callback on
+# the event thread, the readiness and disconnect maps, REAPURB, the
+# CAP_REAP_AFTER_DISCONNECT drain and the ZERO_PACKET write all run here for the
+# first time without a board. What it cannot cover -- real timing, NAKs,
+# maxpacket segmentation, exclusive-access arbitration, a physical unplug -- is
+# listed in docs/testing.md and stays on the board.
+test-usbdev-urb-loopback: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-urb-loopback
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-urb-loopback
+
+## The same fd contract, with an IOKit service behind one node
+# The seam is per device: the loopback model adds a device and leaves the
+# service-less ones alone, so this run must answer exactly what
+# test-usbdev-ioctl answers. It is the check that the seam did not leak into the
+# paths it is not supposed to touch.
+test-usbdev-ioctl-loopback: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=loopback $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+
 ## fstatfs answers for the descriptor it pinned, not for the fd number
 # The identity is decided from the slot's stamp and from the descriptor itself,
 # and those used to be two lookups with a window between them. The window is far
@@ -1871,6 +1897,10 @@ test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 ## Run the USB descriptor blob walk unit test natively on the host
 test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
 	$(BUILD_DIR)/test-usb-desc-host
+
+## Run the usbdevfs URB bookkeeping unit test (native host binary)
+test-usbdev-urb-host: $(BUILD_DIR)/test-usbdev-urb-host
+	$(BUILD_DIR)/test-usbdev-urb-host
 
 ## Run the ELF header validation host unit test
 test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host
