@@ -389,6 +389,14 @@ addressed threads with "Resolve conversation"; a reply carries the
 correction, the measurement, or nothing. A concise what and why belongs in
 the commit body, not the thread.
 
+A reply that hands the choice back to the reviewer is the same artifact in
+a politer form. "If you would rather the source read uniformly one way or
+the other, say so and I will move the remaining three" asks for an
+instruction where a technical answer belongs ("Let's concentrate on real
+discussions!", PR#350). A tradeoff already measured is settled in the
+reply, with the measurement as the reason. Ask the reviewer a question only
+where the code leaves one open.
+
 The body is intent plus reproduction and commands: for a bug, a minimal
 reproduction with host macOS and SDK version, hardware, and `make check`
 status (PR#21, PR#41); for a performance claim, A/B benchmarks on a named
