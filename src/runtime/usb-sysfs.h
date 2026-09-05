@@ -132,3 +132,49 @@ int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out);
  * Returns 0, or -1 with errno set.
  */
 int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st);
+
+/* True when path is a canonical Linux serial alias name this layer owns:
+ * exactly "/dev/ttyACM<n>", "/dev/ttyUSB<n>" or "/dev/serial/by-id/<leaf>".
+ * Pure string check (no lock, no device lookup): sys_fstat uses it to route an
+ * alias fd's stat through proc_intercept_stat instead of leaking the macOS cu.*
+ * identity of the host fd behind it, and the stamp it reads is canonical by
+ * construction. A caller holding the guest's own spelling wants
+ * usb_tty_alias_canon below instead.
+ */
+bool usb_tty_alias_path(const char *path);
+
+/* Whether @path, in any spelling this layer folds, names a serial alias node or
+ * a by-id leaf; @out receives the one canonical spelling of it. Callers that
+ * see the guest's raw spelling use this rather than usb_tty_alias_path, which
+ * reads the canonical form only.
+ */
+bool usb_tty_alias_canon(const char *path, char *out, size_t outsz);
+
+/* Whether @path, in any spelling this layer folds, names one of the three
+ * host-served directories a serial alias name appears in (/dev, /dev/serial,
+ * /dev/serial/by-id); @out receives the canonical spelling. A descriptor opened
+ * on one carries that spelling so a relative lookup through it re-enters the
+ * intercepts.
+ */
+bool usb_tty_alias_dir(const char *path, char *out, size_t outsz);
+
+/* The alias NODE spelling behind @path, which may itself be a by-id leaf, or
+ * false when this layer serves no such alias. Unlike usb_tty_alias_canon this
+ * takes the layer's lock and looks the device up, because that is the only way
+ * to know which ttyACM<n> a by-id name resolves to.
+ *
+ * It is the spelling a descriptor is stamped with: the two names are one
+ * object, so a by-id fd has to fstat as the node -- and the node spelling is
+ * also the only one that fits, since a by-id leaf can be 224 bytes and the
+ * stamp is 63.
+ */
+bool usb_tty_alias_node(const char *path, char *out, size_t outsz);
+
+/* Whether @path could name anything under /sys or /dev that this layer serves,
+ * decided by the same fold-then-classify the intercepts use. The stat gate asks
+ * this instead of matching prefixes itself: matching them left //dev/ttyACM0
+ * and /dev/./ttyACM0 out of the stat intercept while the unconditional open
+ * intercept still served them, so one name opened the device and stat'd the
+ * placeholder behind it.
+ */
+bool usb_sysfs_path_might_be_ours(const char *path);
