@@ -33,11 +33,11 @@ linker resolved against an external sysroot via `--sysroot`.
 - Synthetic `/proc` and selected `/dev` emulation for user-space probes
 - USB device passthrough: `/dev/bus/usb` and `/sys/bus/usb/devices` are
   built from the IOKit registry, and opening a device node yields a
-  usbdevfs fd whose synchronous ioctls (interface claim, control and bulk
-  transfers) drive the attached device through IOKit. Asynchronous URB
-  submission is not implemented; a udev-backed `lsusb` also needs
-  `name_to_handle_at`, and macOS publishes no root hubs, so there are no
-  `usbN` entries and `lsusb -t` lists devices without their bus rows
+  usbdevfs fd whose ioctls -- interface claim, control and bulk transfers,
+  and asynchronous URBs -- drive the attached device through IOKit. A
+  udev-backed `lsusb` also needs `name_to_handle_at`, and macOS publishes
+  no root hubs, so there are no `usbN` entries and `lsusb -t` lists devices
+  without their bus rows
 - Guest-internal FUSE: `/dev/fuse` and `mount("fuse")` work without
   macFUSE / FUSE-T / FSKit
 - Built-in GDB Remote Serial Protocol stub usable from `gdb` or `lldb`
@@ -223,6 +223,13 @@ do.
   mask); the host scheduler picks the actual CPU.
 - `/proc`, `/dev`, and mount data are synthetic compatibility views,
   not host pass-throughs.
+- USB interfaces bound to an Apple class driver (CDC serial, HID, FTDI)
+  cannot be claimed; `CLAIMINTERFACE` reports `EBUSY`, and root-mode
+  device capture is not implemented. CDC serial devices are reachable by
+  opening the host's `/dev/cu.*` node instead.
+- USB mass storage will never be claimable, even with capture; macOS
+  does not release it.
+- Isochronous URBs are unimplemented; submitting one reports `EINVAL`.
 - `uname` and `/proc/version` report Linux 6.18 LTS, a floor for
   version-gated userspace; `src/syscall/dispatch.tbl` states what is
   implemented.

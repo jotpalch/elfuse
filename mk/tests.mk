@@ -37,7 +37,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host test-elf-headers-host \
+        test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
@@ -251,7 +251,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host test-elf-headers-host test-gdbstub-host)
+        test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
+        test-gdbstub-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -272,6 +273,7 @@ $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
+$(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
@@ -1712,17 +1714,19 @@ test-usbdev-ioctl: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 
 ## The usbdevfs fd's failures, one forced condition per run
-# Six things this descriptor has to get right cannot be provoked from a guest on
-# a healthy host: a device declaring an interface number wider than the table
-# that indexes by it, the three ways an open can fail before it returns, and the
+# Seven things this descriptor has to get right cannot be provoked from a guest
+# on a healthy host: a device declaring an interface number wider than the table
+# that indexes by it, the three ways an open can fail before it returns, the
 # two windows an open leaves around the moment the side table binds its guest
 # fd -- before the bind, where a close finds no entry, and after it, where a
-# close can reap the entry and a sibling open can take the slot back. Each run
-# below forces exactly one and the binary asserts only that one, so a failure
-# names the condition. The malformed-descriptor run is also where the
-# out-of-bounds read lives: it is invisible in the answer -- both sides report
-# EINVAL, which is what checkintf reports -- and shows up only under
-# -fsanitize=array-bounds, which is why this lane is in the sanitizer set.
+# close can reap the entry and a sibling open can take the slot back -- and the
+# window a reap leaves between the fd-table snapshot it settles readiness from
+# and the side-table entry it settles it on. Each run below forces exactly one
+# and the binary asserts only that one, so a failure names the condition. The
+# malformed-descriptor run is also where the out-of-bounds read lives: it is
+# invisible in the answer -- both sides report EINVAL, which is what checkintf
+# reports -- and shows up only under -fsanitize=array-bounds, which is why this
+# lane is in the sanitizer set.
 test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=badifnum $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=info \
@@ -1734,6 +1738,8 @@ test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_PUBLISH_DELAY_US=20000 \
 		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_RETIRE_DELAY_US=20000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_REAP_DELAY_US=20000 \
 		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 
 ## fstatfs answers for the descriptor it pinned, not for the fd number
@@ -1882,6 +1888,10 @@ test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 ## Run the USB descriptor blob walk unit test natively on the host
 test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
 	$(BUILD_DIR)/test-usb-desc-host
+
+## Run the usbdevfs URB bookkeeping unit test (native host binary)
+test-usbdev-urb-host: $(BUILD_DIR)/test-usbdev-urb-host
+	$(BUILD_DIR)/test-usbdev-urb-host
 
 ## Run the ELF header validation host unit test
 test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host

@@ -493,6 +493,7 @@ environment hook, read once and with no effect at all when unset:
 | `ELFUSE_USBDEV_OPEN_FAULT=info\|blob\|pipe` | fails one step of a usbdevfs open: the model lookup or the descriptor copy with `ENOMEM`, the readiness pipe with `ENFILE` | `test-usbdev-faults` |
 | `ELFUSE_USBDEV_PUBLISH_DELAY_US=N` | widens the window between `fd_alloc` publishing a usbdevfs fd and the side table binding it, where a close finds no entry | `test-usbdev-faults` |
 | `ELFUSE_USBDEV_RETIRE_DELAY_US=N` | widens the window between the side table binding a usbdevfs fd and the open's recheck, where a close can reap the entry and a sibling open can take its slot | `test-usbdev-faults` |
+| `ELFUSE_USBDEV_REAP_DELAY_US=N` | widens the window between the fd-table snapshot a `REAPURB` pass takes and the side-table entry it settles readiness on, where a close and reopen can swap the description underneath it | `test-usbdev-faults` |
 
 `ELFUSE_USB_FIXTURE` is the same shape pointing at enumeration rather than
 failure: it stands a deterministic synthetic USB tree up in place of whatever
@@ -515,7 +516,7 @@ The lanes these drive:
 | `test-dir-union-alias` | every route to a second fd on one description shares one position and one union state |
 | `test-dir-fd-budget-union` | a union directory fd costs one host descriptor, like a plain one |
 | `test-fstatfs-fd-identity` | `fstatfs` answers for the descriptor it pinned, not for the fd number |
-| `test-usbdev-faults` | an interface number wider than the table that indexes it, each open-time failure reported as itself, and a close inside the fd publish window leaking nothing |
+| `test-usbdev-faults` | an interface number wider than the table that indexes it, each open-time failure reported as itself, a close inside the fd publish window leaking nothing, and a reap that answers for the description it snapshotted rather than the fd number |
 
 Two lanes carry rows that are recorded rather than asserted, and print as
 `XFAIL`. An `XFAIL` row is a measured Linux value the build knowingly does not
@@ -532,6 +533,25 @@ whose parent closes its copy of the fd before the backing has been drained
 answers with its primary alone, because the backing half belongs to a stream
 that has gone. Both rows are load-bearing in pairs -- neither number alone
 separates the answers the site could give -- so both are printed.
+
+USB-layer coverage is split by what it needs. `test-uevent-socket` needs no
+hardware and runs in the matrix like any other unit test, and so do the two
+usbdevfs lanes: `test-usbdev-ioctl` drives the fd against
+`ELFUSE_USB_FIXTURE`, whose devices are modeled but have no IOKit service
+behind them, and `test-usbdev-urb-host` is a native binary over
+`src/syscall/usbdev-urb.h`, the URB bookkeeping that is decided before any
+transfer -- the disconnect-watch refcon, `SUBMITURB`'s argument gate, the
+transferred-count clamp, the `ZERO_PACKET` predicate and the endpoint start
+gate. That header exists because the fixture stops at the argument gate: the
+async engine's first review found five defects in code no lane executed, and
+the arithmetic half of it is testable on any machine.
+
+Everything past that gate needs a device that can complete a transfer, and
+there is none in the tree, so it stays on the board and out of tree. A
+hardware-dependent check that does move in must be gated on an environment
+variable naming the device and must skip with a stated reason when it is
+absent -- a skip is not a pass, and the skip lists above are the model:
+deliberate, explained, and checked.
 
 ## Validation Strategy By Change Type
 

@@ -289,6 +289,14 @@ $(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the usbdevfs URB bookkeeping host unit test (native macOS binary)
+# usbdev-urb.h is header-only arithmetic with no IOKit and no I/O, so the test
+# needs no object but its own.
+$(BUILD_DIR)/test-usbdev-urb-host: \
+		$(BUILD_DIR)/test-usbdev-urb-host.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the guest environment merge host test (native macOS binary)
 # guest-env.o's only dependency is the log macro, which the test stubs.
 $(BUILD_DIR)/test-guest-env-host: $(BUILD_DIR)/test-guest-env-host.o \
