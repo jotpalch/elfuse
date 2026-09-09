@@ -80,8 +80,27 @@ SRCS := \
     debug/log.c \
     debug/syscall-hist.c
 
+# The USB fixture seam (src/syscall/usbdev-fixture.h). usbdev.c calls it with no
+# conditional compilation of its own, so exactly one translation unit has to
+# define the entry points and the choice is made here: the stub in every build,
+# the loopback device model when USB_LOOPBACK_FIXTURE asks for it. Listing both
+# would be a duplicate-symbol link error, which is the property that keeps a
+# default build from quietly acquiring the model.
+ifeq ($(USB_LOOPBACK_FIXTURE),1)
+SRCS += syscall/usbdev-fixture.c
+else
+SRCS += syscall/usbdev-fixture-stub.c
+endif
+
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+
+# Every host source, whether or not this build links it. Only one of the two
+# fixture-seam translation units is ever in SRCS, and a static analyzer wants
+# both: make lint reads this rather than SRCS so that turning the fixture off
+# does not also turn off the checking of it.
+ALL_SRCS := $(sort $(SRCS) src/syscall/usbdev-fixture.c \
+                   src/syscall/usbdev-fixture-stub.c)
 
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
@@ -286,6 +305,14 @@ $(BUILD_DIR)/test-dynamic-array-host: \
 # I/O), so the test links the code under test and nothing else.
 $(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
 		$(BUILD_DIR)/runtime/usb-desc.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the usbdevfs URB bookkeeping host unit test (native macOS binary)
+# usbdev-urb.h is header-only arithmetic with no IOKit and no I/O, so the test
+# needs no object but its own.
+$(BUILD_DIR)/test-usbdev-urb-host: \
+		$(BUILD_DIR)/test-usbdev-urb-host.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

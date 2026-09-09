@@ -680,7 +680,35 @@ bool elf_interp_is_loadable(const elf_info_t *info, const char *display_path)
  * Returns false, with the reason logged, when the window puts the segment
  * outside guest memory or on top of the runtime infra reserve. When infra_lo ==
  * infra_hi the caller opted out (early bring-up before guest_t is wired up);
- * the guest_size bound still applies.
+ * the guest_size bound still applies. An accepted placement never overlaps the
+ * runtime infra reserve. That is the property the caller depends on and the one
+ * worth stating: the reserve holds the page-table pool, the shim code and the
+ * EL1-only shim data, so a segment the loader accepts on top of it is a
+ * guest-controlled write into elfuse's own control structures.
+ *
+ * valid(gpa_out) and valid(zero_len_out) are deliberately absent, and that was
+ * measured rather than assumed. With both stated, the two matching call-site
+ * obligations in elf_check_placement time out at the 30s budget on a quiet host
+ * (0.3 runnable threads per CPU) with the WP cache defeated, so it is the
+ * caveat model and not the machine: caveat already assumes a formal pointer
+ * parameter is valid, which is why the body proves without them. separated is
+ * kept because it does discharge, and stating the non-aliasing in the contract
+ * beats leaving it implicit in the model choice.
+ *
+ * assigns is deliberately absent, and its absence is the honest answer rather
+ * than a gap. This function logs, and WP proves a frame against log_impl's
+ * generated spec (assigns \nothing) rather than against log.c, which locks a
+ * mutex and writes stderr. A frame stated here would therefore discharge and
+ * still be false, which is worse for a caller than no frame at all. Removing it
+ * costs 13 frame obligations and no ensures: the placement bounds above are
+ * what the caller actually depends on, and they prove either way.
+ */
+/*@
+  requires \separated(gpa_out, zero_len_out);
+  ensures \result != 0 ==> *gpa_out + *zero_len_out <= guest_size;
+  ensures \result != 0 ==> !(infra_lo < infra_hi &&
+                             *gpa_out < infra_hi &&
+                             *gpa_out + *zero_len_out > infra_lo);
  */
 static bool elf_place_segment(const elf_segment_t *seg,
                               const char *display_path,

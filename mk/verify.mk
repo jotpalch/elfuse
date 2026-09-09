@@ -1,7 +1,8 @@
 # Frama-C WP proofs
 
 .PHONY: verify check-contracts verify-mutants check-char-signedness \
-        check-stub-constants check-stub-shadow print-verify-targets
+        check-stub-constants check-stub-shadow print-verify-targets \
+        print-verify-profiles
 
 # Frama-C proof of the ELF parsing core. ELF headers come from untrusted
 # binaries, so every offset and extent computed from them is discharged as a
@@ -124,9 +125,82 @@ CPP_DEFS :=
 # git ls-files 'src/*.c' and tally the exits.
 FRAMAC_STUB_DIR := frama-c-stubs
 
-FRAMAC_CPP_ARGS = -nostdinc \
-    -isystem $$($(FRAMAC) -print-share-path)/libc \
-    -I$(FRAMAC_STUB_DIR) -include prelude.h -include macos-libc.h -Isrc -I$(BUILD_DIR) \
+# Split out of FRAMAC_CPP_ARGS because print-verify-profiles has to state the
+# same two lists in the schema's own shape (bare directories, bare headers)
+# rather than as -I and -include flags. Written once here so the recipe and the
+# emitted profile cannot name different include paths, which the MCP compares
+# byte for byte as part of a receipt's load identity: a profile that declared a
+# path the recipe does not pass would accept a proof run under a different
+# header set as that target's evidence.
+FRAMAC_INCLUDE_DIRS := $(FRAMAC_STUB_DIR) src $(BUILD_DIR)
+FRAMAC_FORCE_INCLUDES := prelude.h macos-libc.h
+
+# Recursively expanded: $(FRAMAC) is resolved when the recipe or the emitter
+# asks, not while this file is read, so a FRAMAC override still picks its own
+# libc. Shared for the same reason as the two lists above: the modeled libc and
+# the flag that lets it win are what decide which declarations a file is
+# compiled against, so the recipe and the profile must name one environment.
+#
+# One directory, and used unquoted rather than through patsubst: the value
+# carries a shell substitution containing a space, so a $(patsubst %,-isystem %)
+# over it splits mid-command and emits
+# "-isystem $(frama-c -isystem -print-share-path)/libc". That mangling still
+# proves green on any target whose sources need no libc, which is most of them.
+FRAMAC_ISYSTEM_DIRS = $$($(FRAMAC) -print-share-path)/libc
+
+# The per-target checks a verify-<name> target runs beside Frama-C. A consumer
+# of the emitted profiles runs the prover, not this recipe, so these do not
+# happen there. Named in the profile so a verdict obtained elsewhere is not
+# mistaken for this target's, which needs all of them.
+#
+# The first two are prerequisites rather than recipe lines, and they belong
+# here for the same reason the recipe's three do, more so: they are what says
+# the stub headers a profile-driven load reaches for declare what the SDK
+# declares. A run that skipped them proved a different frama-c-stubs/.
+FRAMAC_BUILD_GATES := scripts/check-stub-constants.py \
+                      scripts/check-stub-shadow.py \
+                      scripts/check-acsl-coverage.py \
+                      scripts/check-char-signedness.py \
+                      scripts/check-wp-result.py
+
+# One spelling. The recipe puts it in FRAMAC_CPP_ARGS and the emitter passes it
+# as a flag, so stating it twice is the drift the split above exists to prevent:
+# drop it from one and a consumer proves against the real macOS headers while
+# make verify-<name> proves against the modeled libc.
+FRAMAC_NOSTDINC := -nostdinc
+
+# A mutation of an INCLUDED header cannot travel through VERIFY_<T>_SRC, which
+# names one file and is what the prover is pointed at. The mutation runner
+# stages the broken header in its own directory and hands that directory over
+# here, where it precedes src/ in the include search and therefore shadows the
+# real one.
+#
+# Assigned, not ?=, so it is empty for every ordinary run and stays that way. A
+# make command line still overrides it, which is the only caller there is; ?=
+# would additionally let a stray environment variable of this name prepend an
+# include directory to all 21 proof targets, silently proving a program nobody
+# asked for.
+#
+# Both forms were measured, and they differ, which is the whole point:
+#   make -n verify-align MUTANT_INCDIR=/tmp/x   puts -I/tmp/x first, as intended
+#   MUTANT_INCDIR=/tmp/x make -n verify-align   injects nothing under :=
+# The second is the environment form. Under ?= it did inject; under := it does
+# not, and the command line still wins. Read the second line as the fix
+# working, not as evidence of a leak.
+MUTANT_INCDIR :=
+
+# WP's cache defaults to 'update', which stores a verdict and replays it. For
+# make verify that is what makes a re-run cheap, and it is left alone. For the
+# mutation gate it is wrong: a mutation is scored caught when a goal comes back
+# open, WP records a TIMEOUT as a stored verdict just like a conclusion, and a
+# replayed timeout is therefore a catch obtained with no prover run at all. The
+# mutation runner sets this to none so every mutation verdict is measured.
+WP_CACHE :=
+
+FRAMAC_CPP_ARGS = $(FRAMAC_NOSTDINC) \
+    -isystem $(FRAMAC_ISYSTEM_DIRS) \
+    $(patsubst %,-I%,$(MUTANT_INCDIR) $(FRAMAC_INCLUDE_DIRS)) \
+    $(patsubst %,-include %,$(FRAMAC_FORCE_INCLUDES)) \
     $(CPP_DEFS)
 
 # One proof per attacker-facing parser. Each is declared by a single
@@ -148,7 +222,7 @@ VERIFY_ELF_FCTS  := elf_add_no_wrap elf_phdr_gpa_in_segment \
                     elf_place_segment elf_check_placement elf_record_load \
                     elf_read_interp \
                     $(VERIFY_UTILS_FCTS)
-VERIFY_ELF_MIN_GOALS ?= 156
+VERIFY_ELF_MIN_GOALS ?= 159
 VERIFY_ELF_MODEL := caveat
 
 # Includes utils.h and elf.h: elf.c includes both, and utils.h already carries
@@ -272,15 +346,19 @@ their callers honor these preconditions stay test-covered
 # function left out of the set is an assumed axiom whether or not this target
 # calls it, and dropping timespec_to_poll_ms fails the gate by name.
 #
-# The cost is that verify-mutants lists those four as unmutated under this
-# target as well as under verify-timespec, where they are mutated. That is a
-# second target proving the same functions, not lost coverage.
+# Those four are proved here and mutated under verify-timespec. The coverage
+# summary counts both ways for exactly this shape: they are covered by function,
+# and they show in the per-target list as proved here without a mutation of
+# their own. That second list is not a gap to close by reflex. A mutation under
+# one target says nothing about another that proves the same function under a
+# different model, so it is worth adding only where the two environments differ
+# enough to matter.
 VERIFY_FUTEXDEADLINE_SRC  := src/runtime/futex.c
 VERIFY_FUTEXDEADLINE_FCTS := futex_remaining_ns futex_quantum_deadline \
                              linux_timespec_is_valid futex_uaddr_is_aligned \
                              timespec_valid timespec_valid_capped \
                              timespec_to_ns_sat timespec_to_poll_ms
-VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 128
+VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 130
 VERIFY_FUTEXDEADLINE_MODEL := typed
 VERIFY_FUTEXDEADLINE_SCAN := src/runtime/futex.c src/proved/timespec.h
 VERIFY_FUTEXDEADLINE_CLAIM := for ANY guest deadline and ANY cap the wait \
@@ -438,6 +516,31 @@ VERIFY_RULES := $(addprefix verify-,$(VERIFY_TARGET_NAMES))
 print-verify-targets:
 	@printf '%s\n' $(VERIFY_TARGET_NAMES)
 
+# The MCP refuses a named run whose load deviated from the target's profile, so
+# this is what lets "proof_coverage {verify_profile: ...}" and a stored
+# conclusion mean the same thing "make verify-<name>" means. Emitted from these
+# variables rather than written by hand so it cannot drift from the recipe: the
+# fields below are the ones the shared recipe consumes.
+#
+# -nostdinc and the -isystem libc are emitted, not omitted. Without them the
+# real macOS headers win over Frama-C's modeled libc and some files parse as a
+# different program (src/syscall/sys.c is one: its rusage _Static_assert only
+# holds against the modeled header), so a consumer that could not express them
+# was loading something weaker than what make verify-<name> proves.
+
+## Print the verify_profiles JSON that frama-c-mcp loads and proves under
+print-verify-profiles:
+	@python3 scripts/emit-verify-profiles.py \
+	    --machdep '$(FRAMAC_DATA_MODEL)' \
+	    --provers '$(FRAMAC_PROVERS)' \
+	    --timeout '$(FRAMAC_TIMEOUT)' \
+	    --include-paths '$(FRAMAC_INCLUDE_DIRS)' \
+	    --force-includes '$(FRAMAC_FORCE_INCLUDES)' \
+	    --isystem-paths "$(FRAMAC_ISYSTEM_DIRS)" \
+	    $(if $(FRAMAC_NOSTDINC),--nostdinc,) \
+	    --build-gates '$(FRAMAC_BUILD_GATES)' \
+	    $(foreach t,$(VERIFY_TARGETS),--target '$(call lc,$(t))|$(VERIFY_$(t)_SRC)|$(VERIFY_$(t)_FCTS)|$(VERIFY_$(t)_MODEL)|$(VERIFY_$(t)_MIN_GOALS)|$(VERIFY_$(t)_CPP_DEFS)')
+
 # One rule template, instantiated per target. The target-specific variables
 # below are exactly what the shared recipe consumes; NAME and TARGET differ only
 # because a mutation run overrides NAME to keep concurrent logs apart.
@@ -491,6 +594,7 @@ $(VERIFY_RULES): check-stub-constants check-stub-shadow | $(BUILD_DIR)
 	    $(SRC) -wp -wp-rte -wp-model $(MODEL) \
 	    -wp-fct $(FCT_ARG) \
 	    -wp-prover $(FRAMAC_PROVERS) -wp-timeout $(FRAMAC_TIMEOUT) \
+	    $(if $(WP_CACHE),-wp-cache $(WP_CACHE),) \
 	    > $(BUILD_DIR)/verify-$(NAME).log 2>&1; \
 	python3 scripts/check-wp-result.py --status $$? \
 	    --log $(BUILD_DIR)/verify-$(NAME).log --min-goals $(MIN_GOALS) \
@@ -521,10 +625,12 @@ MUTANT_SINCE ?=
 MUTANT_TARGET ?=
 verify-mutants:
 	@echo "  MUTANT  proof targets against known-broken sources"
+	$(Q)python3 scripts/check-mutants.py --self-test
 	$(Q)python3 scripts/check-mutants.py --cc '$(CC)' \
 	    $(if $(MUTANT_JOBS),--jobs $(MUTANT_JOBS),) \
 	    $(if $(MUTANT_SINCE),--changed-since $(MUTANT_SINCE),) \
-	    $(if $(MUTANT_TARGET),--target $(MUTANT_TARGET),)
+	    $(if $(MUTANT_TARGET),--target $(MUTANT_TARGET),) \
+	    $(if $(MUTANT_ESCALATE),--escalate $(MUTANT_ESCALATE),)
 
 ## Show that no proved function depends on plain-char signedness
 #

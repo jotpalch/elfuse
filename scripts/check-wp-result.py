@@ -48,8 +48,15 @@ PROVED_GOALS = re.compile(r"^\[wp\] Proved goals: *([0-9]+) / ([0-9]+)$")
 USER_ERROR = re.compile(r"^.*User Error: *")
 
 # A function WP took on faith: it generated a spec instead of analyzing a body.
+# Frama-C words this two ways and the difference matters. "Neither code nor
+# explicit exits and terminates" leaves a hand-written assigns in force;
+# "Neither code nor specification" generates the frame too, which is the
+# stronger assumption and was the one this pattern used to miss. log_impl came
+# through that second wording, so every proof of a function that logs rested on
+# an invented assigns \nothing that no report named.
 ASSUMED = re.compile(
-    r"Neither code nor explicit .* for function ([A-Za-z_][A-Za-z_0-9]*),"
+    r"Neither code nor (?:explicit|specification).* for function "
+    r"([A-Za-z_][A-Za-z_0-9]*),"
 )
 
 # Printed verbatim under their respective banners. Kept as literal blocks

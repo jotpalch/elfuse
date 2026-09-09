@@ -607,6 +607,7 @@ waiter enqueue, so the compare-and-wait is a single critical section.
 | Sysroot snapshot | `pthread_mutex` | `src/syscall/proc-state.c` |
 | Synthetic USB tree (scratch dirs + device model) | `usb_lock` (leaf) | `src/runtime/usb-sysfs.c` |
 | usbdevfs fd side table | `usbdev_table_lock` + per-entry lock | `src/syscall/usbdev.c` |
+| usbdevfs event-thread startup (runloop + notify port) | `usbdev_loop_lock` (leaf) | `src/syscall/usbdev.c` |
 
 Lock ordering is documented inline in those files
 (`mmap_lock` is order 1, `fd_lock` is order 3, `sfd_lock` is order 5a)
@@ -987,12 +988,18 @@ the fd stays nonblocking whatever the guest asks -- and always reports 0.
 `.fasync`.
 
 Transfer memory is one allowance for everything in flight, not a per-call
-size cap: Linux charges `len + sizeof(struct urb)` against a module-global
-`usbfs_memory_mb` (16 MB) and refunds it when the transfer settles, so a
-request of exactly the allowance never fits and concurrent transfers across
-different fds contend for the same total. An atomic counter carries it here,
-charged where Linux charges it and refunded on every exit including the error
-arms. A claim that IOKit answers `kIOReturnExclusiveAccess` is `EBUSY`,
+size cap: Linux charges against a module-global `usbfs_memory_mb` (16 MB) and
+refunds when the transfer settles, so a request of exactly the allowance never
+fits and concurrent transfers across different fds contend for the same total.
+What is charged depends on the path and not on the caller: `do_proc_bulk` and
+`proc_do_submiturb` book `len + sizeof(struct urb)`, while `do_proc_control`
+books a fixed `PAGE_SIZE + sizeof(struct urb) +
+sizeof(struct usb_ctrlrequest)` whatever `wLength` says, because the kernel
+bounces every control transfer through one whole page. An atomic counter
+carries all three here, charged where Linux charges each and refunded on every
+exit including the error arms. `CONTROL` used to be outside it, which is the
+one way a guest could keep transferring after the allowance was full.
+A claim that IOKit answers `kIOReturnExclusiveAccess` is `EBUSY`,
 what Linux reports for an interface held by a kernel driver. `GETDRIVER`
 names the bound Apple driver, or `usbfs` for an interface any usbfs fd on
 this device holds, or reports `ENODATA`; a user-client child is not a driver,
@@ -1005,26 +1012,246 @@ and a dispatcher restart would send it twice.
 Known gaps at this stage, each printed as an XFAIL by
 `tests/test-usbdev-ioctl.c` rather than only written down here:
 
-- `GET_CAPABILITIES` reports 0. Every capability bit names part of the
-  SUBMITURB/REAPURB machinery, which answers `ENOTTY` here.
-- No disconnect gate. Linux answers `ENODEV` for every ioctl once the device
-  is gone; the answers served from the open-time model (`GET_SPEED`,
-  `CONNECTINFO`, `GET_CAPABILITIES`, `read()`) still report it. Noticing the
-  disconnect needs an IOKit termination notification on a run loop, which is
-  the async stage's machinery.
+- `GET_CAPABILITIES` reports `ZERO_PACKET | REAP_AFTER_DISCONNECT`, the two
+  the URB engine below honours. `BULK_CONTINUATION` stays clear because the
+  flag is accepted without its error-cascade unlink, and the two remaining
+  bits describe URB splitting IOKit does not expose.
 - Two ioctls on one fd serialize, because the entry lock is held across the
   blocking transfer. Linux drops the device lock around the URB wait.
 - `GETDRIVER` reports the IOKit class name (`AppleUSBACMControl`) where Linux
   reports the driver's name (`cdc_acm`), and `DISCONNECT_CLAIM`'s name filters
   compare against it.
-- `RESET` clears the claimed pipes' stalls and reports success instead of
-  re-enumerating the port, which would destroy the handles.
+- `RESET` kills the device's URBs and clears the claimed pipes' stalls
+  instead of re-enumerating the port, which would destroy the handles. The
+  URB kill is the half `usb_reset_device` does have; the re-enumeration is
+  the half it does not get. A per-pipe stall clear that fails is logged, not
+  returned: the clears are the substitute, and refusing a `RESET` Linux
+  performs would be the worse answer.
+- `CLEAR_HALT` and `RESETEP` cancel whatever is outstanding on the endpoint,
+  so a queued async URB there reaps `ECONNRESET`. Linux's
+  `check_reset_of_active_ep` only warns and leaves the queue alone, and
+  IOKit exposes no stall clear that does not abort the pipe. libusb calls
+  `libusb_clear_halt` between transfers, so this is reachable in ordinary
+  use.
+- The per-endpoint abort shutter (`ep_aborting`) is an invariant of the paths
+  that abort deliberately, not of the slot: `DISCARDURB` and every wholesale
+  kill raise it, `CLEAR_HALT` and `RESETEP` do not, because
+  `ClearPipeStallBothEnds` aborts the pipe as a side effect and IOKit exposes
+  no variant that does not. A queued follower can therefore be started behind
+  a stall clear's abort that is still in flight. Linux has no such shutter to
+  keep; the guest-visible half of the gap is the `ECONNRESET` row above.
+- A printer's `GET_DEVICE_ID` names its interface in the **high** byte of
+  `wIndex` and an alt setting in the low one, and `check_ctrlrecip` lets that
+  one request through untouched: it returns before the `index &= 0xff` when
+  the request type is `0xa1`, the request is `0`, and
+  `usb_find_alt_setting(actconfig, index >> 8, index & 0xff)` has class
+  `USB_CLASS_PRINTER`. Both control paths here read `wIndex & 0xff` as the
+  interface number for every non-vendor interface recipient, so on a printer
+  such a request implicitly claims the alt setting's number instead of the
+  interface's. Demonstrating it needs a printer attached, so it is recorded
+  rather than modeled.
+- A URB's `signr`, like `DISCSIGNAL`'s, is accepted, reported as success and
+  never delivered: elfuse has no async guest-signal injection from the event
+  thread.
+- `DISCARDURB` waits for IOKit's abort to settle, so a `REAPURBNDELAY`
+  issued straight afterwards finds the URB the way it does on Linux, but the
+  wait is bounded at 2 s rather than unbounded like `usb_kill_urb`.
+- `SETINTERFACE` and `SETCONFIGURATION` report `EBUSY` when that same 2 s
+  drain expires with transfers still outstanding. Linux cannot reach this:
+  `usb_kill_urb` does not give up, so the kill always finishes and the change
+  always proceeds. Both retire the handles the survivors still reference --
+  the interface's pipeRefs, and the whole pipe table -- so the two decide it
+  once, in `usbdev_drain_for_change`, rather than each on its own. A drain
+  that expires settles the slot's own counters and unlinks the survivors, and
+  then restarts every endpoint FIFO exactly as the successful path does:
+  `draining` shut all of them, including the ones the kill did not match, and
+  an endpoint whose leader completed inside the window would otherwise be left
+  with a queued URB, none in flight and nothing to restart it. The
+  process-wide byte budget is not settled there -- it accounts live memory,
+  and a survivor's buffer is still owned by an in-flight IOKit transfer, so
+  its charge is given back where the buffer is freed, in the late callback.
+  `USBDEVFS_RESET` deliberately proceeds instead: a wedged transfer is the
+  state a guest issues `RESET` to escape, and a stall clear leaves the
+  pipeRefs where they are.
 - A short bulk OUT is `EIO`: `WritePipeTO` reports no length, and reporting
   the requested count would spell a partial write as a complete one.
 - The side table holds 32 open fds per process and reports `ENOMEM` past
   that; Linux allocates a `usb_dev_state` per open and has no such limit.
 - `USBDEVFS_IOCTL DISCONNECT` of an interface another usbfs fd holds is
   `EBUSY`; Linux releases that claim and answers 0.
+
+### The URB Engine
+
+`SUBMITURB` validates the URB type and flags the way `devio.c` does, copies
+the guest buffer into a host bounce buffer on the vCPU thread, and queues
+the URB per endpoint. At most one URB per endpoint is in flight at IOKit at
+a time; later submissions queue inside elfuse and are started from the
+completion callback. The queue exists because cancellation granularity
+differs: `DISCARDURB` must kill exactly one URB, but IOKit's `AbortPipe`
+(`USBDeviceAbortPipeZero` for ep0) aborts every outstanding transfer on the
+pipe.
+
+One URB on the wire is not by itself enough. `DISCARDURB` drops
+`async_lock` to issue the abort, and in that window the target can complete
+normally and the completion callback can start the queued follower, which
+the abort then cancels instead -- measured at a handful per hundred
+thousand at natural rates, and reproducibly with the window widened, as the
+discarded URB reaping success and its innocent successor reaping
+`ECONNRESET`. The endpoint's FIFO therefore stays shut for the duration of
+the abort, and `DISCARDURB` waits for the record to leave the pending list
+before it returns. With both, a discarded URB reaps `ENOENT` and any other
+abort reaps `ECONNRESET`, mirroring `usb_kill_urb` against an async unlink.
+
+Two caps that used to be elfuse's own are gone. The 16 MB budget is one
+process-wide byte count, the way `usbfs_memory_usage` is one kernel-wide
+static, and there is no URB-count cap: a 257th eight-byte URB on one fd
+used to be `ENOMEM` against a 16 MB budget, which is exactly the ring depth
+libusb's async API builds for bulk streaming. A URB's record is charged
+alongside its buffer, so zero-length URBs are bounded too.
+
+Completions land on one lazily-started host thread driving a CFRunLoop --
+the first CFRunLoop in the codebase -- fed by
+`CreateDeviceAsyncEventSource` / `CreateInterfaceAsyncEventSource`, which
+is libusb's own darwin model. The teardown discipline is inherited from
+netlink's blocking-recv rule (netlink.c): no host thread ever touches
+guest memory. The
+callback moves only usbdev-owned host memory (fd slots, URB records, the
+completion pipe); copy-in at submit and copy-out at reap both run on the
+vCPU thread. That is what makes the thread safe across `execve` and guest
+teardown, so it is started once and never joined.
+
+`REAPURB` blocks in `io_wait_fd_or_interrupted` on the completion pipe and
+copies the result out on the vCPU thread. What that pipe carries is a level,
+not a running count: it holds exactly one byte while the fd has a completion
+to hand back or has been disconnected, and none otherwise, restored under
+`async_lock` by every path that can move either term. A byte per completion
+would not survive the absence of a URB-count cap -- a zero-length URB costs
+only its record against the 16 MB budget, so far more records fit than the
+pipe has room for bytes, and a byte that does not fit would leave its record
+reapable with nothing readable behind it. The `actual_length` it reports is
+clamped to the buffer the guest submitted, the way every Linux HCD bounds
+`urb->actual_length` by `transfer_buffer_length`; IOKit's transferred count is
+a device-supplied number and is not passed through. A signal interrupts it
+with `EINTR` and `syscall_restart_forbid()`, because Linux's reap path does
+not restart. `REAPURBNDELAY` reports `EAGAIN` when nothing has completed.
+`ZERO_PACKET` on a maxpacket-multiple OUT emits the trailing zero-length write
+from the completion callback, and `SHORT_NOT_OK` turns a short IN into
+`EREMOTEIO` at completion.
+
+### Poll Semantics
+
+usbfs readiness is inverted relative to a pipe: `POLLOUT` means "completed
+URBs are reapable", and `POLLIN` is never signaled. The completion pipe's read
+end raises host `POLLIN`, so `ppoll` and `pselect6` remap it to the
+guest-visible `POLLOUT | POLLWRNORM`, and epoll registers `EVFILT_READ` on the
+pipe but reports `EPOLLOUT`, through a per-registration flag. The host
+interest is always armed, whatever events the guest asked for: a disconnected
+device raises the unmaskable `POLLERR | POLLHUP`, and the pipe is the only
+wake source that reaches a read-only waiter. Disconnect raises the readiness
+level and nothing lowers it again, which is what a sticky `POLLERR | POLLHUP`
+needs. Because the level is one token rather than a count, an `EPOLLET`
+registration is edged once per rise rather than once per completion. A
+consumer that reaps to `EAGAIN` sees no difference, which is the contract
+`EPOLLET` states and the one `tests/test-epoll-edge.c` pins; one that reaps a
+single URB per wake and re-arms would wait here where Linux, whose usbfs wakes
+the wait queue once per completion, fires again. Stated rather than tested:
+reaching it needs a guest that breaks the `EPOLLET` contract. A wake that maps
+to nothing guest-visible re-blocks: the woken entry's host interest is
+withdrawn for the rest of the call (unreaped completions keep the pipe
+readable, so leaving it armed would busy-spin), the wait resumes in bounded
+slices that re-check the lock-free disconnect map, and epoll additionally
+re-adds a fired `EV_ONESHOT` knote disabled so a wake the guest never saw
+cannot consume an `EPOLLONESHOT` arm. epoll_wait therefore never returns 0
+before its timeout, matching Linux `ep_poll`. Undoing those mutes on the way
+out reads the registration and applies the knote change in one step under the
+instance lock: with the lock dropped in between, a concurrent `EPOLL_CTL_MOD`
+could re-arm the registration after the delete had been decided on, and the
+`EV_DELETE` then retired the knote that `MOD` had just installed, leaving an
+active registration with nothing behind it.
+
+### Disconnect And Fork
+
+An `IOServiceAddInterestNotification` on the runloop (or
+`kIOReturnNoDevice` from any op) marks **every** usbfs fd open on that device
+disconnected, not only the one that noticed: poll reports
+`POLLERR | POLLHUP`, `REAPURB` hands back every URB and then reports `ENODEV`, and every other
+ioctl reports `ENODEV` -- the usbfs disconnect contract. The cross-fd half of
+it is what `usbdev_remove` does by walking `udev->filelist`, and it has to be
+a walk here for the same reason: a device is gone for every consumer of it at
+once, and a second fd on the node has nothing of its own that would find out.
+"Every URB" is what
+`CAP_REAP_AFTER_DISCONNECT` promises and what `usbdev_remove` delivers by
+running `destroy_all_async` before it wakes the reapers; IOKit completes
+nothing of its own when a device terminates, so the first reap that finds
+the completion list empty on a disconnected fd issues the kill itself. Only a
+blocking `REAPURB` waits for that kill to settle. `REAPURBNDELAY` issues the
+same aborts and returns `ENODEV` straight away, the answer
+`proc_reapurbnonblock` gives, and the URBs the aborts recover become reapable
+behind it: a non-blocking ioctl that sat out the two-second drain deadline
+holding the fd's `async_lock` against every `SUBMITURB` and `DISCARDURB` was
+the worse half of the contract.
+
+The
+refcon that carries the disconnect notification packs the slot index in a
+field sized from the slot table, not in a hand-written four bits: with 32
+slots and four bits, slot 16+k decoded as slot k, so half the table never
+saw a disconnect and the other half could be marked gone while attached. Across `fork` the fd is dropped and the child sees
+`EBADF`, like `FD_NETLINK` and `FD_INOTIFY` today: IOKit plugin handles
+are Mach-port-backed and cannot cross the `posix_spawn` that implements
+fork.
+
+### Testing The Engine Without Hardware
+
+IOKit publishes no loopback device, so the async engine had no in-tree lane at
+all: `ELFUSE_USB_FIXTURE`'s devices have no IOKit service behind them and stop
+at `SUBMITURB`'s argument gate. `ELFUSE_USB_FIXTURE=loopback` adds one that
+does, by substituting at the narrowest place that leaves every layer above it
+real: the two COM vtables. Every wire call in `usbdev.c` goes through
+`IOUSBDeviceInterface650 **` or `IOUSBInterfaceInterface800 **` as
+`(*h)->Method(h, ...)`, so `src/syscall/usbdev-fixture.c` hands back an object
+whose first member is a vtable of the same shape and nothing above it changes.
+The URB records, the per-endpoint FIFO, the completion callback, `urb_status`,
+the ZLP predicate, the readiness and disconnect maps, `REAPURB`, the drain and
+all of `poll.c` are the same code that runs against a board. Completions arrive
+from a one-shot `CFRunLoopTimer` on the event thread, which is where
+`IODispatchCalloutFromCFMessage` would have delivered them.
+
+What the fixture does is a script rather than a flag:
+`ELFUSE_USB_LOOPBACK=ep02:delay(80),ok;ep81:short(8)` and the rest of the
+vocabulary in `src/syscall/usbdev-fixture.c` name the `IOReturn` each outcome
+stands for, and a guest can rewrite the script, read back a log of what crossed
+the seam and terminate the device through vendor control requests. The log is
+what makes the `ZERO_PACKET` trailing packet observable rather than inferred.
+
+The seam is five `if (u->fake)` branches, one has-device probe and one bind
+call in `usbdev.c`, all behind a mode resolved once per process, and the flag
+is set only for the one location the fixture models -- so the other fixture modes, and every real
+device, take the paths they took before. `make test-usbdev-ioctl-loopback` is
+the standing check on that: the fd-contract lane must answer the same thing
+with the loopback device present as without it.
+
+None of that is in the shipped binary. `src/syscall/usbdev-fixture.c` is a
+translation unit under `src/` that only an assertion has a use for, so the
+default build links `src/syscall/usbdev-fixture-stub.c` in its place: the same
+seven entry points, answering `false` and `-ENODEV`, 44 bytes of text against
+the model's 10 KB. `USB_LOOPBACK_FIXTURE=1` swaps the two, and the two loopback
+lanes get their binary that way, as `build/elfuse-loopback`, while `make`
+leaves `build/elfuse` without it. Which object defines the seam is the whole
+difference between the two builds: not one branch in `usbdev.c` is
+conditionally compiled, so the fixture cannot drift into code the default build
+never compiles, and the default build still pays the branch that keeps the
+fixture off every path it must not touch.
+
+### Deviations From Linux
+
+| usbfs behavior | elfuse behavior |
+|---|---|
+| `RESET` re-enumerates the device | clears the claimed pipes' stall state and returns 0; `USBDeviceReEnumerate` would tear down every open plugin handle |
+| isochronous URBs | `EINVAL` |
+| `DISCSIGNAL` delivers a signal on disconnect | signal and context stored, never delivered |
+| sync `BULK` on an interrupt endpoint works (converted to an interrupt URB) | `EINVAL`; the conversion exists only on the async URB path |
+| `BULK_CONTINUATION` unlinks the rest of the cascade on error | flag accepted, no cascade unlink |
+| `dup` of a usbfs fd works | `EBADF` |
 
 ## procfs And Device Emulation
 
@@ -1752,16 +1979,17 @@ arguments arriving as guest-controlled integers.
 
 ### What Defects Surface In Practice
 
-One worked example, from the loader. `elf_load_fd` saturates `load_max` to
-`UINT64_MAX` when `p_vaddr + p_memsz` overflows (`src/core/elf.c`). For
-`ET_EXEC` the saturation does its job: the fits-in-guest check in
-`src/syscall/exec.c` sees `UINT64_MAX` and rejects the image. For `ET_DYN`
-that check first adds `PIE_LOAD_BASE`, and the sum wraps to `0x3FFFFF`, which
-passes. Nothing lands out of bounds, because `elf_map_segments_fd`
-bounds-checks every segment against `guest_size`. What moves is the
-rejection: it lands at a call site past the `execve` point of no return,
-turning a recoverable `-ENOEXEC` into a fatal exec. Guarding it takes an
-explicit checked add where `load_max` meets the load base.
+One worked example, from the loader. A PT_LOAD whose `p_vaddr + p_memsz`
+overflows is rejected where it is parsed, by the checked `elf_add_no_wrap`
+(`src/core/elf.c`), and `verify-elf` discharges that arithmetic as a proof
+obligation. Saturating `load_max` to `UINT64_MAX` is the alternative that does
+not hold: every consumer adds a load base to it before comparing against
+`guest_size`, so the clamp relocates the wrap into the consumer, where the
+bound check it was meant to trip reads `elf_end > guest_size` and passes.
+Where the image lands is a separate question, checked per segment by
+`elf_place_segment` under `elf_check_placement`, which `sys_execve` calls
+before its point of no return so an unplaceable image is a recoverable
+`-ENOEXEC` rather than a fatal exec.
 
 The class of defect is the point. That is integer arithmetic, not memory
 safety. Rust's `+` wraps silently in release builds too, so the same checked
@@ -1774,22 +2002,53 @@ It is a property of how the loader is structured.
 
 ### Verification Actually In Place
 
-No formal-methods gate exists today. What gates CI is language-independent
-tooling: `clang-format`, a banned-API and unsafe-preprocessor scan,
-`cppcheck`, and the dispatch-table consistency check on Linux; `scan-build`
-as an advisory job; `clang-tidy` advisory except for
-`readability-function-size`, which is named in `WarningsAsErrors` and fails
-the job when a function crosses its ceiling; an Infer run that fails on any
-finding;
-and a runtime matrix under ASAN, UBSAN, and TSAN (see [Testing And
-Confidence](#testing-and-confidence)).
+The language-independent tooling gates CI: `clang-format`, a banned-API and
+unsafe-preprocessor scan, `cppcheck`, and the dispatch-table consistency check
+on Linux; `scan-build` as an advisory job; `clang-tidy` advisory except for
+`readability-function-size`, which is named in `WarningsAsErrors` and fails the
+job when a function crosses its ceiling; an Infer run that fails on any
+finding; and a runtime matrix under ASAN, UBSAN, and TSAN (see [Testing And
+Confidence](#testing-and-confidence)). That catches memory-safety defects after
+the fact rather than excluding them by construction, which is the honest cost
+of the choice.
 
-That catches memory-safety defects after the fact rather than excluding them
-by construction, which is the honest cost of the choice. The improvement
-worth pursuing on this surface is a proof obligation over the ELF parser
-rather than another runtime check, because a guest-triggerable abort inside a
-VMM is a denial of service, and a language that panics on bad input does not
-address that.
+The formal layer proves each selected function body free of arithmetic runtime
+errors, assuming its stated preconditions. `.github/workflows/verify.yml` runs
+the targets a change can move, split between a proof leg and a per-target
+mutation matrix, with a final job that requires both halves; `make verify`
+runs the whole set locally. Each target names a function set and discharges
+its obligations with `-wp-rte`, which adds the implicit runtime-error goals
+(overflow, out-of-bounds, invalid dereference) that the ACSL contracts alone
+leave open.
+`verify-elf` covers the named arithmetic helpers in `src/core/elf.c`, not
+`elf_load_fd`, `elf_map_segments_fd`, or their call-site preconditions; the
+others cover the bounds math of the remaining attacker-facing parsers and
+packers.
+
+Two shapes, and `mk/verify.mk` is the list that says which one a target is.
+Most name functions in a header under `src/proved/`, which is what lets one
+`.c` file's arithmetic be proved while the rest of that file stays unparsable
+to the analyzer. A few name functions in a `.c` file directly, so the loops
+are proved as written rather than as a copy of the math.
+
+Four gates close the ways a proof can say less than it appears to:
+
+- `scripts/check-proof-targets.py` (in `make check`): nothing lands in
+  `src/proved/` without a proof target.
+- `scripts/check-acsl-coverage.py`: a contracted function left out of the
+  proof set is an assumed axiom, so the target fails rather than trusting it.
+- `make verify-mutants`: each target must reject a known-broken source, which
+  is what catches a contract whose clauses do not bite.
+- `make check-contracts`: rebuilds with `-DELFUSE_CONTRACT_ASSERT` so the
+  expressible preconditions of `proved/gva.h` are checked on every call the
+  suite makes, since `src/core/guest.c` does not parse under the analyzer and
+  nothing else checks its call sites.
+
+What the proofs do not cover: the I/O around the proved arithmetic (`pread`,
+`malloc`) stays test-covered, and preconditions at call sites in files the
+analyzer cannot parse are review-only. `frama-c-stubs/` supplies the Darwin
+declarations the analyzer needs, held to the SDK's own values by
+`scripts/check-stub-constants.py`.
 
 ### Host Interface Surface
 
@@ -1818,6 +2077,10 @@ layers for that surface.
 - `make test-matrix` -- cross-checks elfuse (aarch64), QEMU (aarch64),
   and elfuse (x86_64-via-Rosetta) on overlapping corpora, with per-host
   baselines for the Rosetta branch.
+- `make verify` and `make verify-mutants`: the Frama-C WP proof targets, and
+  the assertion that each of them rejects a known-broken source. Run the two
+  together, and not beside a timing lane, because both fan out and the timed
+  lanes fail under the load they create.
 
 The rule for contributors is simple: match the validation depth to the
 subsystem you changed. Procfs, process state, dynamic linking, and

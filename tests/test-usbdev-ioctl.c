@@ -99,6 +99,7 @@ static long pwritev2_raw(int fd,
 #define USBDEVFS_CONNECTINFO 0x40085511u
 #define USBDEVFS_IOCTL 0xc0105512u
 #define USBDEVFS_SUBMITURB 0x8038550au
+#define USBDEVFS_REAPURBNDELAY 0x4008550du
 #define USBDEVFS_GET_CAPABILITIES 0x8004551au
 #define USBDEVFS_DISCONNECT_CLAIM 0x8108551bu
 #define USBDEVFS_GET_SPEED 0x0000551fu
@@ -133,6 +134,26 @@ struct disconnect_claim {
     unsigned int interface, flags;
     char driver[256];
 };
+
+/* struct usbdevfs_urb; the ioctl encodes 0x38 = 56 bytes of it. */
+struct usburb {
+    unsigned char type, endpoint;
+    int status;
+    unsigned int flags;
+    void *buffer;
+    int buffer_length, actual_length, start_frame, number_of_packets;
+    int error_count;
+    unsigned int signr;
+    void *usercontext;
+};
+
+#define URB_TYPE_ISO 0
+#define URB_TYPE_INTERRUPT 1
+#define URB_TYPE_CONTROL 2
+#define URB_TYPE_BULK 3
+
+/* USBFS_XFER_MAX (devio.c:140). */
+#define URB_XFER_MAX (0xffffffffu / 2u - 1000000u)
 
 /* ioctl(2) collapses every failure onto -1; the assertions below are about
  * which errno, so report it as a negative value the way the kernel does.
@@ -763,6 +784,86 @@ static void check_retire_window_race(void)
     printf("  slots: %d before, %d after\n", before, after);
 }
 
+/* proc_do_submiturb's argument order, which is not do_proc_bulk's.
+ *
+ * The synchronous ioctl above resolves the endpoint before it looks at the
+ * length, and the assertions in check_endpoint_arguments pin that. SUBMITURB
+ * runs the same two checks the other way round: devio.c:1631-1658 rejects the
+ * flags mask and USBFS_XFER_MAX first, and only then calls findintfep, so a
+ * length past the bound outranks a missing endpoint and everything else does
+ * not. The async path was first written with the synchronous order and answered
+ * -EINVAL for four requests Linux rejects by endpoint, and had no XFER_MAX
+ * bound at all -- on the default control pipe, where no endpoint lookup runs, a
+ * 2 GB URB was accepted outright.
+ *
+ * All of it is decided before any transfer, so the fixture reaches every case.
+ */
+static void check_urb_arguments(void)
+{
+    printf("\ntest-usbdev-ioctl: SUBMITURB argument order\n");
+    int fd = open(NODE, O_RDWR);
+    if (fd < 0) {
+        TEST("open for the URB arguments");
+        FAIL("open");
+        return;
+    }
+    char scratch[64];
+    struct usburb u = {.type = URB_TYPE_BULK,
+                       .endpoint = 0x05, /* absent on the modeled device */
+                       .buffer = scratch,
+                       .buffer_length = 8};
+
+    TEST("an undefined URB flag outranks the endpoint");
+    u.flags = 0x100u;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb flag 0x100");
+    TEST("ISO_ASAP on a bulk URB outranks the endpoint");
+    u.flags = 0x02u;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb ISO_ASAP");
+    u.flags = 0;
+
+    TEST("a length past USBFS_XFER_MAX outranks the endpoint");
+    u.buffer_length = 0x7fffffff;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb INT_MAX");
+    TEST("exactly USBFS_XFER_MAX is EINVAL");
+    u.buffer_length = (int) URB_XFER_MAX;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb XFER_MAX");
+    TEST("a negative length is EINVAL");
+    u.buffer_length = -1;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb -1");
+
+    TEST("a null buffer with a positive length outranks the endpoint");
+    u.buffer = NULL;
+    u.buffer_length = 64;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb null buffer");
+    u.buffer = scratch;
+
+    TEST("an absent endpoint outranks an unknown transfer type");
+    u.type = 99;
+    u.buffer_length = 8;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -ENOENT, "urb type 99 ep 0x05");
+    TEST("an absent endpoint outranks the ISO rejection");
+    u.type = URB_TYPE_ISO;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -ENOENT, "urb iso ep 0x05");
+    TEST("an absent endpoint outranks the control setup-length check");
+    u.type = URB_TYPE_CONTROL;
+    u.buffer_length = 4;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -ENOENT, "urb control ep 0x05");
+    TEST("a reserved-bit endpoint is EINVAL");
+    u.endpoint = 0x30;
+    u.buffer_length = 8;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb ep 0x30");
+
+    /* The default control pipe skips the endpoint lookup (devio.c:1648), so the
+     * length bound is the only thing between this request and a 2 GB
+     * allocation.
+     */
+    TEST("the default control pipe still honours USBFS_XFER_MAX");
+    u.endpoint = 0;
+    u.buffer_length = 0x7fffffff;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb ep0 INT_MAX");
+    close(fd);
+}
+
 static void check_answers_without_a_device(void)
 {
     printf("\ntest-usbdev-ioctl: what is answered from the model\n");
@@ -773,12 +874,13 @@ static void check_answers_without_a_device(void)
         return;
     }
 
-    /* Every capability bit names part of the URB machinery this stage answers
-     * ENOTTY for, so the word is 0 until that machinery lands.
+    /* The capability word names exactly what the URB engine honours:
+     * ZERO_PACKET and REAP_AFTER_DISCONNECT. BULK_CONTINUATION is accepted
+     * without its error-cascade unlink, so its bit stays clear.
      */
     uint32_t caps = 0xffffffffu;
-    TEST("GET_CAPABILITIES reports no URB capabilities");
-    EXPECT_TRUE(io(fd, USBDEVFS_GET_CAPABILITIES, &caps) == 0 && caps == 0,
+    TEST("GET_CAPABILITIES names what the URB engine honours");
+    EXPECT_TRUE(io(fd, USBDEVFS_GET_CAPABILITIES, &caps) == 0 && caps == 0x11u,
                 "caps");
 
     TEST("GET_SPEED returns the enum as its value");
@@ -796,10 +898,10 @@ static void check_answers_without_a_device(void)
     TEST("an unknown ioctl is ENOTTY");
     EXPECT_EQ(io(fd, 0x00005563u /* _IO('U', 99) */, NULL), -ENOTTY,
               "unknown ioctl");
-    TEST("SUBMITURB is ENOTTY at this stage");
-    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, NULL), -ENOTTY, "submiturb");
-    TEST("DISCARDURB is ENOTTY at this stage");
-    EXPECT_EQ(io(fd, USBDEVFS_DISCARDURB, NULL), -ENOTTY, "discardurb");
+    TEST("SUBMITURB refuses an unreadable URB");
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, NULL), -EFAULT, "submiturb");
+    TEST("DISCARDURB of an unknown URB is EINVAL");
+    EXPECT_EQ(io(fd, USBDEVFS_DISCARDURB, NULL), -EINVAL, "discardurb");
 
     /* Everything that has to reach the wire says so, with the errno Linux uses
      * for a device that is not there.
@@ -1121,6 +1223,79 @@ static void check_close_identity(void)
            CHURN_ROUNDS, churn_bad);
 }
 
+/* A non-blocking reap whose fd number is closed and reopened between the
+ * fd-table window the pass takes and the side-table lookup that has to answer
+ * for it.
+ *
+ * Those were two windows: an fd_snapshot in the reap, and another one inside
+ * usbdev_acquire proving the generation against its own read. A close and
+ * reopen in between satisfied the second and not the first, so the pass ran on
+ * the new description's side-table entry while still holding the old one's
+ * readiness pipe -- it settled the readiness level on, and a blocking reap
+ * would have parked on, whatever host fd had taken that number. One window
+ * answers for one open file description, and the reopened fd is not that
+ * description, so the pass belongs to nothing: EBADF, the answer this side
+ * table already gives a generation mismatch.
+ *
+ * The window is a few instructions wide unaided, so this runs under
+ * ELFUSE_USBDEV_REAP_DELAY_US. The reopen names the other bus for the reason
+ * the publish race does: two entries describing one device are
+ * indistinguishable by anything the guest can read.
+ */
+static void check_reap_window_race(void)
+{
+    printf("\ntest-usbdev-ioctl: a close and reopen inside the reap window\n");
+    int before = count_table_slots();
+    int fd = open(NODE, O_RDWR);
+    if (fd < 0) {
+        TEST("an fd to reap on");
+        FAIL("open");
+        return;
+    }
+
+    /* Nothing has been submitted, so an undisturbed pass is EAGAIN: the device
+     * is reachable and has nothing to hand back. That is the answer the race
+     * has to change, and the answer the two-window form kept giving -- from the
+     * wrong description.
+     */
+    void *out = NULL;
+    TEST("an undisturbed non-blocking reap is EAGAIN");
+    EXPECT_EQ(io(fd, USBDEVFS_REAPURBNDELAY, &out), -EAGAIN, "quiet reap");
+
+    race_fd = fd;
+    race_sibling = -1;
+    race_reopen_node = OTHER_NODE;
+    pthread_t t;
+    if (pthread_create(&t, NULL, race_closer, NULL) != 0) {
+        TEST("closer thread for the reap race");
+        FAIL("pthread_create");
+        close(fd);
+        return;
+    }
+    long r = io(fd, USBDEVFS_REAPURBNDELAY, &out);
+    pthread_join(t, NULL);
+    race_reopen_node = NULL;
+    int sib = race_sibling;
+
+    TEST("the reopen took the number the close freed");
+    EXPECT_TRUE(sib == fd, "same fd number");
+    TEST("the reap answers for no description, not for the new one");
+    EXPECT_EQ(r, -EBADF, "reap across the swap");
+
+    /* The description that owns the number now is untouched by any of it. */
+    TEST("the reopened fd answers for the device it was opened on");
+    EXPECT_EQ(fd_vid(sib), OTHER_VID, "idVendor");
+    TEST("and its own reap is the quiet EAGAIN");
+    EXPECT_EQ(io(sib, USBDEVFS_REAPURBNDELAY, &out), -EAGAIN, "sibling reap");
+
+    if (sib >= 0)
+        close(sib);
+    int after = count_table_slots();
+    TEST("neither entry leaks its slot");
+    EXPECT_EQ(after, before, "slots after the race");
+    printf("  slots: %d before, %d after\n", before, after);
+}
+
 /* Deviations this stage keeps deliberately: printed with both values so the gap
  * is in the lane's output rather than only in the commit message.
  */
@@ -1131,18 +1306,41 @@ static void print_known_gaps(void)
     if (fd >= 0) {
         long r = io(fd, USBDEVFS_RESET, NULL);
         printf(
-            "  XFAIL reset: Linux re-enumerates the port, elfuse clears "
-            "claimed pipes' stalls and returns %ld\n",
+            "  XFAIL reset: Linux re-enumerates the port, elfuse kills the "
+            "device's URBs and clears claimed pipes' stalls, logging rather "
+            "than reporting a clear that fails, and returns %ld\n",
             r);
-        long speed = io(fd, USBDEVFS_GET_SPEED, NULL);
-        printf(
-            "  XFAIL disconnect-gate: Linux answers ENODEV for every ioctl "
-            "once the device is gone, elfuse still serves GET_SPEED, "
-            "CONNECTINFO, GET_CAPABILITIES and read() from the open-time "
-            "model (GET_SPEED here: %ld)\n",
-            speed);
         close(fd);
     }
+    printf(
+        "  XFAIL clear-halt-collateral: Linux warns and leaves a queued URB on "
+        "the endpoint alone (check_reset_of_active_ep, devio.c:1379-1391), "
+        "elfuse has only ClearPipeStallBothEnds, which aborts the pipe, so "
+        "CLEAR_HALT and RESETEP make an in-flight URB reap -ECONNRESET\n");
+    printf(
+        "  XFAIL clear-halt-shutter: Linux has no per-endpoint abort shutter "
+        "to keep, elfuse keeps one (ep_aborting) on DISCARDURB and on every "
+        "wholesale kill and does not raise it for CLEAR_HALT or RESETEP, so a "
+        "queued follower there can be started behind a stall clear's abort "
+        "that is still in flight\n");
+    printf(
+        "  XFAIL printer-device-id: Linux lets a printer's GET_DEVICE_ID "
+        "through untouched, reading wIndex as interface<<8|altsetting when "
+        "usb_find_alt_setting(actconfig, wIndex >> 8, wIndex & 0xff) is "
+        "USB_CLASS_PRINTER (check_ctrlrecip, devio.c), elfuse reads "
+        "wIndex & 0xff as the interface number for every non-vendor interface "
+        "recipient and implicitly claims that one\n");
+    printf(
+        "  XFAIL urb-signal: Linux raises the URB's signr at completion "
+        "(kill_pid_usb_asyncio, devio.c:657) and DISCSIGNAL's at disconnect, "
+        "elfuse accepts both, returns 0 and delivers neither\n");
+    printf(
+        "  XFAIL iso: Linux serves isochronous URBs, elfuse answers EINVAL "
+        "once the endpoint has resolved\n");
+    printf(
+        "  XFAIL discard-latency: Linux's usb_kill_urb returns with the URB "
+        "already completed, elfuse waits for IOKit's abort callback and gives "
+        "up after 2s rather than parking the vCPU thread\n");
     printf(
         "  XFAIL driver-name: Linux GETDRIVER reports the driver's name "
         "(cdc_acm), elfuse reports the IOKit class (AppleUSBACMControl), and "
@@ -1194,6 +1392,11 @@ int main(void)
         SUMMARY("test-usbdev-ioctl");
         return fails > 0 ? 1 : 0;
     }
+    if (getenv("ELFUSE_USBDEV_REAP_DELAY_US")) {
+        check_reap_window_race();
+        SUMMARY("test-usbdev-ioctl");
+        return fails > 0 ? 1 : 0;
+    }
     if (!strcmp(mode, "badifnum")) {
         check_malformed_interface_number();
         SUMMARY("test-usbdev-ioctl");
@@ -1206,6 +1409,7 @@ int main(void)
     check_interface_bound();
     check_endpoint_arguments();
     check_offset_and_vector_edges();
+    check_urb_arguments();
     check_answers_without_a_device();
     check_vfs_ioctls();
     check_access_mode_three();

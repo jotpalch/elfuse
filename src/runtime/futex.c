@@ -332,6 +332,20 @@ static inline unsigned futex_hash(uint64_t uaddr)
     return futex_bucket_index(uaddr, FUTEX_BUCKETS);
 }
 
+/* Linux requires a futex word to be naturally aligned, and every op checks this
+ * before the address reaches a bucket. Stated as a contract because without one
+ * a widened or narrowed mask breaks no obligation: the proof would pass on a
+ * body it never constrained, and the mutation gate would have nothing to
+ * reject.
+ *
+ * The ensures is in the bit domain rather than the more readable "uaddr % 4 ==
+ * 0" because the prover times out bridging modulo and bitmask on a 64-bit
+ * value. Measured at the 30s budget, and a fresh cache does not help.
+ */
+/*@
+  assigns \nothing;
+  ensures \result <==> (uaddr & 0x3) == 0;
+ */
 static inline bool futex_uaddr_is_aligned(uint64_t uaddr)
 {
     return (uaddr & 0x3) == 0;

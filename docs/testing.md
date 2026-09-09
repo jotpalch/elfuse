@@ -81,6 +81,7 @@ make check
 make test-rosetta-all
 make test-gdbstub
 make test-matrix
+make verify
 make lint
 make clean
 ```
@@ -91,11 +92,34 @@ What they do:
 - `make check`: fast elfuse-internal gate. Runs, in order:
   - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
     entry without a direct or aliased test reference fails the build
+  - `scripts/check-eintr-contract.py` so a new interruptible wait fails
+    the build until it states whether it may be restarted (`forbids`,
+    `restartable`, or `not-a-wait`), with the `forbids` claims checked
+    against the source
   - `scripts/check-lock-order.py` so a new file-scope `pthread_mutex_t`
     or `pthread_rwlock_t` that the lock-ordering block at the top of
     `src/syscall/internal.h` does not name fails the build. Membership
     only: whether the lock belongs in the ordered list or the leaf list
     stays a judgement for review
+  - `scripts/check-atomics.py` so a C11 atomic call written without its
+    `_explicit` form, or a `__atomic_*` / `__sync_*` builtin, fails the
+    build. Plain-operator access to an `_Atomic` object needs the
+    declarations resolved and stays a review question
+  - `scripts/check-ascii.py` so a source file carrying non-ASCII outside
+    the comment-diagram set fails the build
+  - `scripts/check-svc-tails.py` so an HVC #5 return tail cannot reach EL0
+    without the X7 ptrace test
+  - `scripts/check-skill-refs.py` so a path, make target, or docs section
+    a skill names that no longer resolves fails the build
+  - `scripts/check-proof-targets.py` so a header added under `src/proved/`
+    with no proof target fails here rather than on the branch later. It
+    asks make for the target list, which is the point: a `VERIFY_<T>_SRC`
+    block written below the `:=` that builds `VERIFY_TARGETS` parses fine
+    and generates no rule
+  - the two harness self-tests, `test-config` (that `tests/test-config.sh`
+    keeps its CLI mode separate from its sourced mode) and `test-runner`
+    (the shared shell runner's output matching and exit-status checks), so
+    the harness is known good before any lane leans on it
   - the unit suite from `tests/manifest.txt` -- deliberately narrow: the
     elfuse-internal implementation tests with no real Linux counterpart (the
     EL1 shim fast-path suite, `test-mremap-infra`, `test-mremap-fork-tracking`,
@@ -181,6 +205,21 @@ What they do:
   assembled from the rebuilt binaries. It also runs as a lane of `make check`.
 - `make test-matrix`: cross-check `elfuse` (aarch64), QEMU (aarch64),
   and `elfuse` (x86_64-via-Rosetta) on overlapping corpora
+- `make verify`: every Frama-C WP proof target, one `frama-c` process each
+  and parallel by default (`VERIFY_JOBS=1` for serial). Each target names a
+  function set and discharges its obligations under `-wp-rte`; `mk/verify.mk`
+  is the target list and records the data model and memory model each one
+  assumes. Needs `opam install frama-c` plus `why3 config detect`; without
+  the latter WP aborts with "Prover not found" instead of reporting unproved
+  goals. `make verify-<name>` runs one target
+- `make verify-mutants`: assert every proof target rejects a known-broken
+  source, so a contract whose clauses do not bite fails. `MUTANT_TARGET=<name>`
+  narrows it to one target, `MUTANT_SINCE=<ref>` to what a branch touched, and
+  `MUTANT_JOBS=N` overrides the one-per-core default
+- `make check-contracts`: rebuild with `-DELFUSE_CONTRACT_ASSERT` so the
+  expressible `proved/gva.h` preconditions are checked on every call the suite
+  makes. Separate from `make check` because those checks sit on the
+  `guest_read` / `guest_write` hot path
 - `make lint`: static analysis through `clang-tidy`
 
 ## Quick Iteration
@@ -454,6 +493,7 @@ environment hook, read once and with no effect at all when unset:
 | `ELFUSE_USBDEV_OPEN_FAULT=info\|blob\|pipe` | fails one step of a usbdevfs open: the model lookup or the descriptor copy with `ENOMEM`, the readiness pipe with `ENFILE` | `test-usbdev-faults` |
 | `ELFUSE_USBDEV_PUBLISH_DELAY_US=N` | widens the window between `fd_alloc` publishing a usbdevfs fd and the side table binding it, where a close finds no entry | `test-usbdev-faults` |
 | `ELFUSE_USBDEV_RETIRE_DELAY_US=N` | widens the window between the side table binding a usbdevfs fd and the open's recheck, where a close can reap the entry and a sibling open can take its slot | `test-usbdev-faults` |
+| `ELFUSE_USBDEV_REAP_DELAY_US=N` | widens the window between the fd-table snapshot a `REAPURB` pass takes and the side-table entry it settles readiness on, where a close and reopen can swap the description underneath it | `test-usbdev-faults` |
 
 `ELFUSE_USB_FIXTURE` is the same shape pointing at enumeration rather than
 failure: it stands a deterministic synthetic USB tree up in place of whatever
@@ -476,7 +516,7 @@ The lanes these drive:
 | `test-dir-union-alias` | every route to a second fd on one description shares one position and one union state |
 | `test-dir-fd-budget-union` | a union directory fd costs one host descriptor, like a plain one |
 | `test-fstatfs-fd-identity` | `fstatfs` answers for the descriptor it pinned, not for the fd number |
-| `test-usbdev-faults` | an interface number wider than the table that indexes it, each open-time failure reported as itself, and a close inside the fd publish window leaking nothing |
+| `test-usbdev-faults` | an interface number wider than the table that indexes it, each open-time failure reported as itself, a close inside the fd publish window leaking nothing, and a reap that answers for the description it snapshotted rather than the fd number |
 
 Two lanes carry rows that are recorded rather than asserted, and print as
 `XFAIL`. An `XFAIL` row is a measured Linux value the build knowingly does not
@@ -494,6 +534,67 @@ answers with its primary alone, because the backing half belongs to a stream
 that has gone. Both rows are load-bearing in pairs -- neither number alone
 separates the answers the site could give -- so both are printed.
 
+USB-layer coverage is split by what it needs. `test-uevent-socket` needs no
+hardware and runs in the matrix like any other unit test, and so do the two
+usbdevfs lanes: `test-usbdev-ioctl` drives the fd against
+`ELFUSE_USB_FIXTURE`, whose devices are modeled but have no IOKit service
+behind them, and `test-usbdev-urb-host` is a native binary over
+`src/syscall/usbdev-urb.h`, the URB bookkeeping that is decided before any
+transfer -- the disconnect-watch refcon, `SUBMITURB`'s argument gate, the
+transferred-count clamp, the `ZERO_PACKET` predicate and the endpoint start
+gate. That header exists because the fixture stops at the argument gate: the
+async engine's first review found five defects in code no lane executed, and
+the arithmetic half of it is testable on any machine.
+
+`test-usbdev-urb-loopback` covers the other half. IOKit publishes no loopback
+device, so the fixture becomes one: `ELFUSE_USB_FIXTURE=loopback` substitutes
+for the two IOKit COM vtables and for nothing above them (see
+[internals.md](internals.md#testing-the-engine-without-hardware)), which puts
+submit, the per-endpoint queue, the completion callback on the event thread,
+`DISCARDURB`, `REAPURB` blocking and non-blocking, poll and epoll readiness,
+the `CAP_REAP_AFTER_DISCONNECT` drain and the `ZERO_PACKET` trailing packet
+under assertion on any machine. The `wedge` script step adds the transfer
+whose abort outlives the engine's 2 s drain deadline, which is what puts the
+orphaning path and the two ioctls that refuse on it under assertion too;
+nothing else in the vocabulary reaches them, because every other outstanding
+transfer answers an abort at once. It is also what times the drain: the lane
+asserts that a `REAPURBNDELAY` which owes the post-disconnect kill issues its
+aborts and answers without waiting for them, where the elapsed time is the
+whole measurement. Two fds on one node carry the other cross-fd assertion,
+that a disconnect one of them provokes reaches the one that never touched the
+device, and a budget filled with URBs that will not complete carries the third,
+that a synchronous `CONTROL` is charged against the same allowance a
+synchronous `BULK` is. `test-usbdev-ioctl-loopback` re-runs the
+fd-contract lane with that device present, which is the check that the seam did
+not reach a path it is not supposed to touch.
+
+Both loopback lanes run `build/elfuse-loopback`, which they build by re-entering
+make with `USB_LOOPBACK_FIXTURE=1`. The model is not in `build/elfuse`, so
+neither is it in anything shipped: see
+[internals.md](internals.md#testing-the-engine-without-hardware).
+
+What the loopback cannot answer stays on the board, and the list is short and
+worth keeping honest: real timing, NAKs, maxpacket segmentation, DMA alignment
+and throughput; that IOKit really delivers completions on the runloop, and the
+`IODispatchCalloutFromCFMessage` opacity that motivates the URB record's atomic
+owner (a timer callout is fully visible to ThreadSanitizer, so that
+justification is board-only); exclusive-access arbitration and kernel-driver
+binding, so `GETDRIVER` and `DISCONNECT_CLAIM` against a real driver; a real
+`SET_CONFIGURATION`, `SET_INTERFACE` pipe renumbering and port `RESET`; that a
+device actually receives the zero-length packet, as opposed to elfuse emitting
+it under the right predicate; and a physical unplug mid-transfer. Two of the
+engine's own answers are board-only for the same reason, and breaking either
+of them leaves the lane green: the `ZERO_PACKET` write's dropped `async_lock`
+and its bounded timeout only matter against an endpoint that NAKs, and the
+fixture answers a zero-length write immediately and ignores both timeout
+arguments; and so is the bystander window `ep_aborting` shuts, because the
+fixture retargets an aborted transfer's timer under its own lock and can never
+start a follower into an abort that is still running. The guest probes for
+those live out of tree. A hardware-dependent check that does move
+in must be gated on an environment variable naming the device and must skip
+with a stated reason when it is absent -- a skip is not a pass, and the
+skip lists above are the model: deliberate, explained, and checked.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:
@@ -508,6 +609,7 @@ Suggested minimum validation:
 | Rosetta hosting, x86_64 dispatch, VZ ioctls, AOT cache | `make elfuse && make test-rosetta-all` |
 | Broad behavioral changes | `make elfuse && make check && make test-matrix` |
 | Debugger or ptrace flow | `make elfuse && make test-gdbstub` |
+| ACSL contracts, `src/proved/`, `mk/verify.mk`, the mutation harness | `make verify && make verify-mutants`, in that order and never beside a runtime lane: both fan out, and the timing lanes fail under the load they create. Add `make check` only when the change touches code rather than annotations |
 
 ## OCI Image CLI
 

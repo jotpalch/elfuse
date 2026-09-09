@@ -79,7 +79,14 @@ BUILD_FLAVOR_STAMP := $(BUILD_DIR)/.build-flavor
 # goal-less invocation is one of them: .DEFAULT_GOAL is help, while
 # MAKECMDGOALS stays empty, so filtering the skip list out of the goals and
 # testing what remains covers both that and a mixed "make help elfuse".
-BUILD_FLAVOR_GOALS := $(filter-out clean distclean help,$(MAKECMDGOALS))
+#
+# print-% is in the list because those goals only print variables, and because
+# something other than a person invokes them: check-proof-targets.py shells out
+# to "make print-verify-targets" and runs on every "make check". Without the
+# skip, that sub-make evaluates the flavor guard with whatever CFLAGS its own
+# environment produces, so running the scanner beside a sanitizer build wipes
+# that build's objects from under it.
+BUILD_FLAVOR_GOALS := $(filter-out clean distclean help print-%,$(MAKECMDGOALS))
 
 ifneq ($(BUILD_FLAVOR_GOALS),)
 BUILD_FLAVOR_PREV := $(shell cat $(BUILD_FLAVOR_STAMP) 2>/dev/null)
