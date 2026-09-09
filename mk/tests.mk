@@ -44,6 +44,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-matrix \
         test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
+        test-usbdev-urb-loopback test-usbdev-ioctl-loopback \
         test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
         test-fstatfs-fd-identity \
@@ -282,6 +283,8 @@ $(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point agains
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
 $(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
+$(call run-lane,test-usbdev-urb-loopback,the async URB engine over an IOKit loopback)
+$(call run-lane,test-usbdev-ioctl-loopback,the usbdevfs fd contract with a service behind one node)
 $(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
 $(call run-lane,test-dir-backing-drain-error,a lost union listing is reported not truncated)
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
@@ -1741,6 +1744,52 @@ test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_REAP_DELAY_US=20000 \
 		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+
+## Build the fixture-enabled binary the two loopback lanes run
+#
+# The loopback fixture is not in the default build (USB_LOOPBACK_FIXTURE in
+# mk/config.mk), so a lane that needs it has to ask for a binary that has it.
+# Asking is a recursive make with the variable set rather than a second link
+# line here, so what the lanes run is the build a reader gets from
+# "make USB_LOOPBACK_FIXTURE=1" and cannot drift from it, and so nothing in this
+# file has to restate the prerequisites of $(ELFUSE_BIN).
+#
+# Into a binary of its own, so a plain make still leaves build/elfuse without
+# the fixture: the sub-make overrides ELFUSE_BIN rather than BUILD_DIR, which
+# keeps every object but the fixture's shared with the outer build. Overriding
+# BUILD_DIR instead would recompile the tree.
+#
+# Phony because the sub-make is what decides whether anything needs rebuilding.
+# The leading '+' is what keeps it expanding under -n: make looks for a literal
+# $(MAKE) in the unexpanded recipe line (make manual 9.3). A command-line
+# override reaches a sub-make through MAKEFLAGS, so the sanitizer lanes get a
+# loopback binary of their own flavor without this line naming EXTRA_CFLAGS.
+.PHONY: elfuse-loopback
+elfuse-loopback:
+	+$(Q)$(MAKE) --no-print-directory USB_LOOPBACK_FIXTURE=1 \
+		ELFUSE_BIN=$(ELFUSE_LOOPBACK_BIN) elfuse
+
+## The async URB engine, against a device that can complete a transfer
+# ELFUSE_USB_FIXTURE=loopback adds one device whose IOKit answers come from
+# src/syscall/usbdev-fixture.c: the two COM vtables are replaced and nothing
+# above them is, so submit, the per-endpoint queue, the completion callback on
+# the event thread, the readiness and disconnect maps, REAPURB, the
+# CAP_REAP_AFTER_DISCONNECT drain and the ZERO_PACKET write all run here for the
+# first time without a board. What it cannot cover -- real timing, NAKs,
+# maxpacket segmentation, exclusive-access arbitration, a physical unplug -- is
+# listed in docs/testing.md and stays on the board.
+test-usbdev-urb-loopback: elfuse-loopback $(TEST_DIR)/test-usbdev-urb-loopback
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-urb-loopback
+
+## The same fd contract, with an IOKit service behind one node
+# The seam is per device: the loopback model adds a device and leaves the
+# service-less ones alone, so this run must answer exactly what
+# test-usbdev-ioctl answers. It is the check that the seam did not leak into the
+# paths it is not supposed to touch.
+test-usbdev-ioctl-loopback: elfuse-loopback $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-ioctl
 
 ## fstatfs answers for the descriptor it pinned, not for the fd number
 # The identity is decided from the slot's stamp and from the descriptor itself,

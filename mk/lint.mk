@@ -21,7 +21,7 @@ endef
 lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h $(DISPATCH_HEADER)
 	$(call require-tool,$(CLANG_TIDY),brew install llvm -- or set CLANG_TIDY=)
 	@echo "  TIDY    src/"
-	$(Q)$(CLANG_TIDY) $(SRCS) -- $(CFLAGS) -Isrc -I$(BUILD_DIR)
+	$(Q)$(CLANG_TIDY) $(ALL_SRCS) -- $(CFLAGS) -Isrc -I$(BUILD_DIR)
 
 ## Re-run Infer with the uninitialized-value checker that .inferconfig disables
 infer-uninit: | $(BUILD_DIR)

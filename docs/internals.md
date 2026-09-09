@@ -1200,6 +1200,48 @@ saw a disconnect and the other half could be marked gone while attached. Across 
 are Mach-port-backed and cannot cross the `posix_spawn` that implements
 fork.
 
+### Testing The Engine Without Hardware
+
+IOKit publishes no loopback device, so the async engine had no in-tree lane at
+all: `ELFUSE_USB_FIXTURE`'s devices have no IOKit service behind them and stop
+at `SUBMITURB`'s argument gate. `ELFUSE_USB_FIXTURE=loopback` adds one that
+does, by substituting at the narrowest place that leaves every layer above it
+real: the two COM vtables. Every wire call in `usbdev.c` goes through
+`IOUSBDeviceInterface650 **` or `IOUSBInterfaceInterface800 **` as
+`(*h)->Method(h, ...)`, so `src/syscall/usbdev-fixture.c` hands back an object
+whose first member is a vtable of the same shape and nothing above it changes.
+The URB records, the per-endpoint FIFO, the completion callback, `urb_status`,
+the ZLP predicate, the readiness and disconnect maps, `REAPURB`, the drain and
+all of `poll.c` are the same code that runs against a board. Completions arrive
+from a one-shot `CFRunLoopTimer` on the event thread, which is where
+`IODispatchCalloutFromCFMessage` would have delivered them.
+
+What the fixture does is a script rather than a flag:
+`ELFUSE_USB_LOOPBACK=ep02:delay(80),ok;ep81:short(8)` and the rest of the
+vocabulary in `src/syscall/usbdev-fixture.c` name the `IOReturn` each outcome
+stands for, and a guest can rewrite the script, read back a log of what crossed
+the seam and terminate the device through vendor control requests. The log is
+what makes the `ZERO_PACKET` trailing packet observable rather than inferred.
+
+The seam is five `if (u->fake)` branches, one has-device probe and one bind
+call in `usbdev.c`, all behind a mode resolved once per process, and the flag
+is set only for the one location the fixture models -- so the other fixture modes, and every real
+device, take the paths they took before. `make test-usbdev-ioctl-loopback` is
+the standing check on that: the fd-contract lane must answer the same thing
+with the loopback device present as without it.
+
+None of that is in the shipped binary. `src/syscall/usbdev-fixture.c` is a
+translation unit under `src/` that only an assertion has a use for, so the
+default build links `src/syscall/usbdev-fixture-stub.c` in its place: the same
+seven entry points, answering `false` and `-ENODEV`, 44 bytes of text against
+the model's 10 KB. `USB_LOOPBACK_FIXTURE=1` swaps the two, and the two loopback
+lanes get their binary that way, as `build/elfuse-loopback`, while `make`
+leaves `build/elfuse` without it. Which object defines the seam is the whole
+difference between the two builds: not one branch in `usbdev.c` is
+conditionally compiled, so the fixture cannot drift into code the default build
+never compiles, and the default build still pays the branch that keeps the
+fixture off every path it must not touch.
+
 ### Deviations From Linux
 
 | usbfs behavior | elfuse behavior |

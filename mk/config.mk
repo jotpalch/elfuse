@@ -4,6 +4,23 @@ ENTITLEMENTS := entitlements.plist
 SIGN_IDENTITY ?= -
 BUILD_DIR := build
 ELFUSE_BIN := $(BUILD_DIR)/elfuse
+
+# The USB loopback fixture, off by default.
+#
+# src/syscall/usbdev-fixture.c models one IOKit device that echoes back what
+# was written to it, so the async URB engine can be driven with no board
+# attached. The synthetic USB tree in runtime/usb-sysfs.c earns its place in the
+# product because it lets lsusb work on a machine with no devices; a device that
+# echoes back what was written to it earns nothing outside a test, so it is not
+# in the shipped binary. The default build links
+# src/syscall/usbdev-fixture-stub.c instead, which answers the same seam and
+# models nothing. USB_LOOPBACK_FIXTURE=1 swaps the two (see the SRCS block in
+# the top-level Makefile).
+#
+# The loopback lanes of make check need a binary that has it, and get one under
+# a name of its own so a plain make still leaves $(ELFUSE_BIN) free of it.
+USB_LOOPBACK_FIXTURE ?= 0
+ELFUSE_LOOPBACK_BIN := $(BUILD_DIR)/elfuse-loopback
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
 
 # Private pseudo-syscall number used by translated guests to invoke the
