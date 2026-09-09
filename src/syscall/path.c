@@ -46,10 +46,27 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
 #define SYSFS_PREFIX "/sys"
 #define DEV_USB_PREFIX "/dev/bus"
 
+/* Step over a leading "//" run and leading "." components so the literal prefix
+ * tests in the two gates below read the first real component. Linux resolves
+ * //x and /./x as /x; matching the raw spelling put one spelling of a name
+ * outside an intercept while another went through it, which is how
+ * //dev/ttyACM0 came to stat as a character device and open as the placeholder
+ * file behind it.
+ */
+static const char *path_skip_root_noise(const char *path)
+{
+    while (path[0] == '/' && path[1] == '/')
+        path++;
+    while (!strncmp(path, "/./", 3))
+        path += 2;
+    return path;
+}
+
 bool path_might_use_open_intercept(const char *path)
 {
     if (!path || path[0] != '/')
         return false;
+    path = path_skip_root_noise(path);
 
     if (!strncmp(path, "/proc", 5))
         return true;
@@ -186,6 +203,7 @@ bool path_might_use_stat_intercept(const char *path)
 {
     if (!path || path[0] != '/')
         return false;
+    path = path_skip_root_noise(path);
 
     if (!strncmp(path, "/proc", 5))
         return true;
@@ -203,9 +221,18 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
-        return true;
-    if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
+
+    /* Everything the synthetic USB layer can serve -- /sys, /dev/bus/usb and
+     * the ttyACM/ttyUSB and by-id names -- asked of that layer rather than
+     * matched here, so this gate and the intercept behind it decide ownership
+     * the same way. Matching prefixes here left //dev/ttyACM0 and
+     * /dev/./ttyACM0 outside the stat intercept while procemu's open intercept,
+     * which is not gated, still served them: one spelling opened the character
+     * device and stat'd the placeholder file behind it. The predicate is pure
+     * string work and takes no lock. A name the layer does not serve reports
+     * PROC_NOT_INTERCEPTED below and falls back to the host.
+     */
+    if (usb_sysfs_path_might_be_ours(path))
         return true;
 
     return false;
@@ -534,21 +561,26 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    /* A /sys walk that passes through one of the synthetic USB `subsystem`
-     * symlinks is rewritten to the canonical guest spelling of where it lands,
-     * before anything decides whose name it is. The links exist only in the
-     * synthetic tree, so no other layer can resolve them: the sysroot has no
-     * such link, and a lexical fold puts the walk back in the device directory
-     * it had just left. Doing it here, once, is what makes open, stat, lstat,
-     * readlink and getdents64 answer from one name -- the union listing of
-     * `<dev>/subsystem/..` offered /sys/bus/pci while every lookup of
-     * `<dev>/subsystem/../pci` denied it, because each entry point folded the
+    /* A /sys walk that passes through one of the synthetic USB symlinks is
+     * rewritten to the canonical guest spelling of where it lands, before
+     * anything decides whose name it is. The links exist only in the synthetic
+     * tree, so no other layer can resolve them: the sysroot has no such link,
+     * and a lexical fold puts the walk back in the directory it had just left.
+     * Doing it here, once, is what makes open, stat, lstat, readlink and
+     * getdents64 answer from one name -- the union listing of
+     * <dev>/subsystem/.. offered /sys/bus/pci while every lookup of
+     * <dev>/subsystem/../pci denied it, because each entry point folded the
      * name for itself.
+     *
+     * /sys/class/tty is here for the same reason /sys/bus/usb/devices is: the
+     * tty alias directories carry a device link and a subsystem link, and both
+     * are walked through.
      *
      * Cheap for everything else: the prefix test rejects every path that cannot
      * contain such a link before the USB layer is called at all.
      */
-    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21)) {
+    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21) ||
+        !strncmp(tx->guest_path, "/sys/class/tty/", 15)) {
         /* Through a local buffer, not straight into guest_buf: guest_path may
          * already be guest_buf (the FUSE resolver above puts it there), and the
          * rewrite reads its input while writing its output.
