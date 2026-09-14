@@ -42,6 +42,10 @@
 #include "debug/log.h"
 #include "proved/futexhash.h"
 #include "proved/futexop.h"
+#include "proved/futexpi.h"
+#include "proved/futexreq.h"
+#include "proved/futexwaitv.h"
+#include "proved/futexwakeop.h"
 #include "proved/timespec.h"
 
 /* macOS 14.4+ ships os_sync_{wait_on_address_with_timeout,wake_by_address_any}
@@ -106,18 +110,9 @@ _Static_assert(FUTEX_WAKE_BITSET == 10,
 
 #define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFU
 
-/* PI futex word layout (bits):
- *   0-29: TID of lock holder (0 = unlocked)
- *   30:   FUTEX_OWNER_DIED (set by robust_list_walk on thread exit)
- *   31:   FUTEX_WAITERS (at least one thread is blocked)
- *
- * Linux kernel: FUTEX_WAITERS=0x80000000 (bit 31), FUTEX_OWNER_DIED=0x40000000
- * (bit 30), FUTEX_TID_MASK=0x3FFFFFFF. FUTEX_OWNER_DIED=0x40000000 (bit 30) is
- * set by robust_list_walk on thread exit. FUTEX_TID_MASK is 30 bits.
+/* The PI word's three fields and the edits made to them are proved/futexpi.h,
+ * which carries the layout and Linux's own constants.
  */
-#define FUTEX_TID_MASK 0x3FFFFFFFU
-#define FUTEX_OWNER_DIED 0x40000000U
-#define FUTEX_WAITERS 0x80000000U
 
 /* Address-wait helper state.
  *
@@ -332,6 +327,20 @@ static inline unsigned futex_hash(uint64_t uaddr)
     return futex_bucket_index(uaddr, FUTEX_BUCKETS);
 }
 
+/* Linux requires a futex word to be naturally aligned, and every op checks this
+ * before the address reaches a bucket. Stated as a contract because without one
+ * a widened or narrowed mask breaks no obligation: the proof would pass on a
+ * body it never constrained, and the mutation gate would have nothing to
+ * reject.
+ *
+ * The ensures is in the bit domain rather than the more readable "uaddr % 4 ==
+ * 0" because the prover times out bridging modulo and bitmask on a 64-bit
+ * value. Measured at the 30s budget, and a fresh cache does not help.
+ */
+/*@
+  assigns \nothing;
+  ensures \result <==> (uaddr & 0x3) == 0;
+ */
 static inline bool futex_uaddr_is_aligned(uint64_t uaddr)
 {
     return (uaddr & 0x3) == 0;
@@ -342,13 +351,15 @@ static inline bool futex_uaddr_is_aligned(uint64_t uaddr)
  * 4), so this drops b->lock and retakes it. The caller must re-check
  * waiter.woken afterward: a wake can land in the window.
  *
- * Returns whether a deliverable signal is queued for this thread.
+ * Returns whether a deliverable signal is queued for this thread, claimed so a
+ * sibling woken by the same process-directed signal does not also report EINTR
+ * for it.
  */
 static bool futex_poll_signal_relock(futex_bucket_t *b)
 {
     pthread_mutex_unlock(&b->lock);
     signal_check_timer_real();
-    bool sig_ready = signal_pending() != 0;
+    bool sig_ready = signal_claim_interruption();
     pthread_mutex_lock(&b->lock);
     return sig_ready;
 }
@@ -535,9 +546,9 @@ static void futex_clear_waiters_bit(uint32_t *word)
         bool cleared;
         if (!futex_word_load(word, &v))
             return;
-        if (!(v & FUTEX_WAITERS))
+        if (!futex_pi_has_waiters(v))
             return;
-        if (!futex_word_cas(word, &v, v & ~FUTEX_WAITERS, &cleared))
+        if (!futex_word_cas(word, &v, futex_pi_clear_waiters(v), &cleared))
             return;
         if (cleared)
             return;
@@ -965,11 +976,12 @@ static int64_t futex_os_sync_wait(guest_t *g,
         /* Return EINTR only when a real deliverable signal is queued for this
          * thread. POSIX callers (e.g. glibc sem_wait, foot's render worker)
          * often do not retry on EINTR, so synthetic spurious wakeups cannot be
-         * issued here. signal_pending() confirms under sig_lock so the atomic
-         * hint cannot produce a stale-true edge after rt_sigprocmask masked the
-         * queued signal.
+         * issued here. The claim confirms under sig_lock, so the atomic hint
+         * cannot produce a stale-true edge after rt_sigprocmask masked the
+         * queued signal, and takes a process-directed signal for this thread so
+         * a sibling woken by the same one does not report EINTR for it too.
          */
-        if (signal_pending()) {
+        if (signal_claim_interruption()) {
             if (has_timeout)
                 syscall_restart_forbid();
             return -LINUX_EINTR;
@@ -1192,7 +1204,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
             break;
         }
 
-        /* The slow-path confirm inside signal_pending() avoids the stale-true
+        /* The confirm under sig_lock inside the claim avoids the stale-true
          * edge the atomic hint can carry after rt_sigprocmask masks the queued
          * signal. Re-check waiter.woken below: a wake can land in the window
          * the poll opens.
@@ -1315,6 +1327,34 @@ static int64_t futex_wait(guest_t *g,
     return rc;
 }
 
+/* Whether a plain wake would meet a PI waiter among the first budget entries it
+ * would touch at uaddr. A PI waiter stays tied to its entry bucket while it
+ * retries and is not woken by a plain wake, so Linux answers EINVAL from inside
+ * futex_wake() and futex_wake_op(); this decides before anything is woken, the
+ * way futex_requeue decides, so a refused call leaves the chain as it found it.
+ *
+ * The budget is what bounds the walk, because a waiter Linux never reaches
+ * cannot refuse the call: its loops stop once nr_wake entries are woken.
+ */
+static bool futex_pi_waiter_within(const futex_bucket_t *b,
+                                   uint64_t uaddr,
+                                   uint32_t bitset,
+                                   uint32_t budget)
+{
+    for (const futex_waiter_t *w = b->head; w && budget != 0; w = w->next) {
+        if (w->uaddr != uaddr || (w->bitset & bitset) == 0)
+            continue;
+
+        /* pub_follows is false only for a PI waiter today; see where it is set
+         * in futex_lock_pi_inner.
+         */
+        if (!w->pub_follows)
+            return true;
+        budget--;
+    }
+    return false;
+}
+
 static int64_t futex_wake(const guest_t *g,
                           uint64_t uaddr,
                           uint32_t val,
@@ -1381,6 +1421,11 @@ static int64_t futex_wake(const guest_t *g,
     }
 #endif
 
+    if (futex_pi_waiter_within(b, uaddr, bitset, val)) {
+        pthread_mutex_unlock(&b->lock);
+        return -LINUX_EINVAL;
+    }
+
     futex_waiter_t **pp = &b->head;
     while (*pp && (uint32_t) woken < val) {
         futex_waiter_t *w = *pp;
@@ -1418,6 +1463,12 @@ static int64_t futex_requeue(guest_t *g,
                              int do_cmp,
                              uint32_t expected)
 {
+    /* Linux refuses these before taking either key; proved/futexreq.h carries
+     * why the sign is only visible as the top bit here.
+     */
+    if (!futex_requeue_counts_valid(wake_count, requeue_count))
+        return -LINUX_EINVAL;
+
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
 
@@ -1448,34 +1499,28 @@ static int64_t futex_requeue(guest_t *g,
         }
     }
 
-    /* A PI waiter remains tied to its entry bucket while it retries the PI
-     * acquisition. FUTEX_REQUEUE has no PI-aware counterpart here, so reject an
-     * attempted migration before waking or moving any waiter.
+    /* A PI waiter stays tied to its entry bucket while it retries, and
+     * FUTEX_REQUEUE has no PI-aware form here, so reject one before anything
+     * moves. Every waiter the call could touch is checked, wake candidates
+     * included, matching where requeue.c makes the same decision. The budget is
+     * summed in 64 bits: both halves are guest-supplied and wake-all passes
+     * INT_MAX.
      */
-    if (uaddr != uaddr2 && requeue_count != 0) {
-        uint32_t skips = wake_count;
-        uint32_t remaining = requeue_count;
+    uint64_t checked = futex_requeue_budget(wake_count, requeue_count);
+    for (futex_waiter_t *w = b_src->head; w && checked != 0; w = w->next) {
+        if (w->uaddr != uaddr)
+            continue;
 
-        for (futex_waiter_t *w = b_src->head; w; w = w->next) {
-            if (w->uaddr != uaddr)
-                continue;
-            if (skips != 0) {
-                skips--;
-                continue;
-            }
-
-            /* pub_follows is false only for a PI waiter today; see where it is
-             * set in futex_lock_pi_inner.
-             */
-            if (!w->pub_follows) {
-                if (idx_src != idx_dst)
-                    pthread_mutex_unlock(&b_dst->lock);
-                pthread_mutex_unlock(&b_src->lock);
-                return -LINUX_EINVAL;
-            }
-            if (--remaining == 0)
-                break;
+        /* pub_follows is false only for a PI waiter today; see where it is set
+         * in futex_lock_pi_inner.
+         */
+        if (!w->pub_follows) {
+            if (idx_src != idx_dst)
+                pthread_mutex_unlock(&b_dst->lock);
+            pthread_mutex_unlock(&b_src->lock);
+            return -LINUX_EINVAL;
         }
+        checked--;
     }
 
     int woken = 0, requeued = 0;
@@ -1495,21 +1540,33 @@ static int64_t futex_requeue(guest_t *g,
             woken++;
             /* Leave pp unchanged because *pp is already the next node */
         } else if ((uint32_t) requeued < requeue_count) {
-            /* Requeue: remove from source, add to destination */
-            *pp = w->next;
+            if (idx_src == idx_dst) {
+                /* Same bucket: only the key changes. Linux's requeue_futex()
+                 * takes this path too (hb1 == hb2), rewriting q->key without
+                 * moving the entry. Unlinking and relinking here would put w
+                 * right back at *pp, so pp would never advance past it.
+                 */
+                w->uaddr = uaddr2;
+                pp = &w->next;
+            } else {
+                /* Requeue: remove from source, add to destination */
+                *pp = w->next;
 
-            /* Move the publication with the waiter. The destination is charged
-             * before the source is debited, so the shim never sees this parked
-             * waiter charged to no bucket.
-             */
-            shim_globals_futex_waiters_add(g, idx_dst, +1);
-            if (w->pub_follows) {
-                shim_globals_futex_waiters_add(g, w->pub_bucket, -1);
-                w->pub_bucket = idx_dst;
+                /* Credit the destination before debiting the source, so the
+                 * shim never sees this waiter charged to no bucket. Both halves
+                 * sit under pub_follows: a waiter carrying no charge of its own
+                 * must not gain one here, which is how a charge outlived its
+                 * waiter.
+                 */
+                if (w->pub_follows) {
+                    shim_globals_futex_waiters_add(g, idx_dst, +1);
+                    shim_globals_futex_waiters_add(g, w->pub_bucket, -1);
+                    w->pub_bucket = idx_dst;
+                }
+                w->uaddr = uaddr2;
+                w->next = b_dst->head;
+                b_dst->head = w;
             }
-            w->uaddr = uaddr2;
-            w->next = b_dst->head;
-            b_dst->head = w;
             requeued++;
         } else {
             break; /* Both limits reached */
@@ -1594,6 +1651,12 @@ static int64_t futex_wake_op(guest_t *g,
         op_val = 1U << futex_op_shift_arg_mask(op_arg);
     wake_op &= 7; /* Actual operation is bits 0-2 */
 
+    /* An op Linux does not implement stops here, before the modify and before
+     * any wake. proved/futexwakeop.h carries both gates.
+     */
+    if (!futex_wake_op_supported(wake_op))
+        return -LINUX_ENOSYS;
+
     unsigned idx1 = futex_hash(uaddr);
     unsigned idx2 = futex_hash(uaddr2);
     futex_bucket_t *b1 = &buckets[idx1];
@@ -1629,26 +1692,7 @@ static int64_t futex_wake_op(guest_t *g,
         ok = futex_word_load(word2, &old_val);
         if (!ok)
             break;
-        switch (wake_op) {
-        case 0:
-            new_val = op_val;
-            break; /* SET */
-        case 1:
-            new_val = old_val + op_val;
-            break; /* ADD */
-        case 2:
-            new_val = old_val | op_val;
-            break; /* OR */
-        case 3:
-            new_val = old_val & ~op_val;
-            break; /* ANDN */
-        case 4:
-            new_val = old_val ^ op_val;
-            break; /* XOR */
-        default:
-            new_val = old_val;
-            break;
-        }
+        new_val = futex_wake_op_apply(old_val, wake_op, op_val);
         ok = futex_word_cas(word2, &old_val, new_val, &swapped);
     } while (ok && !swapped);
 
@@ -1657,6 +1701,36 @@ static int64_t futex_wake_op(guest_t *g,
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
         return -LINUX_EFAULT;
+    }
+
+    /* A comparison Linux does not implement stops here: the modify above has
+     * already landed, and neither wake runs.
+     */
+    if (!futex_wake_cmp_supported(wake_cmp)) {
+        if (idx1 != idx2)
+            pthread_mutex_unlock(&b2->lock);
+        pthread_mutex_unlock(&b1->lock);
+        return -LINUX_ENOSYS;
+    }
+
+    /* Signed comparison on the word as it was before the modify. Evaluated here
+     * because the test below has to know whether the second wake runs at all: a
+     * walk the comparison never reaches cannot refuse the call.
+     */
+    int cond_met = futex_wake_op_cmp((int32_t) old_val, wake_cmp, cmp_arg);
+
+    /* Neither wake reaches a PI waiter. Both walks are tested before either one
+     * wakes anybody, so a refused call leaves both chains as it found them. The
+     * modify above stays: Linux applies it before its own walks reach the
+     * waiter that answers EINVAL.
+     */
+    if (futex_pi_waiter_within(b1, uaddr, FUTEX_BITSET_MATCH_ANY, val) ||
+        (cond_met &&
+         futex_pi_waiter_within(b2, uaddr2, FUTEX_BITSET_MATCH_ANY, val2))) {
+        if (idx1 != idx2)
+            pthread_mutex_unlock(&b2->lock);
+        pthread_mutex_unlock(&b1->lock);
+        return -LINUX_EINVAL;
     }
 
     /* Wake up to val waiters at uaddr (unlink woken entries) */
@@ -1670,33 +1744,6 @@ static int64_t futex_wake_op(guest_t *g,
         } else {
             pp1 = &w->next;
         }
-    }
-
-    /* Evaluate comparison predicate on old_val */
-    int cond_met = 0;
-    /* Linux FUTEX_WAKE_OP uses signed comparison semantics */
-    int32_t sv = (int32_t) old_val;
-    switch (wake_cmp) {
-    case 0:
-        cond_met = (sv == cmp_arg);
-        break; /* EQ */
-    case 1:
-        cond_met = (sv != cmp_arg);
-        break; /* NE */
-    case 2:
-        cond_met = (sv < cmp_arg);
-        break; /* LT (signed) */
-    case 3:
-        cond_met = (sv <= cmp_arg);
-        break; /* LE (signed) */
-    case 4:
-        cond_met = (sv > cmp_arg);
-        break; /* GT (signed) */
-    case 5:
-        cond_met = (sv >= cmp_arg);
-        break; /* GE (signed) */
-    default:
-        break;
     }
 
     /* Conditionally wake up to val2 waiters at uaddr2 (unlink woken) */
@@ -1799,7 +1846,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             return 0;
 
         /* Already own it? Deadlock (Linux returns EDEADLK) */
-        if ((expected & FUTEX_TID_MASK) == tid)
+        if (futex_pi_owner_tid(expected) == tid)
             return -LINUX_EDEADLK;
 
         /* Robust owner death: the robust-list walk sets FUTEX_OWNER_DIED and
@@ -1810,7 +1857,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
          * which never sees a robust-cleaned word (TID == 0) and would otherwise
          * spin forever.
          */
-        if (expected & FUTEX_OWNER_DIED) {
+        if (futex_pi_owner_died(expected)) {
             if (!futex_word_cas(word, &expected, 0, NULL))
                 return -LINUX_EFAULT;
             continue; /* Retry acquisition */
@@ -1821,7 +1868,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
          * FUTEX_LOCK_PI returns -ESRCH (attach_to_pi_owner ->
          * handle_exit_race).
          */
-        uint32_t owner_tid = expected & FUTEX_TID_MASK;
+        uint32_t owner_tid = futex_pi_owner_tid(expected);
         if (owner_tid != 0 && !thread_find((int64_t) owner_tid))
             return -LINUX_ESRCH;
 
@@ -1833,11 +1880,11 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             uint32_t cur;
             if (!futex_word_load(word, &cur))
                 return -LINUX_EFAULT;
-            if ((cur & FUTEX_TID_MASK) == 0)
+            if (futex_pi_unowned(cur))
                 break; /* Owner released; retry outer loop */
-            if (cur & FUTEX_WAITERS)
+            if (futex_pi_has_waiters(cur))
                 break; /* Already set by another waiter */
-            uint32_t desired = cur | FUTEX_WAITERS;
+            uint32_t desired = futex_pi_set_waiters(cur);
             bool marked;
             if (!futex_word_cas(word, &cur, desired, &marked))
                 return -LINUX_EFAULT;
@@ -1849,7 +1896,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
         uint32_t cur;
         if (!futex_word_load(word, &cur))
             return -LINUX_EFAULT;
-        if ((cur & FUTEX_TID_MASK) == 0)
+        if (futex_pi_unowned(cur))
             continue;
 
         /* Enqueue and block */
@@ -1862,7 +1909,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             pthread_mutex_unlock(&b->lock);
             return -LINUX_EFAULT;
         }
-        if ((cur & FUTEX_TID_MASK) == 0) {
+        if (futex_pi_unowned(cur)) {
             pthread_mutex_unlock(&b->lock);
             continue;
         }
@@ -1999,11 +2046,11 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                     pthread_cond_destroy(&waiter.cond);
                     return -LINUX_EFAULT;
                 }
-                if (check & FUTEX_OWNER_DIED) {
+                if (futex_pi_owner_died(check)) {
                     owner_died = true;
                     break;
                 }
-                uint32_t check_tid = check & FUTEX_TID_MASK;
+                uint32_t check_tid = futex_pi_owner_tid(check);
                 if (check_tid != 0 && !thread_tid_alive((int64_t) check_tid)) {
                     bucket_unlink_locked(b, &waiter);
                     pthread_mutex_unlock(&b->lock);
@@ -2097,7 +2144,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
     uint32_t cur;
     if (guest_read_small(g, uaddr, &cur, sizeof(cur)) != 0)
         return -LINUX_EFAULT;
-    if ((cur & FUTEX_TID_MASK) != tid)
+    if (futex_pi_owner_tid(cur) != tid)
         return -LINUX_EPERM;
 
     /* Only the owner reaches here, and an owned PI lock is always aligned
@@ -2300,30 +2347,22 @@ typedef struct {
 #define LINUX_CLOCK_REALTIME 0
 #define LINUX_CLOCK_MONOTONIC 1
 
+/* The distinct buckets the wait set covers, ascending. The locks below are
+ * taken in this order and released in reverse, so both properties of the answer
+ * are load-bearing: proved/futexwaitv.h carries them.
+ *
+ * nr_futexes is bounded by FUTEX_WAITV_MAX before the call, which is what keeps
+ * nbuckets below the array length at every insert.
+ */
 static int waitv_collect_buckets(const linux_futex_waitv_t *elts,
                                  uint32_t nr_futexes,
-                                 unsigned bucket_ids[FUTEX_WAITV_MAX],
-                                 futex_bucket_t *bucket_ptrs[FUTEX_WAITV_MAX])
+                                 unsigned bucket_ids[FUTEX_WAITV_MAX])
 {
     unsigned nbuckets = 0;
 
-    for (uint32_t i = 0; i < nr_futexes; i++) {
-        unsigned idx = futex_hash(elts[i].uaddr);
-        unsigned pos = 0;
-
-        while (pos < nbuckets && bucket_ids[pos] < idx)
-            pos++;
-        if (pos < nbuckets && bucket_ids[pos] == idx)
-            continue;
-
-        for (unsigned j = nbuckets; j > pos; j--) {
-            bucket_ids[j] = bucket_ids[j - 1];
-            bucket_ptrs[j] = bucket_ptrs[j - 1];
-        }
-        bucket_ids[pos] = idx;
-        bucket_ptrs[pos] = &buckets[idx];
-        nbuckets++;
-    }
+    for (uint32_t i = 0; i < nr_futexes; i++)
+        nbuckets = futex_bucket_insert(bucket_ids, nbuckets, FUTEX_WAITV_MAX,
+                                       futex_hash(elts[i].uaddr));
 
     return (int) nbuckets;
 }
@@ -2420,9 +2459,7 @@ int64_t sys_futex_waitv(guest_t *g,
      */
     futex_waiter_t waiters[FUTEX_WAITV_MAX];
     unsigned bucket_ids[FUTEX_WAITV_MAX];
-    futex_bucket_t *bucket_ptrs[FUTEX_WAITV_MAX];
-    int nbuckets =
-        waitv_collect_buckets(elts, nr_futexes, bucket_ids, bucket_ptrs);
+    int nbuckets = waitv_collect_buckets(elts, nr_futexes, bucket_ids);
     int enqueued = 0;
     int64_t result_err = 0;
 
@@ -2445,7 +2482,7 @@ int64_t sys_futex_waitv(guest_t *g,
     }
 
     for (int i = 0; i < nbuckets; i++)
-        pthread_mutex_lock(&bucket_ptrs[i]->lock);
+        pthread_mutex_lock(&buckets[bucket_ids[i]].lock);
 
     for (uint32_t i = 0; i < nr_futexes; i++) {
         uint64_t uaddr = elts[i].uaddr;
@@ -2474,7 +2511,7 @@ int64_t sys_futex_waitv(guest_t *g,
     }
 
     for (int i = nbuckets - 1; i >= 0; i--)
-        pthread_mutex_unlock(&bucket_ptrs[i]->lock);
+        pthread_mutex_unlock(&buckets[bucket_ids[i]].lock);
 
     /* All enqueued. Block on shared.cond until any wake site signals it. The
      * bounded sleep (capped at 100 ms or the user deadline, whichever is
@@ -2557,7 +2594,7 @@ int64_t sys_futex_waitv(guest_t *g,
 
 unlock_early:
     for (int i = nbuckets - 1; i >= 0; i--)
-        pthread_mutex_unlock(&bucket_ptrs[i]->lock);
+        pthread_mutex_unlock(&buckets[bucket_ids[i]].lock);
 
     for (int i = enqueued - 1; i >= 0; i--) {
         waitv_unlink(&waiters[i]);
@@ -2652,11 +2689,10 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
         if (guest_read_small(g, futex_gva, &futex_val, sizeof(futex_val)) ==
             0) {
             /* Only act if this thread owns the lock */
-            uint32_t owner = futex_val & FUTEX_TID_MASK;
+            uint32_t owner = futex_pi_owner_tid(futex_val);
             if (owner == (uint32_t) thread_tid(t)) {
                 /* Set FUTEX_OWNER_DIED and clear TID */
-                uint32_t new_val =
-                    (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
+                uint32_t new_val = futex_pi_mark_owner_died(futex_val);
                 if (guest_write_small(g, futex_gva, &new_val, sizeof(new_val)) <
                     0)
                     log_debug(
@@ -2696,10 +2732,9 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
         uint32_t futex_val;
         if (guest_read_small(g, futex_gva, &futex_val, sizeof(futex_val)) ==
             0) {
-            uint32_t owner = futex_val & FUTEX_TID_MASK;
+            uint32_t owner = futex_pi_owner_tid(futex_val);
             if (owner == (uint32_t) thread_tid(t)) {
-                uint32_t new_val =
-                    (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
+                uint32_t new_val = futex_pi_mark_owner_died(futex_val);
                 if (guest_write_small(g, futex_gva, &new_val, sizeof(new_val)) <
                     0)
                     log_debug(

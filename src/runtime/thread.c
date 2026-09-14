@@ -375,6 +375,11 @@ void thread_deactivate(thread_entry_t *t)
     if (!t)
         return;
 
+    /* Before thread_lock, which ranks after sig_lock, and before the slot can
+     * be handed to a new thread that would inherit the claims by address.
+     */
+    signal_release_claims(t);
+
     pthread_mutex_lock(&thread_lock);
 
     /* If this is a VM-clone child, mark it as exited and wake the tracer/parent

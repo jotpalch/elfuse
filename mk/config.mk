@@ -3,7 +3,44 @@
 ENTITLEMENTS := entitlements.plist
 SIGN_IDENTITY ?= -
 BUILD_DIR := build
+
+# The USB loopback fixture, off by default.
+#
+# src/syscall/usbdev-fixture.c models one IOKit device that echoes back what
+# was written to it, so the async URB engine can be driven with no board
+# attached. The synthetic USB tree in runtime/usb-sysfs.c earns its place in the
+# product because it lets lsusb work on a machine with no devices; a device that
+# echoes back what was written to it earns nothing outside a test, so it is not
+# in the shipped binary. The default build links
+# src/syscall/usbdev-fixture-stub.c instead, which answers the same seam and
+# models nothing. USB_LOOPBACK_FIXTURE=1 swaps the two (see the SRCS block in
+# the top-level Makefile).
+#
+# The loopback lanes of make check need a binary that has it, and get one under
+# a name of its own so a plain make still leaves build/elfuse free of it.
+#
+# The name is where the two flavors are kept apart, because nothing else keeps
+# them apart. The switch changes SRCS and not CFLAGS, and the flavor stamp in
+# mk/common.mk is $(strip $(CFLAGS)), so it never trips on this: with both
+# flavors linking to build/elfuse, "make USB_LOOPBACK_FIXTURE=1 elfuse" followed
+# by "make elfuse" printed "Nothing to be done" and left the fixture in the
+# binary a plain make had just been asked for -- measured before this split, nm
+# still finding _usbdev_fixture_lock in build/elfuse until a make clean. The
+# byte counts for that build are dated in docs/internals.md and not repeated
+# here, because the sequence cannot be run again to re-measure them. What is
+# guaranteed now is that the fixture build and the shipped build never write
+# the same path, so the shipped one cannot be a stale copy of the other; the
+# objects are still shared, which is correct, because the only translation
+# unit the switch changes is the fixture seam's own and every other object
+# is compiled with identical flags. .ci/check-usb-fixture-bin.sh holds the
+# two paths apart.
+USB_LOOPBACK_FIXTURE ?= 0
+ELFUSE_LOOPBACK_BIN := $(BUILD_DIR)/elfuse-loopback
+ifeq ($(USB_LOOPBACK_FIXTURE),1)
+ELFUSE_BIN := $(ELFUSE_LOOPBACK_BIN)
+else
 ELFUSE_BIN := $(BUILD_DIR)/elfuse
+endif
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
 
 # Private pseudo-syscall number used by translated guests to invoke the
@@ -32,6 +69,7 @@ NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-stdio-nonblock-host.c \
                 tests/test-guest-env-host.c \
                 tests/test-usb-desc-host.c \
+                tests/test-usbdev-urb-host.c \
                 tests/test-elf-headers-host.c \
                 tests/test-gdbstub-host.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c

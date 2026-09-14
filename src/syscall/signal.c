@@ -405,12 +405,48 @@ static void refresh_pending_hint_locked(void)
     atomic_store_explicit(&sig_pending_hint, hint, memory_order_release);
 }
 
+/* Process-directed signals a waiter has claimed, and the thread that did.
+ *
+ * A claim leaves the signal in the shared set, where rt_sigpending and a fork
+ * snapshot still see it, and hides it from every other thread for as long as
+ * the claimer leaves it unblocked. Moving it into the claimer's private set
+ * instead would make it thread-directed for good: a mask restored over it or
+ * the claimer exiting would strand it where no other thread can take it. Any
+ * dequeue from the shared set releases the claim on that signal. Caller holds
+ * sig_lock for all of these.
+ */
+static thread_entry_t *shared_claim_owner[LINUX_NSIG];
+static uint64_t shared_claimed;
+
+static void shared_claim_release_locked(int signum)
+{
+    shared_claimed &= ~sig_bit(signum);
+    shared_claim_owner[signum - 1] = NULL;
+}
+
+/* The shared set as the current thread may take it. */
+static uint64_t shared_visible_locked(void)
+{
+    uint64_t shared = pending_load(&sig_state.shared.pending);
+    for (uint64_t c = shared_claimed & shared; c; c &= c - 1) {
+        int idx = bit_ctz64(c);
+        thread_entry_t *owner = shared_claim_owner[idx];
+        if (owner == current_thread)
+            continue;
+        uint64_t owner_blocked =
+            atomic_load_explicit(&owner->blocked, memory_order_acquire);
+        if (!(owner_blocked & BIT64(idx)))
+            shared &= ~BIT64(idx);
+    }
+    return shared;
+}
+
 /* Signals pending for the current thread: its private (thread-directed) set
  * unioned with the shared (process-directed) set. Caller holds sig_lock.
  */
 static inline uint64_t self_pending_locked(void)
 {
-    uint64_t pending = pending_load(&sig_state.shared.pending);
+    uint64_t pending = shared_visible_locked();
     if (current_thread)
         pending |= pending_load(&current_thread->tpending.pending);
     return pending;
@@ -544,6 +580,11 @@ void signal_reset_for_exec(void)
     }
     /* Clear saved sigsuspend state (both global and per-thread) */
     sig_state.saved_blocked_valid = false;
+
+    /* Every claimer but this thread is gone after exec. */
+    shared_claimed = 0;
+    for (int i = 0; i < LINUX_NSIG; i++)
+        shared_claim_owner[i] = NULL;
     if (t)
         t->saved_blocked_valid = false;
 
@@ -770,6 +811,19 @@ bool signal_attention_needed(void)
 
 bool signal_pending_interruption(bool *restart_out)
 {
+    /* Same lock-free fast path as signal_pending(): the fd waits ask this
+     * before every host wait.
+     */
+    uint64_t hint =
+        atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
+    uint64_t hint_blocked =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    if ((hint & ~hint_blocked) == 0) {
+        if (restart_out)
+            *restart_out = false;
+        return false;
+    }
+
     pthread_mutex_lock(&sig_lock);
     uint64_t blocked =
         atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
@@ -922,6 +976,9 @@ void signal_set_state(const signal_state_snapshot_t *state)
                           memory_order_relaxed);
     sig_state.saved_blocked = state->saved_blocked;
     sig_state.saved_blocked_valid = state->saved_blocked_valid;
+    shared_claimed = 0;
+    for (int i = 0; i < LINUX_NSIG; i++)
+        shared_claim_owner[i] = NULL;
     sig_state.altstack = state->altstack;
     sig_state.on_altstack = state->on_altstack;
 
@@ -984,7 +1041,10 @@ size_t signal_peek_signalfd(uint64_t mask,
          */
         for (int signum = 1; signum <= LINUX_NSIG && total < max; signum++) {
             uint64_t bit = BIT64(signum - 1);
-            if (!(mask & bit) || !(pending_load(&sp->pending) & bit))
+            uint64_t avail = sp == &sig_state.shared
+                                 ? shared_visible_locked()
+                                 : pending_load(&sp->pending);
+            if (!(mask & bit) || !(avail & bit))
                 continue;
 
             if (signum >= LINUX_SIGRTMIN) {
@@ -1088,6 +1148,8 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
             sp->std_info_valid[signum - 1] = false;
             pending_clear(&sp->pending, bit);
         }
+        if (sp == &sig_state.shared)
+            shared_claim_release_locked(signum);
     }
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
@@ -1120,6 +1182,57 @@ void signal_restore_blocked(uint64_t saved)
     atomic_store_explicit(thread_blocked_ptr(), saved & ~unmaskable,
                           memory_order_release);
     pthread_mutex_unlock(&sig_lock);
+}
+
+void signal_defer_restore_blocked(uint64_t saved)
+{
+    uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
+    pthread_mutex_lock(&sig_lock);
+    *thread_saved_blocked_ptr() = saved & ~unmaskable;
+    *thread_saved_valid_ptr() = true;
+    pthread_mutex_unlock(&sig_lock);
+}
+
+void signal_restore_saved_blocked(void)
+{
+    /* Every syscall epilogue calls this, so skip sig_lock when nothing was
+     * left. Only the owning thread writes its saved_blocked_valid, which makes
+     * the unlocked read its own.
+     */
+    bool *valid = thread_saved_valid_ptr();
+    if (!*valid)
+        return;
+
+    pthread_mutex_lock(&sig_lock);
+    if (*valid) {
+        atomic_store_explicit(thread_blocked_ptr(), *thread_saved_blocked_ptr(),
+                              memory_order_release);
+        *valid = false;
+    }
+    pthread_mutex_unlock(&sig_lock);
+}
+
+void signal_release_claims(struct thread_entry *t)
+{
+    if (!t)
+        return;
+
+    bool released = false;
+    pthread_mutex_lock(&sig_lock);
+    for (uint64_t c = shared_claimed; c; c &= c - 1) {
+        int idx = bit_ctz64(c);
+        if (shared_claim_owner[idx] == t) {
+            shared_claim_release_locked(idx + 1);
+            released = true;
+        }
+    }
+    pthread_mutex_unlock(&sig_lock);
+
+    /* A released signal is visible to the other threads again; wake the ones
+     * parked in a wait so they look.
+     */
+    if (released)
+        attention_raise();
 }
 
 /* Guest ITIMER_REAL API. */
@@ -1590,38 +1703,50 @@ static int signal_first_waking_locked(uint64_t candidates)
     return 0;
 }
 
-static bool signal_set_would_wake_locked(uint64_t candidates)
-{
-    return signal_first_waking_locked(candidates) != 0;
-}
-
-/* Bind a process-directed signal to this thread by moving it from the shared
- * set into the caller's private set, siginfo included.
+/* The first signal under @blocked that would wake this thread, claimed for it
+ * when it came from the shared set (see shared_claim_owner).
  *
  * signal_deliver() drains the shared set on whichever thread reaches it first,
  * so a waiter that woke on a shared signal can lose it to another vCPU and
  * return with no handler to run -- and, for sigsuspend, with its temporary mask
  * still installed and nothing left to restore it. Claiming the signal while
  * still holding sig_lock makes this thread's delivery the one that happens.
- * Caller holds sig_lock.
+ * Private set first, matching signal_deliver()'s dequeue order: a
+ * thread-directed signal is already bound here. Without a thread to claim for
+ * there is only one vCPU to race with. Caller holds sig_lock.
  */
-static void signal_claim_shared_locked(signal_pending_t *tp, int signum)
+static int signal_claim_waking_locked(uint64_t blocked)
 {
-    /* Seed the descriptor before dequeuing, the same way signal_deliver() does:
-     * signal_rt_dequeue_locked() leaves it untouched when the RT queue holds no
-     * saved siginfo, so the fields it does not write must already be valid.
-     */
-    signal_rt_info_t info = signal_default_info(signum);
-    if (signum >= LINUX_SIGRTMIN) {
-        if (!signal_rt_dequeue_locked(&sig_state.shared, signum, &info))
-            return;
-    } else {
-        info = signal_standard_peek_locked(&sig_state.shared, signum);
-        sig_state.shared.std_info_valid[signum - 1] = false;
-        pending_clear(&sig_state.shared.pending, sig_bit(signum));
+    signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
+
+    int signum = signal_first_waking_locked(
+        tp ? pending_load(&tp->pending) & ~blocked : 0);
+    if (signum)
+        return signum;
+
+    signum = signal_first_waking_locked(shared_visible_locked() & ~blocked);
+    if (signum && tp) {
+        shared_claimed |= sig_bit(signum);
+        shared_claim_owner[signum - 1] = current_thread;
     }
-    signal_enqueue_locked(tp, signum, &info);
-    refresh_pending_hint_locked();
+    return signum;
+}
+
+bool signal_claim_interruption(void)
+{
+    /* Same lock-free fast path as signal_pending(). */
+    uint64_t hint =
+        atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
+    uint64_t blocked =
+        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    if ((hint & ~blocked) == 0)
+        return false;
+
+    pthread_mutex_lock(&sig_lock);
+    blocked = atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    bool claimed = signal_claim_waking_locked(blocked) != 0;
+    pthread_mutex_unlock(&sig_lock);
+    return claimed;
 }
 
 /* rt_sigsuspend. */
@@ -1678,28 +1803,7 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
             pthread_mutex_lock(&sig_lock);
             uint64_t now_blocked = atomic_load_explicit(thread_blocked_ptr(),
                                                         memory_order_acquire);
-            signal_pending_t *tp =
-                current_thread ? &current_thread->tpending : NULL;
-
-            /* Private set first, matching signal_deliver()'s dequeue order: a
-             * thread-directed signal is already bound here and needs no claim.
-             */
-            int wake_sig = signal_first_waking_locked(
-                tp ? pending_load(&tp->pending) & ~now_blocked : 0);
-            if (!wake_sig) {
-                int shared_sig = signal_first_waking_locked(
-                    pending_load(&sig_state.shared.pending) & ~now_blocked);
-                if (shared_sig) {
-                    wake_sig = shared_sig;
-
-                    /* Without a thread to bind it to there is only one vCPU to
-                     * race with, so leave the signal shared.
-                     */
-                    if (tp)
-                        signal_claim_shared_locked(tp, shared_sig);
-                }
-            }
-            woke = wake_sig != 0;
+            woke = signal_claim_waking_locked(now_blocked) != 0;
             pthread_mutex_unlock(&sig_lock);
             if (woke)
                 break;
@@ -1781,7 +1885,7 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
      */
     signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
     uint64_t thread_m = tp ? (pending_load(&tp->pending) & mask) : 0;
-    uint64_t shared_m = pending_load(&sig_state.shared.pending) & mask;
+    uint64_t shared_m = shared_visible_locked() & mask;
 
     if ((thread_m | shared_m) == 0) {
         pthread_mutex_unlock(&sig_lock);
@@ -1800,13 +1904,13 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
 
     /* Dequeue: same logic as signal_deliver. */
     if (signum >= LINUX_SIGRTMIN) {
-        /* Seed before dequeuing, the same way signal_deliver and
-         * signal_claim_shared_locked do. A pending RT bit whose queue holds no
-         * saved siginfo is reachable, and signal_rt_dequeue_locked leaves the
-         * descriptor untouched when it hits one, so without the seed the caller
-         * copies uninitialized host stack into the guest's siginfo_t. Linux
-         * collect_signal() fills the same default rather than withholding the
-         * signal, so the signum is still reported.
+        /* Seed before dequeuing, the same way signal_deliver does. A pending RT
+         * bit whose queue holds no saved siginfo is reachable, and
+         * signal_rt_dequeue_locked leaves the descriptor untouched when it hits
+         * one, so without the seed the caller copies uninitialized host stack
+         * into the guest's siginfo_t. Linux collect_signal() fills the same
+         * default rather than withholding the signal, so the signum is still
+         * reported.
          */
         *info_out = signal_default_info(signum);
         signal_rt_dequeue_locked(src, signum, info_out);
@@ -1815,6 +1919,8 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
         src->std_info_valid[signum - 1] = false;
         pending_clear(&src->pending, sig_bit(signum));
     }
+    if (src == &sig_state.shared)
+        shared_claim_release_locked(signum);
     refresh_pending_hint_locked();
 
     pthread_mutex_unlock(&sig_lock);
@@ -1899,13 +2005,15 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
          * continue are silently discarded by signal_deliver and must NOT
          * interrupt the wait. Only a signal with a real handler, or a SIG_DFL
          * TERM/CORE disposition, justifies waking the caller with -EINTR.
+         * Claimed, not just seen, so a sibling woken by the same
+         * process-directed signal does not report EINTR for it too.
          */
         pthread_mutex_lock(&sig_lock);
         _Atomic uint64_t *blocked = thread_blocked_ptr();
-        uint64_t candidates =
-            self_pending_locked() &
-            ~atomic_load_explicit(blocked, memory_order_relaxed) & ~mask;
-        bool interrupt = signal_set_would_wake_locked(candidates);
+        bool interrupt =
+            signal_claim_waking_locked(
+                atomic_load_explicit(blocked, memory_order_relaxed) | mask) !=
+            0;
         pthread_mutex_unlock(&sig_lock);
         if (interrupt) {
             if (has_timeout)
@@ -2489,10 +2597,24 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
     signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
     uint64_t self_blocked = atomic_load_explicit(blocked, memory_order_relaxed);
     uint64_t thread_d = tp ? (pending_load(&tp->pending) & ~self_blocked) : 0;
-    uint64_t shared_d = pending_load(&sig_state.shared.pending) & ~self_blocked;
+    uint64_t shared_d = shared_visible_locked() & ~self_blocked;
     if ((thread_d | shared_d) == 0) {
         pthread_mutex_unlock(&sig_lock);
         return 0;
+    }
+
+    /* A wait that left its temporary mask for this delivery hands the saved
+     * mask to the first frame built, so that frame goes to the signal the wait
+     * claimed. A thread-directed signal delivered first would put the original
+     * mask back at its rt_sigreturn, over the claimed one.
+     */
+    uint64_t claimed_here = 0;
+    if (tp && *thread_saved_valid_ptr()) {
+        for (uint64_t c = shared_claimed & shared_d; c; c &= c - 1) {
+            int idx = bit_ctz64(c);
+            if (shared_claim_owner[idx] == current_thread)
+                claimed_here |= BIT64(idx);
+        }
     }
 
     /* Linux dequeue_signal() drains task->pending before shared_pending, so the
@@ -2501,7 +2623,10 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
      */
     int signum;
     signal_pending_t *src;
-    if (thread_d) {
+    if (claimed_here) {
+        signum = bit_ctz64(claimed_here) + 1;
+        src = &sig_state.shared;
+    } else if (thread_d) {
         signum = bit_ctz64(thread_d) + 1;
         src = tp;
     } else {
@@ -2521,6 +2646,8 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
         src->std_info_valid[signum - 1] = false;
         pending_clear(&src->pending, sig_bit(signum));
     }
+    if (src == &sig_state.shared)
+        shared_claim_release_locked(signum);
 
     /* A directed dequeue cleared a bit that only this thread's set held, so the
      * global hint must be recomputed from the surviving pending state.

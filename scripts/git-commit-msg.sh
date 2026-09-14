@@ -15,6 +15,10 @@
 
 set -uo pipefail
 
+# Every rule below is defined over printable ASCII, and a glob range or a
+# bracket expression follows LC_COLLATE instead. Decide them all in C.
+export LC_ALL=C
+
 message_file=$1
 
 # "-" reads standard input. The hook itself is always handed a real path, but

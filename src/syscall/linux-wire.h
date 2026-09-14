@@ -76,6 +76,7 @@ typedef struct {
 #define LINUX_ECHILD 10
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_EOVERFLOW 75
+#define LINUX_EREMOTEIO 121 /* Remote I/O error (usbfs URB_SHORT_NOT_OK) */
 #define LINUX_ECONNREFUSED 111
 #define LINUX_ECONNRESET 104
 #define LINUX_ECONNABORTED 103
@@ -140,6 +141,26 @@ typedef struct {
 #define LINUX_FIOASYNC 0x5452   /* set/clear O_ASYNC (arg: int *) */
 #define LINUX_TIOCNOTTY 0x5422  /* -> macOS TIOCNOTTY (same semantics) */
 #define LINUX_TIOCGSID 0x5429   /* -> macOS TIOCGSID (same semantics) */
+
+/* The rest of what do_vfs_ioctl answers for every file before it calls
+ * f_op->unlocked_ioctl (fs/ioctl.c), beside FIONBIO and FIOASYNC above. Nothing
+ * here serves them; the numbers exist so a file's own ioctl handler can tell a
+ * request that reaches it from one that never does. FIONREAD is not among them:
+ * do_vfs_ioctl hands that one to vfs_ioctl for anything that is not a regular
+ * file. Neither are the FS_IOC_*FLAGS and FS_IOC_FS*XATTR arms, which answer
+ * -ENOIOCTLCMD for an inode with no fileattr operations and are retried through
+ * vfs_ioctl.
+ */
+#define LINUX_FIOQSIZE 0x5460             /* bytes behind the inode */
+#define LINUX_FIGETBSZ 0x00000002         /* the superblock's block size */
+#define LINUX_FIFREEZE 0xC0045877         /* freeze the filesystem */
+#define LINUX_FITHAW 0xC0045878           /* thaw it */
+#define LINUX_FS_IOC_FIEMAP 0xC020660B    /* map an inode's extents */
+#define LINUX_FICLONE 0x40049409          /* reflink a whole file */
+#define LINUX_FICLONERANGE 0x4020940D     /* reflink a range of one */
+#define LINUX_FIDEDUPERANGE 0xC0189436    /* dedupe a range against others */
+#define LINUX_FS_IOC_GETFSUUID 0x80111500 /* the superblock's UUID */
+#define LINUX_FS_IOC_GETFSSYSFSPATH 0x80811501 /* its sysfs path */
 
 /* Serial line control. Linux encodes the argument in the ioctl arg word itself;
  * macOS has no ioctl form and exposes tcsendbreak/tcdrain/tcflush/tcflow.

@@ -706,6 +706,8 @@ run_unit_tests()
     test_check "$runner" "test-clone-childtid" "PASS" "$bindir/test-clone-childtid"
     test_check "$runner" "test-exec" "exec-works" "$bindir/test-exec" "$bindir/echo-test" exec-works
     test_check "$runner" "test-fork-exec" "PASS" "$bindir/test-fork-exec" "$bindir/echo-test"
+    test_check "$runner" "test-fork-wait-latency" "PASS" \
+        "$bindir/test-fork-wait-latency"
     test_rc "$runner" "test-process-lifecycle" 0 \
         "$bindir/test-process-lifecycle"
     test_check "$runner" "test-cloexec" "PASS" "$bindir/test-cloexec"
@@ -718,6 +720,14 @@ run_unit_tests()
     test_check "$runner" "test-signal-thread" "PASS|0 failed" "$bindir/test-signal-thread"
     test_check "$runner" "test-signal-in-shim" "0 failed" \
         "$bindir/test-signal-in-shim"
+    test_check "$runner" "test-nanosleep-signal-latency" "PASS" \
+        "$bindir/test-nanosleep-signal-latency"
+    test_check "$runner" "test-nanosleep-process-signal" "PASS" \
+        "$bindir/test-nanosleep-process-signal"
+    test_check "$runner" "test-wait-process-signal" " - PASS" \
+        "$bindir/test-wait-process-signal"
+    test_check "$runner" "test-wait-sigmask-signal" " - PASS" \
+        "$bindir/test-wait-sigmask-signal"
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
         "$bindir/test-ptrace-interrupt"
     test_check "$runner" "test-sigsuspend" "PASS|0 failed" "$bindir/test-sigsuspend"
@@ -894,6 +904,16 @@ run_unit_tests()
         "$bindir/test-futex-wake-nowaiter"
     test_rc "$runner" "test-futex-requeue-account" 0 \
         "$bindir/test-futex-requeue-account"
+    test_rc "$runner" "test-futex-requeue-samebucket" 0 \
+        "$bindir/test-futex-requeue-samebucket"
+    test_rc "$runner" "test-futex-requeue-pi" 0 \
+        "$bindir/test-futex-requeue-pi"
+    test_rc "$runner" "test-futex-wake-op-enosys" 0 \
+        "$bindir/test-futex-wake-op-enosys"
+    test_rc "$runner" "test-futex-wake-pi" 0 \
+        "$bindir/test-futex-wake-pi"
+    test_rc "$runner" "test-futex-waitv-buckets" 0 \
+        "$bindir/test-futex-waitv-buckets"
     test_rc "$runner" "test-robust-futex" 0 "$bindir/test-robust-futex"
     test_rc "$runner" "test-futex-ops" 0 \
         "$bindir/test-futex-ops"
@@ -1472,14 +1492,23 @@ run_suite()
 # made the floor one higher than the lanes could reach on a checkout without
 # fixtures. qemu-aarch64 runs test-futex-timed too. The other two are
 # elfuse-internal, test-ptrace-interrupt by way of QEMU_SKIP since a ptrace-stop
-# register snapshot has no counterpart there, so the qemu floor should be 226;
-# it stays at 225 deliberately, because the qemu fixtures are not present on the
-# machine that made these changes and 226 would be a number nobody observed. A
-# floor too low costs nothing; an unobserved one asserts a run that did not
-# happen.
+# register snapshot has no counterpart there, so the qemu floor was 226; it
+# stayed at 225 deliberately, because the qemu fixtures were not present on the
+# machine that made those changes and 226 would have been a number nobody
+# observed. A floor too low costs nothing; an unobserved one asserts a run that
+# did not happen.
+#
+# Both floors then went up by one for test-futex-requeue-samebucket, which
+# regression-tests FUTEX_REQUEUE(X, X): no fixture, not in QEMU_SKIP, so it runs
+# in both lanes. elfuse-aarch64 251 and qemu-aarch64 226 were both observed
+# there (285 and 263 respectively, fixtures present), unlike the 225 above.
+#
+# Both went up by one again for test-futex-wake-pi, which regression-tests the
+# EINVAL a plain wake owes a PI waiter, and which runs in both lanes for the
+# same two reasons. 252 and 227, observed here at 286 and 264.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|250|0"
-    "qemu-aarch64|225|0"
+    "elfuse-aarch64|252|0"
+    "qemu-aarch64|227|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

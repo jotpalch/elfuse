@@ -103,6 +103,33 @@ expect_fail 'body line 73' 'Add a syscall
 expect_fail 'single word' 'Fix' 'more than one word'
 expect_fail '51 characters' 'Reject a syscall that outlives its own page tables!' 'exceeds 50'
 expect_fail 'lowercase start' 'add a syscall' 'capital letter'
+
+# Rule 3 decides the case of the first letter with a glob range, and a range
+# follows LC_COLLATE rather than ASCII. Only a locale that interleaves the cases
+# puts a capital inside [a-z], and a UTF-8 charmap alone does not say that: a
+# C.UTF-8 keeps the C collation and takes the same branch the C locale does. Ask
+# each candidate whether "A" falls in the range, put the accepted subject to the
+# ones that say yes, and say so when no candidate does.
+locale_legs=0
+for locale_name in $(locale -a 2>/dev/null | grep -i 'utf-*8$'); do
+    (
+        export LC_ALL="$locale_name"
+        # The constant subject is the point: ask where this locale sorts "A".
+        # shellcheck disable=SC2194
+        case A in [a-z]) exit 0 ;; esac
+        exit 1
+    ) || continue
+    checks=$((checks + 1))
+    locale_legs=$((locale_legs + 1))
+    if ! locale_out=$(printf 'Add a syscall' | LC_ALL="$locale_name" "$hook" - 2>&1); then
+        printf 'FAIL (rejected under %s): %s\n' "$locale_name" "$locale_out" >&2
+        failures=$((failures + 1))
+    fi
+    [ "$locale_legs" -lt 8 ] || break
+done
+if [ "$locale_legs" -eq 0 ]; then
+    echo 'note: no UTF-8 locale here collates a capital into [a-z]' >&2
+fi
 expect_fail 'trailing period' 'Add a syscall.' 'end with a period'
 expect_fail 'past tense' 'Added a syscall' 'imperative mood'
 expect_fail 'gerund' 'Adding a syscall' 'imperative mood'

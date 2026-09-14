@@ -2242,10 +2242,27 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
             } else if (ret == 0) {
                 still_active = true;
             } else {
+                /* ret < 0, in practice ECHILD: the host child is gone. It can
+                 * be gone because proc_deferred_reap_poll() took it from the
+                 * watchdog tick, which reaches a single-threaded guest parked
+                 * here and not only one racing a second guest thread. When the
+                 * registry already carried the exit, the entry holds the status
+                 * and the rusage, so finish it the way the ret == host_pid
+                 * branch does: deactivating alone drops the child's time from
+                 * RUSAGE_CHILDREN and leaves the lifecycle row to be imported
+                 * again.
+                 */
                 proc_entry_t *entry =
                     proc_find_host_guest_entry(host_pid, guest_pid);
-                if (entry)
+                if (entry && entry->exited) {
+                    proc_account_entry_locked(entry);
                     entry->active = false;
+                    pthread_mutex_unlock(&pid_lock);
+                    lifecycle_consume(guest_pid);
+                    pthread_mutex_lock(&pid_lock);
+                } else if (entry) {
+                    entry->active = false;
+                }
             }
         }
         pthread_mutex_unlock(&pid_lock);
@@ -2261,6 +2278,25 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
             return wait_rc;
         }
     }
+}
+
+/* Has the local table already recorded this child's exit? The lifecycle
+ * registry carries the guest exit before the child's host process finishes
+ * tearing down, so this can be true while waitpid(2) on the host pid still
+ * reports the process as running.
+ */
+static bool proc_guest_child_exited_locked(int64_t guest_pid)
+{
+    proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+    return entry && entry->exited;
+}
+
+static bool proc_guest_child_exited(int64_t guest_pid)
+{
+    pthread_mutex_lock(&pid_lock);
+    bool exited = proc_guest_child_exited_locked(guest_pid);
+    pthread_mutex_unlock(&pid_lock);
+    return exited;
 }
 
 /* sys_wait4. */
@@ -2282,24 +2318,37 @@ static void proc_deferred_reap_poll(void)
             proc_table[i].host_reap_pending = false;
             continue;
         }
+
+        /* Claim the entry by clearing the flag before dropping the lock, and
+         * put it back below if the child was not reapable after all. The
+         * watchdog tick made this a second concurrent caller even for a guest
+         * with one thread, and two callers that both saw the flag would both
+         * call wait4 on this host_pid. The host OS can hand that pid to a
+         * freshly spawned fork child the instant the first call reaps it, so
+         * the second would reap that one and discard its status. The paired
+         * lookup below guards which entry the flag is written back to, not the
+         * reap itself.
+         */
+        proc_table[i].host_reap_pending = false;
         pthread_mutex_unlock(&pid_lock);
         int st;
         pid_t r = wait4(host_pid, &st, WNOHANG, NULL);
         pthread_mutex_lock(&pid_lock);
 
-        /* Only clear the flag once the zombie is gone (r > 0) or the child is
-         * no longer ours to reap (r < 0, typically ECHILD). The guest_pid check
-         * guards against host_pid reuse: the host OS can hand this exact pid to
-         * a brand new process the instant wait4 above reaps it, and a second
-         * guest fork admitted on another thread during this unlocked window
-         * could land that new child in slot i under the same host_pid. Clearing
-         * host_reap_pending for it instead of (or in addition to) the original
-         * entry would strand a real pending zombie.
+        /* Restore the claim when the child was still running (r == 0), so a
+         * later sweep tries again; a reaped zombie (r > 0) or one that is no
+         * longer ours (r < 0, typically ECHILD) stays cleared. The guest_pid
+         * check guards against host_pid reuse: the host OS can hand this exact
+         * pid to a brand new process the instant wait4 above reaps it, and a
+         * second guest fork admitted on another thread during this unlocked
+         * window could land that new child in slot i under the same host_pid.
+         * Writing the flag back onto it would ask a later sweep to reap a live
+         * child.
          */
-        if (r != 0 && i < proc_table_capacity &&
+        if (r == 0 && i < proc_table_capacity &&
             proc_table[i].host_pid == host_pid &&
             proc_table[i].guest_pid == guest_pid)
-            proc_table[i].host_reap_pending = false;
+            proc_table[i].host_reap_pending = true;
     }
     pthread_mutex_unlock(&pid_lock);
 }
@@ -2563,9 +2612,41 @@ int64_t sys_wait4(guest_t *g,
                         return -LINUX_EINTR;
                     struct timespec ts;
                     timespec_deadline_in_ms(&ts, 100);
+
+                    /* Import before the sleep as well as after it. The poll
+                     * above runs unlocked, so a broadcast landing between it
+                     * and the lock below finds nobody parked and evaporates:
+                     * pid_cond keeps no count. The doorbell sets entry->exited
+                     * under pid_lock before it broadcasts, so re-reading the
+                     * table inside the same critical section the sleep releases
+                     * is what closes that window. The import itself stays
+                     * outside the lock, like the poll: it touches the registry
+                     * file, and pid_lock holds only bounded table walks.
+                     */
+                    lifecycle_import_children();
                     pthread_mutex_lock(&pid_lock);
+                    if (proc_guest_child_exited_locked(gpid)) {
+                        pthread_mutex_unlock(&pid_lock);
+                        return sys_wait4(g, pid, status_gva, options,
+                                         rusage_gva);
+                    }
                     pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
                     pthread_mutex_unlock(&pid_lock);
+
+                    /* The doorbell reports the guest exit about a millisecond
+                     * before the child's host process becomes reapable, so the
+                     * poll above still says "running" when the wakeup arrives.
+                     * The registry carries the exit by then, so importing it
+                     * copies the status across and flags the host reap for
+                     * proc_deferred_reap_poll(), after which the table lookup
+                     * at the top of sys_wait4 answers without waiting for the
+                     * host process at all. Without this the wakeup is wasted
+                     * and the wait costs the full 100 ms timeout.
+                     */
+                    lifecycle_import_children();
+                    if (proc_guest_child_exited(gpid))
+                        return sys_wait4(g, pid, status_gva, options,
+                                         rusage_gva);
                 }
             }
             if (ret > 0) {
@@ -2574,6 +2655,22 @@ int64_t sys_wait4(guest_t *g,
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
             }
+
+            /* ECHILD here does not have to mean the guest has no such child.
+             * proc_deferred_reap_poll() collects host zombies whose status the
+             * guest already has, and it runs from the watchdog tick as well as
+             * from this entry, so it can take this host_pid between the poll
+             * above and this line. The status is copied into the table before
+             * the reap is flagged, so ask the table before reporting the host
+             * errno; the re-entry answers from the lookup at the top.
+             */
+            int wait_errno = errno;
+            if (wait_errno == ECHILD) {
+                lifecycle_import_children();
+                if (proc_guest_child_exited(gpid))
+                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+            }
+            errno = wait_errno;
             return linux_errno();
         }
     }
@@ -2953,8 +3050,37 @@ static void *preempt_thread_main(void *arg)
             atomic_store_explicit(&g_external_guest_signal, 1,
                                   memory_order_release);
             drain_external_guest_signal();
+
+            /* The doorbell is also how a fork child reports that it exited.
+             * sys_wait4 and sys_waitid sleep on pid_cond between re-checks, and
+             * nothing on this path signaled it, so a waiting parent only
+             * re-checked when its 100 ms safety-net timeout expired: every
+             * fork/wait pair paid that timeout in full even though the child
+             * was already gone.
+             *
+             * Broadcast under pid_lock, not beside it. A sleeper holds the lock
+             * across its predicate check and only releases it inside
+             * pthread_cond_timedwait, so taking the lock here means the
+             * broadcast cannot land in the window between the two and be lost.
+             * pid_lock is a leaf (see the lock-order block in
+             * syscall/internal.h) and every critical section under it is a
+             * bounded table walk, so this cannot invert an order or park the
+             * sigwait thread on someone else's blocking call.
+             */
+            pthread_mutex_lock(&pid_lock);
+            pthread_cond_broadcast(&pid_cond);
+            pthread_mutex_unlock(&pid_lock);
             wakeup_pipe_signal();
         } else if (sig == SIGALRM) {
+            /* sys_wait4's entry is the only other caller, so a guest that takes
+             * its last child's status and never waits again strands that
+             * child's host process as a zombie for the rest of the run. The
+             * tick already exists and already runs on this thread, so sweeping
+             * from it bounds the strand to a period or two without adding a
+             * thread, a wakeup, or a cost on the wait path.
+             */
+            proc_deferred_reap_poll();
+
             static uint64_t last_progress;
             uint64_t now =
                 atomic_load_explicit(&g_vcpu_progress, memory_order_relaxed);
@@ -3997,6 +4123,12 @@ static bool syscall_return_epilogue(guest_t *g,
             frame_restored = false; /* committed to a handler frame: X8 = 2 */
     }
 
+    /* A temporary mask a wait left for this delivery comes back now if no frame
+     * took it. A deferred stop delivers at HVC #13 and restores there.
+     */
+    if (!defer_stop)
+        signal_restore_saved_blocked();
+
     /* X7 asks the shim to restore its SVC frame and enter HVC #13 for this
      * stop. Written only on the tails that do restore the frame, which put the
      * guest's own X7 back before the ERET. The flag beside it is what lets the
@@ -4178,6 +4310,7 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
             }
             cpu_ptrace_stop_armed = false;
             running = ptrace_take_stop(g, vcpu, exit_code);
+            signal_restore_saved_blocked();
             break;
 
         case 2: {

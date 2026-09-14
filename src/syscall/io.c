@@ -235,11 +235,12 @@ int64_t io_retry_backoff(unsigned *backoff_us)
 
     /* Teardown, or a signal Linux would have delivered: semop, flock and
      * F_SETLKW are all interruptible, and the blocking host calls these replace
-     * were reachable by neither. signal_pending_interruption already filters
-     * SIG_IGN, default-ignore, and SA_RESTART, so it cannot manufacture an
-     * EINTR the guest would not have seen.
+     * were reachable by neither. SIG_IGN and default-ignore signals do not
+     * count. Teardown is tested first so a thread an execve reaps never claims
+     * a process-directed signal, and the claim keeps a sibling contending for
+     * the same lock from also reporting EINTR for it.
      */
-    if (thread_stop_requested() || signal_pending_interruption(NULL))
+    if (thread_stop_requested() || signal_claim_interruption())
         return -LINUX_EINTR;
 
     /* First miss: yield rather than sleep. A lock or semaphore released inside
@@ -329,8 +330,12 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
          * wakeup pipe plus thread_interrupt_all -- which the one-shot's raiser
          * sends alongside it -- already break this poll. The edge stays where
          * it belongs, for the next futex or poll wait that is entitled to it.
+         *
+         * Claimed rather than tested: the wakeup pipe wakes every thread parked
+         * here at once, and one that only saw a process-directed signal in the
+         * shared set would report EINTR while a sibling ran the handler.
          */
-        if (signal_pending_interruption(NULL))
+        if (signal_claim_interruption())
             return -LINUX_EINTR;
 
         /* Bounded wait even when the wakeup pipe exists: the pipe is a
@@ -702,7 +707,7 @@ static int64_t tty_drain_interruptible(int host_fd)
         bool leader_only = thread_stop_is_leader_work_only();
         bool interrupted = (!leader_only && thread_stop_requested()) ||
                            (!leader_only && futex_interrupt_consume()) ||
-                           signal_pending_interruption(NULL);
+                           signal_claim_interruption();
         if (!interrupted) {
             int ret = poll(fds, 1, leader_only ? 0 : 20);
             if (ret < 0 && errno != EINTR)

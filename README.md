@@ -15,7 +15,7 @@ linker resolved against an external sysroot via `--sysroot`.
 
 ## Features
 
-- Single native macOS binary (~560 KiB signed), no daemon and no disk
+- Single native macOS binary (under 1 MiB signed), no daemon and no disk
   image
 - Millisecond-scale VM startup; per-syscall overhead is microseconds
 - Native Apple Silicon execution through Hypervisor.framework
@@ -31,11 +31,13 @@ linker resolved against an external sysroot via `--sysroot`.
   case-colliding names on the default case-folding APFS (see
   [docs/filenames.md](docs/filenames.md))
 - Synthetic `/proc` and selected `/dev` emulation for user-space probes
-- Synthetic USB device tree: `/dev/bus/usb` plus `/sys/bus/usb/devices`
-  built from the IOKit registry, enough for libusb-style enumeration
-  (a udev-backed `lsusb` also needs `name_to_handle_at`, which is not
-  implemented yet; and macOS publishes no root hubs, so there are no
-  `usbN` entries and `lsusb -t` lists devices without their bus rows)
+- USB device passthrough: `/dev/bus/usb` and `/sys/bus/usb/devices` are
+  built from the IOKit registry, and opening a device node yields a
+  usbdevfs fd whose ioctls -- interface claim, control and bulk transfers,
+  and asynchronous URBs -- drive the attached device through IOKit. A
+  udev-backed `lsusb` also needs `name_to_handle_at`, and macOS publishes
+  no root hubs, so there are no `usbN` entries and `lsusb -t` lists devices
+  without their bus rows
 - Guest-internal FUSE: `/dev/fuse` and `mount("fuse")` work without
   macFUSE / FUSE-T / FSKit
 - Built-in GDB Remote Serial Protocol stub usable from `gdb` or `lldb`
@@ -71,15 +73,21 @@ boot-time overhead those tools impose.
   than leave it to convention, which is a real gain, but the checks inside
   those accessors are the same ones to get right.
 - The defects that surface here are arithmetic and design errors, not
-  memory-safety errors. An overflow-saturated `load_max` in `src/core/elf.c`
-  wraps once the PIE load base is added in `src/syscall/exec.c`, pushing a
-  rejection past the `execve` point of no return. Rust's `+` wraps in release
-  builds too; catching it takes an explicit checked add either way.
+  memory-safety errors. An ELF whose `p_vaddr + p_memsz` overflows has to be
+  rejected where `src/core/elf.c` parses it: saturating `load_max` to
+  `UINT64_MAX` instead relocates the wrap into every consumer that adds a
+  load base, where the `elf_end > guest_size` check it was meant to trip
+  passes. Rust's `+` wraps in release builds too; catching it takes an
+  explicit checked add either way.
 - What guards the memory-safety side is language-independent and already
   gates CI: `cppcheck`, `clang-tidy`, `scan-build`, Infer, and a runtime
   matrix under ASAN, UBSAN, and TSAN. That catches such defects after the
   fact rather than excluding them by construction, which is the honest cost
-  of the choice.
+  of the choice. Frama-C proves each selected function body free of arithmetic
+  runtime errors, assuming its stated preconditions: the WP targets in
+  `mk/verify.mk` (`make verify`) discharge the bounds math in `src/proved/` and
+  the ELF loader's arithmetic helpers under `-wp-rte`, and
+  `make verify-mutants` asserts each proof rejects a known-broken source.
 - The host surface is nearly all C ABI: Hypervisor.framework, Mach, pthreads,
   macOS syscalls, `SCM_RIGHTS`, and hosting Apple Rosetta. The EL1 shim is
   aarch64 assembly under any host language.
@@ -171,14 +179,17 @@ make elfuse        # build and codesign build/elfuse
 make check         # quick unit suite + BusyBox applet smoke
 make test-gdbstub  # debugger integration
 make test-matrix   # cross-check elfuse against QEMU on the same corpus
+make verify        # Frama-C WP proofs
 make lint          # clang-tidy
 ```
 
 `make check` is the recommended pre-commit gate. `make test-matrix` is the
 recommended gate for changes touching procfs, dynamic linking, networking,
 or process semantics. `make test-rosetta-all` covers the x86_64 acceptance
-suites in isolation. See [docs/testing.md](docs/testing.md) for the full
-target list, fixture flow, and validation-by-change-type guidance.
+suites in isolation. `make verify` and `make verify-mutants` gate changes to
+`src/proved/`, to the ACSL contracts, or to any function a proof target
+names. See [docs/testing.md](docs/testing.md) for the full target list,
+fixture flow, and validation-by-change-type guidance.
 
 The first `make` in a fresh clone installs Git hooks that run the same checks
 CI does, at commit and push time instead of after: staged formatting, comment
@@ -204,15 +215,21 @@ do.
   `posix_spawn`-ing a fresh `elfuse` host process and transferring
   state (see [docs/internals.md](docs/internals.md)).
 - Up to 64 concurrent guest threads per VM (`MAX_THREADS = 64`).
-- Around 213 syscalls implemented; anything outside
-  `src/syscall/dispatch.tbl` returns `-ENOSYS` rather than silently
-  succeeding.
+- The implemented syscall set is `src/syscall/dispatch.tbl`; anything
+  outside it returns `-ENOSYS` rather than silently succeeding.
 - `FUTEX_LOCK_PI` and friends behave as plain mutex acquire / release;
   true priority-inheritance scheduling is not modeled.
 - `sched_setaffinity` is honored as a no-op (returns the all-CPUs
   mask); the host scheduler picks the actual CPU.
 - `/proc`, `/dev`, and mount data are synthetic compatibility views,
   not host pass-throughs.
+- USB interfaces bound to an Apple class driver (CDC serial, HID, FTDI)
+  cannot be claimed; `CLAIMINTERFACE` reports `EBUSY`, and root-mode
+  device capture is not implemented. CDC serial devices are reachable by
+  opening the host's `/dev/cu.*` node instead.
+- USB mass storage will never be claimable, even with capture; macOS
+  does not release it.
+- Isochronous URBs are unimplemented; submitting one reports `EINVAL`.
 - `uname` and `/proc/version` report Linux 6.18 LTS, a floor for
   version-gated userspace; `src/syscall/dispatch.tbl` states what is
   implemented.

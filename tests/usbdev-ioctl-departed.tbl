@@ -1,0 +1,184 @@
+# What Linux answers for the usbdevfs ioctls this layer names, issued on a
+# device that has gone.
+#
+# Copyright 2026 elfuse contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Read once out of drivers/usb/core/devio.c at tag v6.15 and recorded here, so
+# that no comment in this tree has to assert it in prose. Every line number
+# below is that file at that tag -- git blob
+# f6ce6e26e0d45f67704f40b27c5a09cde9111259, which v6.15 through v6.19 all
+# carry unchanged. Two facts decide every row:
+#
+#   usbdev_do_ioctl (devio.c:2600-2641) lets REAPURB and REAPURBNDELAY past
+#   first and then refuses everything else with -ENODEV once connected(ps) is
+#   false, so the argument checks inside every proc_* handler live behind that
+#   gate and cannot be reached on a departed device.
+#
+#   reap_as (devio.c:2081-2102) leaves its wait as soon as connected(ps) is
+#   false, and proc_reapurbnonblock (devio.c:2121-2135) answers -ENODEV rather
+#   than -EAGAIN in the same state, so the two ioctls that are let past the gate
+#   answer -ENODEV of their own accord once nothing is left to hand back.
+#
+#   usbdev_poll (devio.c:2833-2847) raises EPOLLHUP from the same connected(ps)
+#   and EPOLLERR from the empty ps->list that usbdev_remove leaves behind, so
+#   every fd open on the node reads POLLERR|POLLHUP afterwards, whether or not
+#   it was the fd that asked.
+#
+# tests/test-usbdev-ioctl-departed.c drives each row and asserts the tuple.
+# scripts/gen-usbdev-ioctl-departed.py joins this file against the dispatch in
+# src/syscall/usbdev.c and emits tests/usbdev-ioctl-departed-vectors.h; a
+# usbdevfs ioctl the layer implements with no row here fails the gate, so the
+# table cannot fall behind the surface.
+#
+# The surface is not only what usbdev_ioctl dispatches. A row may name a
+# USBDEVFS_ request that file defines and dispatches nowhere, and that row
+# drives the default arm; the generator refuses to emit while usbdev_ioctl has
+# a default arm and no row reaches it. Without those rows the join could not
+# reach that arm at all, and the -ENOTTY it answered on a departed device sat
+# under a comment claiming this table said what every arm answers.
+#
+# Columns:
+#   id       row name; the lane defines departed_drive_<id> for it
+#   ioctl    the USBDEVFS_ request the row drives
+#   phase    fresh       a freshly opened fd, nothing claimed on it
+#            held-claim  an fd holding a claim taken before the device left
+#            held-release  the same, for the release side
+#   kernel   rc/errno/stamp/peer that Linux answers
+#            rc     the ioctl(2) return
+#            errno  errno when rc is -1, otherwise NONE
+#            stamp  poll revents on the fd that asked
+#            peer   poll revents on another fd open on the same node
+#   elfuse   the same tuple where this layer deliberately answers otherwise,
+#            or - where it must match Linux
+#   cite     the devio.c line the Linux answer was read from
+# An indented line after a row is that row's note, and is printed with it.
+
+CONTROL CONTROL fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	DeviceRequestTO reaches the wire and IOKit answers the device gone.
+
+BULK BULK fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	The endpoint lookup claims the owning interface first, and the claim is
+	what asks.
+
+RESETEP RESETEP fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	ClearPipeStallBothEnds behind the same implicit claim.
+
+CLEAR_HALT CLEAR_HALT fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	As RESETEP.
+
+SETINTERFACE SETINTERFACE fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	The explicit claim ahead of SetAlternateInterface asks.
+
+SETCONFIGURATION SETCONFIGURATION fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	The bound-driver enumeration ahead of SetConfiguration asks.
+
+GETDRIVER GETDRIVER fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	The interface enumeration is the question.
+
+DISCONNECT_CLAIM DISCONNECT_CLAIM fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	As GETDRIVER.
+
+DRIVER_IOCTL IOCTL fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	USBDEVFS_IOCTL with the DISCONNECT sub-code; proc_ioctl carries a
+	connected() test of its own at devio.c:2330 behind the outer gate.
+
+RESET RESET fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	RESET touches no pipe with nothing claimed, so the question is asked
+	before the emulation runs at all.
+
+CLAIMINTERFACE CLAIMINTERFACE fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	An unheld interface number: the claim asks before it is granted.
+
+CLAIMINTERFACE_BOUND CLAIMINTERFACE fresh -1/ENODEV/ERRHUP/ERRHUP -1/EINVAL/NONE/NONE 2638
+	An interface number past what this layer can represent. claimintf's own
+	bound (devio.c:788-789) sits behind the gate, so on Linux the number is
+	never judged on a device that is gone. Here the bound stays ahead of the
+	device question: it is arithmetic against the width of ps->ifclaimed and
+	reads no device state, and tests/test-usbdev-ioctl.c pins that ordering
+	on a node with no IOKit object behind it. Closing the gap would put a
+	registry enumeration ahead of a check that needs none.
+
+CLAIMINTERFACE_HELD CLAIMINTERFACE held-claim -1/ENODEV/ERRHUP/ERRHUP - 2638
+	An interface this fd already holds. claimintf's already-claimed
+	short-circuit (devio.c:790-791) is behind the gate too.
+
+RELEASEINTERFACE RELEASEINTERFACE fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	An interface this fd does not hold: releaseintf's -EINVAL
+	(devio.c:815-833) is behind the gate.
+
+RELEASEINTERFACE_BOUND RELEASEINTERFACE fresh -1/ENODEV/ERRHUP/ERRHUP -1/EINVAL/NONE/NONE 2638
+	The same bound on the release side, and the same reason for keeping it
+	ahead of the device question.
+
+RELEASEINTERFACE_HELD RELEASEINTERFACE held-release -1/ENODEV/ERRHUP/ERRHUP - 2638
+	An interface this fd does hold, which is the arm that drops the claim
+	and closes the handle.
+
+SUBMITURB SUBMITURB fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	A well-formed bulk URB: the endpoint lookup's implicit claim asks.
+
+SUBMITURB_BADFLAGS SUBMITURB fresh -1/ENODEV/ERRHUP/ERRHUP -1/EINVAL/NONE/NONE 2638
+	A URB carrying a flag bit no type accepts. proc_do_submiturb's argument
+	gate (devio.c:1644-1650) is behind the connected() gate on Linux and
+	ahead of the device question here, for the reason CLAIMINTERFACE_BOUND
+	gives: the flags mask, the transfer bound and the null buffer are
+	decided against the request alone, and tests/test-usbdev-ioctl.c asserts
+	the whole of that order against a node with no device behind it.
+
+DISCARDURB DISCARDURB fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	A userurb pointer this fd never submitted. proc_unlinkurb's own -EINVAL
+	is behind the gate, and unlike the two argument gates above it this one
+	reaches the guest: libusb_cancel_transfer passes the errno through, so
+	an unplug arrived as LIBUSB_ERROR_NOT_FOUND rather than NO_DEVICE. The
+	discard that finds its record asks the device through AbortPipe anyway,
+	so only this arm had to be given the question.
+
+REAPURB REAPURB fresh -1/ENODEV/ERRHUP/ERRHUP -1/EINTR/NONE/NONE 2104
+	Let past the gate, and answered by reap_as: the wait ends on
+	connected(ps) going false, so a blocking reap on a departed device
+	returns rather than parking. Here the wait ends on this fd's own
+	disconnect stamp, which is raised by an IOKit answer, by the terminate
+	watch the async paths arm, or by a peer that learned first. A
+	synchronous-only fd has none of the three, so the reap waits; the row
+	measures that by interrupting it with a signal, which is the answer
+	proc_reapurb gives for a signal too (devio.c:2116-2117).
+
+REAPURBNDELAY REAPURBNDELAY fresh -1/ENODEV/ERRHUP/ERRHUP -1/EAGAIN/NONE/NONE 2132
+	The same gap without the wait: proc_reapurbnonblock picks between
+	-EAGAIN and -ENODEV on connected(ps), and this layer picks on the fd's
+	own stamp.
+
+GET_CAPABILITIES GET_CAPABILITIES fresh -1/ENODEV/ERRHUP/ERRHUP 0/NONE/NONE/NONE 2638
+	Answered from a build constant, with no wire behind it, the way stat
+	and the descriptor read on the same node are. Making it ask would put a
+	registry enumeration on a call that needs none.
+
+GET_SPEED GET_SPEED fresh -1/ENODEV/ERRHUP/ERRHUP 2/NONE/NONE/NONE 2638
+	Answered from the speed recorded at open, as GET_CAPABILITIES. The rc
+	is the USB_SPEED_FULL enumerator the loopback device models.
+
+CONNECTINFO CONNECTINFO fresh -1/ENODEV/ERRHUP/ERRHUP 0/NONE/NONE/NONE 2638
+	Answered from the devnum and speed recorded at open, as GET_SPEED.
+
+DISCSIGNAL DISCSIGNAL fresh -1/ENODEV/ERRHUP/ERRHUP 0/NONE/NONE/NONE 2638
+	Stores a signal number this layer never delivers, so there is nothing
+	for it to ask the device about.
+
+HUB_PORTINFO HUB_PORTINFO fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	A request this layer defines and dispatches nowhere, so it reaches
+	usbdev_ioctl's default arm. Linux implements it (proc_gethubportinfo)
+	and still answers -ENODEV, because connected() is decided before the
+	switch that would reach it; what the arm answers on a device that is
+	still here, -ENOTTY, is outside this table.
+
+ALLOC_STREAMS ALLOC_STREAMS fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	The default arm again, and the row with a guest behind it: libusb maps
+	-ENOTTY on this request to LIBUSB_ERROR_NOT_SUPPORTED and -ENODEV to
+	LIBUSB_ERROR_NO_DEVICE, so an unplugged device that answered -ENOTTY
+	read as a kernel with no bulk-streams support and stayed that way.
+
+WAIT_FOR_RESUME WAIT_FOR_RESUME fresh -1/ENODEV/ERRHUP/ERRHUP - 2638
+	The default arm reached by a request carrying no argument at all,
+	which is the shape that would have slipped past an arm asking the
+	device only when it had a buffer to read.

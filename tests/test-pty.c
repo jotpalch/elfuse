@@ -88,11 +88,17 @@
 int passes = 0, fails = 0;
 
 /* A master with no hangup support blocks these reads forever; the alarm turns
- * that into a visible failure instead of a wedged run.
+ * that into a visible failure instead of a wedged run. The message goes to
+ * stdout because test-matrix.sh discards stderr. The alarm is armed only around
+ * a read, where stdout is at a line boundary.
  */
 static void hup_on_alarm(int sig)
 {
     (void) sig;
+    static const char msg[] =
+        "\ntest-pty: TIMEOUT waiting on a hung-up master read\n";
+    ssize_t ignored = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    (void) ignored;
     _exit(2);
 }
 
@@ -123,6 +129,9 @@ static int count_pts_entries(void)
 
 int main(void)
 {
+    /* Keep completed results when the alarm's _exit(2) fires under a pipe. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("test-pty: PTY ioctl + /dev/pts/N path support\n");
 
     /* Regression guard for the pty_keepalive_table BSS-zero collision: any
@@ -804,20 +813,30 @@ int main(void)
                 EXPECT_TRUE(hr > 0 && (hp.revents & POLLHUP),
                             "no POLLHUP after the last slave closed");
 
+                /* Both reads block forever without hangup support. */
+                signal(SIGALRM, hup_on_alarm);
+
                 char hbuf[16];
-                ssize_t drained = put == (ssize_t) (sizeof(bye) - 1)
-                                      ? read(hup_master, hbuf, sizeof(hbuf))
-                                      : -1;
+                ssize_t drained = -1;
+                if (put == (ssize_t) (sizeof(bye) - 1)) {
+                    alarm(10);
+                    drained = read(hup_master, hbuf, sizeof(hbuf));
+                    alarm(0);
+                }
                 TEST("queued output survives the hangup");
                 EXPECT_TRUE(drained == (ssize_t) (sizeof(bye) - 1) &&
                                 memcmp(hbuf, bye, sizeof(bye) - 1) == 0,
                             "pending slave output was lost");
 
                 errno = 0;
+                alarm(10);
+                ssize_t hret = read(hup_master, hbuf, sizeof(hbuf));
+                int herr = errno;
+                alarm(0);
+
                 TEST("read reports EIO once drained");
-                EXPECT_TRUE(
-                    read(hup_master, hbuf, sizeof(hbuf)) < 0 && errno == EIO,
-                    "read did not report the hangup as EIO");
+                EXPECT_TRUE(hret < 0 && herr == EIO,
+                            "read did not report the hangup as EIO");
             }
             close(hup_master);
         }

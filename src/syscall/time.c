@@ -27,6 +27,7 @@
 #include "syscall/proc.h" /* proc_exit_group_requested, proc_get_pid */
 #include "syscall/signal.h"
 #include "syscall/time.h"
+#include "syscall/wakeup-pipe.h"
 
 /* Linux TIMER_ABSTIME (not defined on all macOS SDK versions) */
 #ifndef TIMER_ABSTIME
@@ -117,8 +118,39 @@ static int64_t interruptible_sleep_ns(guest_t *g,
 {
     int64_t requested_ns = remaining_ns;
 
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) < 0)
+        return linux_errno();
+
+    int64_t elapsed_ns = 0;
+    int64_t stop_due_ns = 0;
+
     while (remaining_ns > 0) {
-        if (thread_stop_requested() || signal_pending()) {
+        /* Read the wake counter before testing the predicate, not after. A wake
+         * that lands in between then moves the counter and wakeup_wait_ns
+         * returns without parking, instead of broadcasting to a thread that has
+         * not arrived yet and being lost.
+         */
+        uint64_t counter = wakeup_counter();
+
+        /* A signal, exit_group and an execve teardown end the sleep on the wake
+         * that reports them. An execve handed to this leader is tested once per
+         * SLEEP_CHUNK_NS instead: a handoff rings thousands of times a second,
+         * and the guest reissues the rest of its interval after every EINTR.
+         * test-exec-handoff measured its 400 ms sleep under handoff pressure
+         * taking 3150 ms across 29390 returns when every ring was answered,
+         * against 432 ms across 3 on this cadence.
+         *
+         * Teardown is tested before a signal is claimed, because a thread an
+         * execve reaps would take a claimed process-directed signal with it.
+         */
+        bool stop_due = elapsed_ns >= stop_due_ns;
+        if (stop_due)
+            stop_due_ns = elapsed_ns + SLEEP_CHUNK_NS;
+
+        bool stop = thread_stop_requested() &&
+                    (stop_due || !thread_stop_is_leader_work_only());
+        if (stop || signal_claim_interruption()) {
             /* Only once part of a relative interval is spent, because the
              * restart re-runs the original request rather than the remainder.
              * This check also runs before the first chunk, where nothing is
@@ -135,24 +167,26 @@ static int64_t interruptible_sleep_ns(guest_t *g,
             return -LINUX_EINTR;
         }
 
-        int64_t sleep_ns =
-            (remaining_ns < SLEEP_CHUNK_NS) ? remaining_ns : SLEEP_CHUNK_NS;
-        struct timespec req = ns_to_host_timespec(sleep_ns);
-        struct timespec rem = {0};
+        /* Park until whichever comes first, the end of the interval or the next
+         * stop test. A wake cuts the park short, so this bounds the stop
+         * cadence rather than what the sleep waits on.
+         */
+        int64_t chunk_ns = stop_due_ns - elapsed_ns;
+        if (remaining_ns < chunk_ns)
+            chunk_ns = remaining_ns;
+        wakeup_wait_ns(chunk_ns, counter);
 
-        if (nanosleep(&req, &rem) < 0) {
-            int64_t slept_ns = sleep_ns - host_timespec_to_ns_sat(&rem);
-            if (slept_ns < 0)
-                slept_ns = 0;
-            remaining_ns -= slept_ns;
-            if (write_rem && remaining_ns != requested_ns)
-                syscall_restart_forbid();
-            if (write_rem &&
-                write_remaining_sleep(g, rem_gva, remaining_ns) < 0)
-                return -LINUX_EFAULT;
-            return -LINUX_EINTR;
-        }
-        remaining_ns -= sleep_ns;
+        /* Charge the time that actually passed. The wake is process-wide, so
+         * the park also returns early on another thread's, and a condition
+         * variable may return spuriously. Neither the chunk nor the request is
+         * a safe measure of what was spent.
+         */
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+            return linux_errno();
+        elapsed_ns =
+            host_timespec_to_ns_sat(&now) - host_timespec_to_ns_sat(&start);
+        remaining_ns = requested_ns - elapsed_ns;
     }
 
     return 0;

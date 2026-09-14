@@ -447,6 +447,14 @@ void signal_refresh_pending_hint(void);
 int signal_pending(void);
 bool signal_pending_interruption(bool *restart_out);
 
+/* True when a signal that reaches the guest is pending for the calling thread,
+ * with a process-directed one moved into this thread's private set first. A
+ * wait that several threads leave on one broadcast uses this instead of
+ * signal_pending(): the shared set is visible to every thread, and Linux
+ * complete_signal() interrupts only the one thread it picks.
+ */
+bool signal_claim_interruption(void);
+
 /* True if anything that would normally be drained by signal_check_timer is
  * currently live: an unblocked pending signal, OR any of the three guest
  * itimers is armed. The shim's identity fast path consults this (indirectly via
@@ -600,6 +608,26 @@ uint64_t signal_signalfd_pending_mask(void);
 uint64_t signal_save_blocked(void);
 void signal_set_blocked(uint64_t mask);
 void signal_restore_blocked(uint64_t saved);
+
+/* Leave a wait's temporary mask installed for the signal that ended it, and
+ * hand @saved to the next handler frame as uc_sigmask so rt_sigreturn restores
+ * it. ppoll, pselect6 and epoll_pwait call this when they return EINTR for a
+ * signal they claimed, which is where Linux keeps the mask for ERESTARTNOHAND.
+ */
+void signal_defer_restore_blocked(uint64_t saved);
+
+/* Put back a mask left for delivery -- by signal_defer_restore_blocked() or
+ * rt_sigsuspend -- that no handler frame took, because the signal was discarded
+ * or a stop came first. The syscall epilogue calls this after it delivers, as
+ * Linux restore_saved_sigmask() does.
+ */
+void signal_restore_saved_blocked(void);
+
+/* Drop the claims @t holds on process-directed signals, so another thread can
+ * take them. thread_deactivate() calls this before the slot can be reused.
+ */
+struct thread_entry;
+void signal_release_claims(struct thread_entry *t);
 
 /* Guest ITIMER_REAL emulation. These emulate the guest's setitimer(ITIMER_REAL)
  * internally rather than forwarding to the host, because macOS shares alarm()

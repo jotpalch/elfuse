@@ -99,6 +99,7 @@ static long pwritev2_raw(int fd,
 #define USBDEVFS_CONNECTINFO 0x40085511u
 #define USBDEVFS_IOCTL 0xc0105512u
 #define USBDEVFS_SUBMITURB 0x8038550au
+#define USBDEVFS_REAPURBNDELAY 0x4008550du
 #define USBDEVFS_GET_CAPABILITIES 0x8004551au
 #define USBDEVFS_DISCONNECT_CLAIM 0x8108551bu
 #define USBDEVFS_GET_SPEED 0x0000551fu
@@ -133,6 +134,26 @@ struct disconnect_claim {
     unsigned int interface, flags;
     char driver[256];
 };
+
+/* struct usbdevfs_urb; the ioctl encodes 0x38 = 56 bytes of it. */
+struct usburb {
+    unsigned char type, endpoint;
+    int status;
+    unsigned int flags;
+    void *buffer;
+    int buffer_length, actual_length, start_frame, number_of_packets;
+    int error_count;
+    unsigned int signr;
+    void *usercontext;
+};
+
+#define URB_TYPE_ISO 0
+#define URB_TYPE_INTERRUPT 1
+#define URB_TYPE_CONTROL 2
+#define URB_TYPE_BULK 3
+
+/* USBFS_XFER_MAX (devio.c:140). */
+#define URB_XFER_MAX (0xffffffffu / 2u - 1000000u)
 
 /* ioctl(2) collapses every failure onto -1; the assertions below are about
  * which errno, so report it as a negative value the way the kernel does.
@@ -274,6 +295,9 @@ static void check_seek(void)
 /* claimintf refuses ifnum >= 8 * sizeof(unsigned long) -- 64, not 32. Between
  * the two, an interface number is merely absent, which is a question about the
  * device rather than about the argument.
+ *
+ * Which side 64 itself falls on depends on what the bound stands for upstream,
+ * and it is not the same for every op here: see the two blocks at the end.
  */
 static void check_interface_bound(void)
 {
@@ -320,16 +344,47 @@ static void check_interface_bound(void)
     EXPECT_EQ(io(fd, USBDEVFS_SETINTERFACE, &si), -EINVAL,
               "setinterface 64/256");
 
+    /* The same number, the other side of the split above: 64 is an argument
+     * error to claimintf and a device answer to these two. Neither
+     * proc_disconnect_claim nor proc_ioctl bounds the number at all -- their
+     * -EINVAL is usb_ifnum_to_if coming back NULL (devio.c:2471-2473 and
+     * devio.c's proc_ioctl, which repeats connected() for itself) -- so the
+     * bound here stands in for that lookup, and a lookup cannot outrank the
+     * device it would have been performed on. This node has no IOKit object
+     * behind it, so it is that device, and it answers -ENODEV for every
+     * interface number. It used to answer -EINVAL for 64 and -ENODEV for 63,
+     * which named a missing interface on a device that was missing entirely.
+     *
+     * CLAIMINTERFACE, RELEASEINTERFACE and SETINTERFACE keep -EINVAL for 64
+     * because claimintf really does bound it, against the width of
+     * ps->ifclaimed rather than against anything the device says. Linux runs
+     * connected() ahead of that bound too, so on a device that has gone it
+     * answers -ENODEV where this answers -EINVAL; the deviation is recorded
+     * rather than closed, because closing it would put an IOKit enumeration
+     * ahead of a check that reads no device state.
+     */
     struct disconnect_claim dc;
     memset(&dc, 0, sizeof(dc));
     dc.interface = 64;
-    TEST("DISCONNECT_CLAIM 64 is EINVAL");
-    EXPECT_EQ(io(fd, USBDEVFS_DISCONNECT_CLAIM, &dc), -EINVAL, "dc 64");
+    TEST("DISCONNECT_CLAIM 64 asks the device before it judges the number");
+    EXPECT_EQ(io(fd, USBDEVFS_DISCONNECT_CLAIM, &dc), -ENODEV, "dc 64");
 
     struct usbdevfs_ioctl ic = {
         .ifno = 64, .ioctl_code = (int) USBDEVFS_DISCONNECT, .data = NULL};
-    TEST("USBDEVFS_IOCTL ifno 64 is EINVAL");
-    EXPECT_EQ(io(fd, USBDEVFS_IOCTL, &ic), -EINVAL, "usbdevfs_ioctl 64");
+    TEST("USBDEVFS_IOCTL ifno 64 asks the device before it judges the number");
+    EXPECT_EQ(io(fd, USBDEVFS_IOCTL, &ic), -ENODEV, "usbdevfs_ioctl 64");
+    ic.ifno = -1;
+    TEST("USBDEVFS_IOCTL ifno -1 answers the same");
+    EXPECT_EQ(io(fd, USBDEVFS_IOCTL, &ic), -ENODEV, "usbdevfs_ioctl -1");
+
+    /* RESET makes no IOKit call of its own with nothing claimed -- its pipe
+     * loop has nothing to walk -- so it ran to the end and returned 0 on a node
+     * with no device behind it. libusb_reset_device is the recovery call an
+     * application reaches for after an error, so success there is the answer
+     * that keeps it from finding out. connected() runs before proc_resetdevice.
+     */
+    TEST("RESET with nothing claimed still asks the device");
+    EXPECT_EQ(io(fd, USBDEVFS_RESET, NULL), -ENODEV, "reset");
     close(fd);
 }
 
@@ -763,6 +818,86 @@ static void check_retire_window_race(void)
     printf("  slots: %d before, %d after\n", before, after);
 }
 
+/* proc_do_submiturb's argument order, which is not do_proc_bulk's.
+ *
+ * The synchronous ioctl above resolves the endpoint before it looks at the
+ * length, and the assertions in check_endpoint_arguments pin that. SUBMITURB
+ * runs the same two checks the other way round: devio.c:1644-1661 rejects the
+ * flags mask and USBFS_XFER_MAX first, and only then calls findintfep, so a
+ * length past the bound outranks a missing endpoint and everything else does
+ * not. The async path was first written with the synchronous order and answered
+ * -EINVAL for four requests Linux rejects by endpoint, and had no XFER_MAX
+ * bound at all -- on the default control pipe, where no endpoint lookup runs, a
+ * 2 GB URB was accepted outright.
+ *
+ * All of it is decided before any transfer, so the fixture reaches every case.
+ */
+static void check_urb_arguments(void)
+{
+    printf("\ntest-usbdev-ioctl: SUBMITURB argument order\n");
+    int fd = open(NODE, O_RDWR);
+    if (fd < 0) {
+        TEST("open for the URB arguments");
+        FAIL("open");
+        return;
+    }
+    char scratch[64];
+    struct usburb u = {.type = URB_TYPE_BULK,
+                       .endpoint = 0x05, /* absent on the modeled device */
+                       .buffer = scratch,
+                       .buffer_length = 8};
+
+    TEST("an undefined URB flag outranks the endpoint");
+    u.flags = 0x100u;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb flag 0x100");
+    TEST("ISO_ASAP on a bulk URB outranks the endpoint");
+    u.flags = 0x02u;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb ISO_ASAP");
+    u.flags = 0;
+
+    TEST("a length past USBFS_XFER_MAX outranks the endpoint");
+    u.buffer_length = 0x7fffffff;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb INT_MAX");
+    TEST("exactly USBFS_XFER_MAX is EINVAL");
+    u.buffer_length = (int) URB_XFER_MAX;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb XFER_MAX");
+    TEST("a negative length is EINVAL");
+    u.buffer_length = -1;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb -1");
+
+    TEST("a null buffer with a positive length outranks the endpoint");
+    u.buffer = NULL;
+    u.buffer_length = 64;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb null buffer");
+    u.buffer = scratch;
+
+    TEST("an absent endpoint outranks an unknown transfer type");
+    u.type = 99;
+    u.buffer_length = 8;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -ENOENT, "urb type 99 ep 0x05");
+    TEST("an absent endpoint outranks the ISO rejection");
+    u.type = URB_TYPE_ISO;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -ENOENT, "urb iso ep 0x05");
+    TEST("an absent endpoint outranks the control setup-length check");
+    u.type = URB_TYPE_CONTROL;
+    u.buffer_length = 4;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -ENOENT, "urb control ep 0x05");
+    TEST("a reserved-bit endpoint is EINVAL");
+    u.endpoint = 0x30;
+    u.buffer_length = 8;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb ep 0x30");
+
+    /* The default control pipe skips the endpoint lookup (devio.c:1651), so the
+     * length bound is the only thing between this request and a 2 GB
+     * allocation.
+     */
+    TEST("the default control pipe still honors USBFS_XFER_MAX");
+    u.endpoint = 0;
+    u.buffer_length = 0x7fffffff;
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, &u), -EINVAL, "urb ep0 INT_MAX");
+    close(fd);
+}
+
 static void check_answers_without_a_device(void)
 {
     printf("\ntest-usbdev-ioctl: what is answered from the model\n");
@@ -773,12 +908,13 @@ static void check_answers_without_a_device(void)
         return;
     }
 
-    /* Every capability bit names part of the URB machinery this stage answers
-     * ENOTTY for, so the word is 0 until that machinery lands.
+    /* The capability word names exactly what the URB engine honors: ZERO_PACKET
+     * and REAP_AFTER_DISCONNECT. BULK_CONTINUATION is accepted without its
+     * error-cascade unlink, so its bit stays clear.
      */
     uint32_t caps = 0xffffffffu;
-    TEST("GET_CAPABILITIES reports no URB capabilities");
-    EXPECT_TRUE(io(fd, USBDEVFS_GET_CAPABILITIES, &caps) == 0 && caps == 0,
+    TEST("GET_CAPABILITIES names what the URB engine honors");
+    EXPECT_TRUE(io(fd, USBDEVFS_GET_CAPABILITIES, &caps) == 0 && caps == 0x11u,
                 "caps");
 
     TEST("GET_SPEED returns the enum as its value");
@@ -793,13 +929,29 @@ static void check_answers_without_a_device(void)
                     ci.slow == 0,
                 "connectinfo");
 
-    TEST("an unknown ioctl is ENOTTY");
-    EXPECT_EQ(io(fd, 0x00005563u /* _IO('U', 99) */, NULL), -ENOTTY,
+    /* The device question outranks the unknown request, as connected() outranks
+     * usbdev_do_ioctl's switch (devio.c:2638) and the -ENOTTY is that switch's
+     * default. This node has no IOKit object behind it, so -ENODEV is the whole
+     * answer; the -ENOTTY the arm gives once the enumeration has run is pinned
+     * on a live device by tests/test-usbdev-ioctl-departed.c, and what the arm
+     * answers on a departed one is a row in tests/usbdev-ioctl-departed.tbl.
+     */
+    TEST("an unknown ioctl asks the device before it refuses");
+    EXPECT_EQ(io(fd, 0x00005563u /* _IO('U', 99) */, NULL), -ENODEV,
               "unknown ioctl");
-    TEST("SUBMITURB is ENOTTY at this stage");
-    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, NULL), -ENOTTY, "submiturb");
-    TEST("DISCARDURB is ENOTTY at this stage");
-    EXPECT_EQ(io(fd, USBDEVFS_DISCARDURB, NULL), -ENOTTY, "discardurb");
+    TEST("SUBMITURB refuses an unreadable URB");
+    EXPECT_EQ(io(fd, USBDEVFS_SUBMITURB, NULL), -EFAULT, "submiturb");
+
+    /* -EINVAL is proc_unlinkurb's answer for a URB this fd is not holding, and
+     * it is the answer on a device that is there; this node has none behind it,
+     * so the discard's own scan is not what decides. The scan reads the pending
+     * list, which is this layer's bookkeeping and says nothing about the
+     * device, so it used to answer -EINVAL here and reach libusb as
+     * LIBUSB_ERROR_NOT_FOUND on an unplug. The -EINVAL half is asserted where a
+     * device exists, in tests/test-usbdev-ioctl-departed.c's setup.
+     */
+    TEST("DISCARDURB of an unknown URB asks the device first");
+    EXPECT_EQ(io(fd, USBDEVFS_DISCARDURB, NULL), -ENODEV, "discardurb");
 
     /* Everything that has to reach the wire says so, with the errno Linux uses
      * for a device that is not there.
@@ -827,22 +979,81 @@ static void check_answers_without_a_device(void)
 
 /* FIONBIO and FIOASYNC never reach a file's own ioctl handler on Linux:
  * do_vfs_ioctl answers both for every file before it calls f_op->unlocked_ioctl
- * (fs/ioctl.c:818-822), so they also never meet usbdevfs's FMODE_WRITE gate.
- * Sent into it here they came back EPERM on a read-only fd and ENOTTY on a
- * writable one, while fcntl(F_SETFL) on the same descriptor set O_NONBLOCK and
- * F_GETFL reported it: two entry points onto one flag, disagreeing about it.
+ * (fs/ioctl.c:507-511 at v6.18), so they also never meet usbdevfs's FMODE_WRITE
+ * gate. Sent into it here they came back EPERM on a read-only fd and ENOTTY on
+ * a writable one, while fcntl(F_SETFL) on the same descriptor set O_NONBLOCK
+ * and F_GETFL reported it: two entry points onto one flag, disagreeing about
+ * it.
  *
  * Measured on Linux (gcc:14, a char device and a plain file, access modes 0, 1,
  * 2 and 3): FIONBIO(1) is 0 and sets O_NONBLOCK in every one of them;
  * FIOASYNC(1) is ENOTTY and FIOASYNC(0) is 0, because ioctl_fioasync only
  * consults f_op->fasync when the request would change the FASYNC state and
  * usbdev_file_operations declares none (devio.c:2846-2856).
+ *
+ * The ten beside them are the rest of that set, and one sentence decides all
+ * twelve: the access mode is not theirs to meet, so each answers alike on a
+ * read-only and on a writable fd. usbdev_vfs_answers_first sits ABOVE this
+ * layer's FMODE_WRITE gate for exactly that, and the read-only half of the loop
+ * below is what says so -- moved under that gate, every one of the ten turns
+ * EPERM there while the writable half stays green.
+ *
+ * What the ten answer here is not what Linux answers, so the table carries both
+ * values the way every other recorded gap in this lane does. This layer models
+ * none of them and gives -ENOTTY to all ten; Linux agrees on two and the other
+ * eight are deliberate divergences, printed as XFAIL at the end of this
+ * function. Measured on Linux 7.0.14 (uname -r
+ * 7.0.14-orbstack-00380-ga7e0a2dc9535, aarch64, gcc:14, unprivileged, a
+ * 256-byte zeroed argument buffer -- the shape this lane sends, wide enough for
+ * the largest _IOC_SIZE among the ten, the 129 bytes FS_IOC_GETFSSYSFSPATH
+ * declares, rather than for the answer they all give) against a real
+ * /dev/bus/usb/BBB/DDD node on a devtmpfs mount. That is the kernel that ran;
+ * the line numbers cited below are v6.18, which is the source they were read
+ * from, and the two are named apart because a cite and a measurement are
+ * different claims. The superblock those arms consult is the one the node sits
+ * on, which is devtmpfs and not usbfs: devtmpfs is shmem-backed
+ * (devtmpfs.c:69), so it has a block size (shmem.c:5071) and a generated UUID
+ * (shmem.c:5082-5084), and two arms answer on that rather than -ENOTTY.
  */
+static const struct {
+    const char *name;
+    unsigned long request;
+    const char *linux_answer; /* measured, not derived from the name */
+    const char *cite;         /* the fs/ioctl.c arm it stops in */
+    const char *note;         /* NULL where Linux gives -ENOTTY too */
+} vfs_first[] = {
+    {"FIOQSIZE", 0x5460ul, "-1/ENOTTY", "ioctl.c:513-522", NULL},
+    {"FIGETBSZ", 0x00000002ul, "0, writing s_blocksize 4096", "ioctl.c:533-538",
+     "the arm is reached and answers from the superblock"},
+    {"FIFREEZE", 0xc0045877ul, "-1/EPERM", "ioctl.c:385-394",
+     "ioctl_fsfreeze stops at CAP_SYS_ADMIN, and -1/EOPNOTSUPP past it"},
+    {"FITHAW", 0xc0045878ul, "-1/EPERM", "ioctl.c:402-412",
+     "ioctl_fsthaw stops at the same capability, and -1/EINVAL past it on a "
+     "superblock nobody froze"},
+    {"FS_IOC_FIEMAP", 0xc020660bul, "-1/EOPNOTSUPP", "ioctl.c:206-207",
+     "the inode carries no fiemap operation, which is its own answer"},
+    {"FICLONE", 0x40049409ul, "-1/EBADF", "ioctl.c:237-238",
+     "the argument is an fd, not a pointer, so a pointer names no open file"},
+    {"FICLONERANGE", 0x4020940dul, "-1/EINVAL", "ioctl.c:250-258",
+     "the zeroed argument names fd 0 as the source, and -1/EXDEV instead when "
+     "fd 0 sits on another superblock"},
+    {"FIDEDUPERANGE", 0xc0189436ul, "-1/EINVAL", "ioctl.c:415-452",
+     "vfs_dedupe_file_range refuses a source that is not a regular file "
+     "(remap_range.c:515-516), which is its own answer: the same zeroed "
+     "argument on a regular file is 0, and on a directory it is -1/EISDIR"},
+    {"FS_IOC_GETFSUUID", 0x80111500ul, "0", "ioctl.c:455-465",
+     "the shmem-backed devtmpfs every distro mounts carries a generated UUID, "
+     "so the arm answers; a ramfs-backed one has none and refuses"},
+    {"FS_IOC_GETFSSYSFSPATH", 0x80811501ul, "-1/ENOTTY", "ioctl.c:468-473",
+     NULL},
+};
+
 static void check_vfs_ioctls(void)
 {
-    printf("\ntest-usbdev-ioctl: the two ioctls the vfs answers first\n");
+    printf("\ntest-usbdev-ioctl: the ioctls the vfs answers first\n");
     const int modes[2] = {O_RDONLY, O_RDWR};
     const char *names[2] = {"read-only", "writable"};
+    const int nvfs = (int) (sizeof(vfs_first) / sizeof(vfs_first[0]));
     for (int i = 0; i < 2; i++) {
         int fd = open(NODE, modes[i]);
         if (fd < 0) {
@@ -885,6 +1096,26 @@ static void check_vfs_ioctls(void)
         snprintf(t, sizeof(t), "FIOASYNC(0) on a %s fd is 0", names[i]);
         TEST(t);
         EXPECT_EQ(io(fd, FIOASYNC, &zero), 0, "fioasync 0");
+
+        /* And the ten, under the same claim. The read-only pass is the one that
+         * pins the carve-out above the FMODE_WRITE gate rather than below it;
+         * -ENOTTY here is this layer's answer, not Linux's, and the XFAIL lines
+         * below carry what Linux gives.
+         */
+        for (int v = 0; v < nvfs; v++) {
+            /* Wide enough for the largest _IOC_SIZE among the ten:
+             * FS_IOC_GETFSSYSFSPATH declares 129 bytes. Nothing writes it while
+             * every one of them stops at -ENOTTY, and sizing it to the request
+             * rather than to that answer is what keeps it true if one stops
+             * doing so.
+             */
+            unsigned char scratch[256] = {0};
+            snprintf(t, sizeof(t), "%s on a %s fd is ENOTTY", vfs_first[v].name,
+                     names[i]);
+            TEST(t);
+            EXPECT_EQ(io(fd, vfs_first[v].request, scratch), -ENOTTY,
+                      vfs_first[v].name);
+        }
         close(fd);
     }
 
@@ -898,6 +1129,16 @@ static void check_vfs_ioctls(void)
         TEST("FIOASYNC with a bad argument is EFAULT");
         EXPECT_EQ(io(fd, FIOASYNC, (void *) 8), -EFAULT, "fioasync efault");
         close(fd);
+    }
+
+    for (int v = 0; v < nvfs; v++) {
+        if (!vfs_first[v].note)
+            continue;
+        printf(
+            "  XFAIL vfs-first-%s: Linux answers %s (%s), elfuse -1/ENOTTY; "
+            "%s\n",
+            vfs_first[v].name, vfs_first[v].linux_answer, vfs_first[v].cite,
+            vfs_first[v].note);
     }
 }
 
@@ -1121,6 +1362,79 @@ static void check_close_identity(void)
            CHURN_ROUNDS, churn_bad);
 }
 
+/* A non-blocking reap whose fd number is closed and reopened between the
+ * fd-table window the pass takes and the side-table lookup that has to answer
+ * for it.
+ *
+ * Those were two windows: an fd_snapshot in the reap, and another one inside
+ * usbdev_acquire proving the generation against its own read. A close and
+ * reopen in between satisfied the second and not the first, so the pass ran on
+ * the new description's side-table entry while still holding the old one's
+ * readiness pipe -- it settled the readiness level on, and a blocking reap
+ * would have parked on, whatever host fd had taken that number. One window
+ * answers for one open file description, and the reopened fd is not that
+ * description, so the pass belongs to nothing: EBADF, the answer this side
+ * table already gives a generation mismatch.
+ *
+ * The window is a few instructions wide unaided, so this runs under
+ * ELFUSE_USBDEV_REAP_DELAY_US. The reopen names the other bus for the reason
+ * the publish race does: two entries describing one device are
+ * indistinguishable by anything the guest can read.
+ */
+static void check_reap_window_race(void)
+{
+    printf("\ntest-usbdev-ioctl: a close and reopen inside the reap window\n");
+    int before = count_table_slots();
+    int fd = open(NODE, O_RDWR);
+    if (fd < 0) {
+        TEST("an fd to reap on");
+        FAIL("open");
+        return;
+    }
+
+    /* Nothing has been submitted, so an undisturbed pass is EAGAIN: the device
+     * is reachable and has nothing to hand back. That is the answer the race
+     * has to change, and the answer the two-window form kept giving -- from the
+     * wrong description.
+     */
+    void *out = NULL;
+    TEST("an undisturbed non-blocking reap is EAGAIN");
+    EXPECT_EQ(io(fd, USBDEVFS_REAPURBNDELAY, &out), -EAGAIN, "quiet reap");
+
+    race_fd = fd;
+    race_sibling = -1;
+    race_reopen_node = OTHER_NODE;
+    pthread_t t;
+    if (pthread_create(&t, NULL, race_closer, NULL) != 0) {
+        TEST("closer thread for the reap race");
+        FAIL("pthread_create");
+        close(fd);
+        return;
+    }
+    long r = io(fd, USBDEVFS_REAPURBNDELAY, &out);
+    pthread_join(t, NULL);
+    race_reopen_node = NULL;
+    int sib = race_sibling;
+
+    TEST("the reopen took the number the close freed");
+    EXPECT_TRUE(sib == fd, "same fd number");
+    TEST("the reap answers for no description, not for the new one");
+    EXPECT_EQ(r, -EBADF, "reap across the swap");
+
+    /* The description that owns the number now is untouched by any of it. */
+    TEST("the reopened fd answers for the device it was opened on");
+    EXPECT_EQ(fd_vid(sib), OTHER_VID, "idVendor");
+    TEST("and its own reap is the quiet EAGAIN");
+    EXPECT_EQ(io(sib, USBDEVFS_REAPURBNDELAY, &out), -EAGAIN, "sibling reap");
+
+    if (sib >= 0)
+        close(sib);
+    int after = count_table_slots();
+    TEST("neither entry leaks its slot");
+    EXPECT_EQ(after, before, "slots after the race");
+    printf("  slots: %d before, %d after\n", before, after);
+}
+
 /* Deviations this stage keeps deliberately: printed with both values so the gap
  * is in the lane's output rather than only in the commit message.
  */
@@ -1131,18 +1445,48 @@ static void print_known_gaps(void)
     if (fd >= 0) {
         long r = io(fd, USBDEVFS_RESET, NULL);
         printf(
-            "  XFAIL reset: Linux re-enumerates the port, elfuse clears "
-            "claimed pipes' stalls and returns %ld\n",
+            "  XFAIL reset: Linux re-enumerates the port, elfuse asks the "
+            "device first and then kills its URBs and clears claimed pipes' "
+            "stalls, logging rather than reporting a clear that fails; on this "
+            "node, which has no device behind it, that first question answers "
+            "%ld\n",
             r);
-        long speed = io(fd, USBDEVFS_GET_SPEED, NULL);
-        printf(
-            "  XFAIL disconnect-gate: Linux answers ENODEV for every ioctl "
-            "once the device is gone, elfuse still serves GET_SPEED, "
-            "CONNECTINFO, GET_CAPABILITIES and read() from the open-time "
-            "model (GET_SPEED here: %ld)\n",
-            speed);
         close(fd);
     }
+    printf(
+        "  XFAIL clear-halt-collateral: Linux warns and leaves a queued URB on "
+        "the endpoint alone (check_reset_of_active_ep, devio.c:1382-1394), "
+        "elfuse has only ClearPipeStallBothEnds, which aborts the pipe, so "
+        "CLEAR_HALT and RESETEP make an in-flight URB reap -ECONNRESET\n");
+    printf(
+        "  XFAIL clear-halt-shutter: Linux has no per-endpoint abort shutter "
+        "to keep, elfuse keeps one (ep_aborting) on DISCARDURB and on every "
+        "wholesale kill and does not raise it for CLEAR_HALT or RESETEP, so a "
+        "queued follower there can be started behind a stall clear's abort "
+        "that is still in flight\n");
+    printf(
+        "  XFAIL printer-device-id: Linux lets a printer's GET_DEVICE_ID "
+        "through untouched, reading wIndex as interface<<8|altsetting when "
+        "usb_find_alt_setting(actconfig, wIndex >> 8, wIndex & 0xff) is "
+        "USB_CLASS_PRINTER (check_ctrlrecip, devio.c), elfuse reads "
+        "wIndex & 0xff as the interface number for every non-vendor interface "
+        "recipient and implicitly claims that one\n");
+    printf(
+        "  XFAIL urb-signal: Linux raises the URB's signr at completion "
+        "(kill_pid_usb_asyncio, devio.c:657) and DISCSIGNAL's at disconnect, "
+        "elfuse accepts both, returns 0 and delivers neither\n");
+    printf(
+        "  XFAIL iso: Linux serves isochronous URBs, elfuse answers EINVAL "
+        "once the endpoint has resolved\n");
+    printf(
+        "  XFAIL discard-latency: DISCARDURB is proc_unlinkurb, which calls "
+        "usb_kill_urb -- the synchronous one, guaranteeing the URB is idle on "
+        "return -- and NOT usb_unlink_urb, the asynchronous unlink that "
+        "returns -EINPROGRESS; so elfuse waits for IOKit's abort callback to "
+        "match it, and the divergence is only the ceiling: Linux never gives "
+        "up, elfuse gives up after 2s rather than parking the vCPU thread "
+        "against a wire that may never answer, leaving the record flagged and "
+        "still reapable when its completion arrives\n");
     printf(
         "  XFAIL driver-name: Linux GETDRIVER reports the driver's name "
         "(cdc_acm), elfuse reports the IOKit class (AppleUSBACMControl), and "
@@ -1194,6 +1538,11 @@ int main(void)
         SUMMARY("test-usbdev-ioctl");
         return fails > 0 ? 1 : 0;
     }
+    if (getenv("ELFUSE_USBDEV_REAP_DELAY_US")) {
+        check_reap_window_race();
+        SUMMARY("test-usbdev-ioctl");
+        return fails > 0 ? 1 : 0;
+    }
     if (!strcmp(mode, "badifnum")) {
         check_malformed_interface_number();
         SUMMARY("test-usbdev-ioctl");
@@ -1206,6 +1555,7 @@ int main(void)
     check_interface_bound();
     check_endpoint_arguments();
     check_offset_and_vector_edges();
+    check_urb_arguments();
     check_answers_without_a_device();
     check_vfs_ioctls();
     check_access_mode_three();

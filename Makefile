@@ -80,12 +80,40 @@ SRCS := \
     debug/log.c \
     debug/syscall-hist.c
 
+# The USB fixture seam (src/syscall/usbdev-fixture.h). usbdev.c calls it with no
+# conditional compilation of its own, so exactly one translation unit has to
+# define the entry points and the choice is made here: the stub in every build,
+# the loopback device model when USB_LOOPBACK_FIXTURE asks for it. Listing both
+# would be a duplicate-symbol link error, which is the property that keeps a
+# default build from quietly acquiring the model.
+ifeq ($(USB_LOOPBACK_FIXTURE),1)
+SRCS += syscall/usbdev-fixture.c
+else
+SRCS += syscall/usbdev-fixture-stub.c
+endif
+
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+
+# Every host source, whether or not this build links it. Only one of the two
+# fixture-seam translation units is ever in SRCS, and a static analyzer wants
+# both: make lint reads this rather than SRCS so that turning the fixture off
+# does not also turn off the checking of it.
+ALL_SRCS := $(sort $(SRCS) src/syscall/usbdev-fixture.c \
+                   src/syscall/usbdev-fixture-stub.c)
 
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
+
+# The usbdevfs departed-device vectors. Generated for the same reason
+# dispatch.h is: the table is data, the join against usbdev_ioctl's dispatch is
+# a gate, and neither is something to hand-edit. Under build/ so that the
+# formatting gates, which cover tests/*.h, have no opinion about a file a script
+# writes.
+DEPARTED_MANIFEST := tests/usbdev-ioctl-departed.tbl
+DEPARTED_GENERATOR := scripts/gen-usbdev-ioctl-departed.py
+DEPARTED_HEADER := $(BUILD_DIR)/usbdev-ioctl-departed-vectors.h
 HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -arch arm64
 
 # Generated headers under build/ that must exist before compiling sources that
@@ -126,6 +154,11 @@ $(DISPATCH_HEADER): $(DISPATCH_MANIFEST) $(DISPATCH_GENERATOR) src/syscall/abi.h
 	rm -f "$$tmp"
 
 $(BUILD_DIR)/syscall/syscall.o: $(DISPATCH_HEADER)
+
+$(DEPARTED_HEADER): $(DEPARTED_MANIFEST) $(DEPARTED_GENERATOR) \
+		src/syscall/usbdev.c | $(BUILD_DIR)
+	@echo "  GEN     $@"
+	$(Q)python3 $(DEPARTED_GENERATOR) --output $@
 
 ## Build the elfuse executable
 elfuse: $(ELFUSE_BIN)
@@ -289,6 +322,14 @@ $(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the usbdevfs URB bookkeeping host unit test (native macOS binary)
+# usbdev-urb.h is header-only arithmetic with no IOKit and no I/O, so the test
+# needs no object but its own.
+$(BUILD_DIR)/test-usbdev-urb-host: \
+		$(BUILD_DIR)/test-usbdev-urb-host.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the guest environment merge host test (native macOS binary)
 # guest-env.o's only dependency is the log macro, which the test stubs.
 $(BUILD_DIR)/test-guest-env-host: $(BUILD_DIR)/test-guest-env-host.o \
@@ -353,9 +394,24 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
 
+# test-usbdev-ioctl-departed reads the generated vectors out of build/, so it
+# needs that directory on the include path where the other guest binaries do
+# not.
+$(BUILD_DIR)/test-usbdev-ioctl-departed: tests/test-usbdev-ioctl-departed.c \
+		$(DEPARTED_HEADER) | $(BUILD_DIR)
+	@echo "  CROSS   $<"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -I$(BUILD_DIR) -o $@ $<
+
 # test-usbdev-ioctl churns open/read/close on one usbdevfs node from four
 # threads, so a close and a sibling's open contend for the same fd number.
 $(BUILD_DIR)/test-usbdev-ioctl: tests/test-usbdev-ioctl.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-usbdev-urb-loopback opens a second usbdevfs node from a thread while the
+# first is closing, so the two contend for one guest fd number.
+$(BUILD_DIR)/test-usbdev-urb-loopback: \
+		tests/test-usbdev-urb-loopback.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
@@ -395,6 +451,35 @@ $(BUILD_DIR)/test-fd-pin-lock: \
 # test-socket-accept-contended parks two threads on one listener.
 $(BUILD_DIR)/test-socket-accept-contended: \
 		tests/test-socket-accept-contended.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-nanosleep-signal-latency aims a signal at a sibling thread parked in a
+# sleep, which is the only way to hold one thread in the wait while another
+# times the delivery.
+$(BUILD_DIR)/test-nanosleep-signal-latency: \
+		tests/test-nanosleep-signal-latency.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-nanosleep-process-signal parks several threads in a sleep and sends the
+# group one signal.
+$(BUILD_DIR)/test-nanosleep-process-signal: \
+		tests/test-nanosleep-process-signal.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-wait-process-signal parks several threads in each blocking wait and sends
+# the group one signal.
+$(BUILD_DIR)/test-wait-process-signal: \
+		tests/test-wait-process-signal.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-wait-sigmask-signal signals a wait from a second thread while the wait's
+# own sigmask is the only one that unblocks it.
+$(BUILD_DIR)/test-wait-sigmask-signal: \
+		tests/test-wait-sigmask-signal.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
@@ -533,6 +618,12 @@ $(BUILD_DIR)/test-shim-urandom-toctou: tests/test-shim-urandom-toctou.c | $(BUIL
 # it needs threads.
 $(BUILD_DIR)/test-futex-requeue-account: tests/test-futex-requeue-account.c \
     | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-futex-requeue-samebucket parks a waiter, so it needs threads.
+$(BUILD_DIR)/test-futex-requeue-samebucket: \
+    tests/test-futex-requeue-samebucket.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 

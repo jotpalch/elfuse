@@ -53,6 +53,7 @@
 #include "runtime/procemu-internal.h"
 #include "runtime/procemu.h"
 #include "runtime/usb-desc.h"
+#include "runtime/usb-fixture.h"
 #include "runtime/usb-sysfs.h"
 #include "syscall/internal.h"
 #include "syscall/linux-wire.h"
@@ -307,16 +308,27 @@ typedef struct {
      * what happens when a device does.
      */
     unsigned ifnum_base;
+
+    /* The endpoints every interface of this device carries, or NULL for the
+     * default of one bulk IN per interface (0x81, 0x82, ...). The loopback
+     * device needs a real OUT and a real interrupt IN, and the IOKit half has
+     * to report the same set, so the table is shared rather than written twice
+     * (runtime/usb-fixture.h).
+     */
+    const usb_fixture_ep_t *eps;
+    unsigned neps;
 } usb_fixture_spec_t;
 
 /* The number of interface descriptors is the only thing that varies the blob
  * length: an 18-byte device descriptor, one configuration header, then one
  * interface descriptor per interface.
  */
-static size_t usb_fixture_blob_len(unsigned nifaces)
+static size_t usb_fixture_blob_len(const usb_fixture_spec_t *s)
 {
+    unsigned neps = s->neps ? s->neps : 1;
     return USB_DEVICE_DESC_LEN + USB_CONFIG_DESC_LEN +
-           (size_t) nifaces * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
+           (size_t) s->nifaces *
+               (USB_INTERFACE_DESC_LEN + (size_t) neps * USB_ENDPOINT_DESC_LEN);
 }
 
 /* Fill @d from @s, writing the device, configuration and interface descriptors
@@ -346,9 +358,10 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     snprintf(d->devpath, sizeof(d->devpath), "%d", s->port);
     snprintf(d->name, sizeof(d->name), "%d-%d", s->busnum, s->port);
 
-    size_t cfg_total =
-        USB_CONFIG_DESC_LEN +
-        (size_t) s->nifaces * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
+    unsigned neps = s->neps ? s->neps : 1;
+    size_t if_total =
+        USB_INTERFACE_DESC_LEN + (size_t) neps * USB_ENDPOINT_DESC_LEN;
+    size_t cfg_total = USB_CONFIG_DESC_LEN + (size_t) s->nifaces * if_total;
     build_device_descriptor(d, blob);
     uint8_t *c = blob + USB_DEVICE_DESC_LEN;
     c[0] = USB_CONFIG_DESC_LEN;
@@ -361,15 +374,13 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     c[7] = 0x80;                 /* bmAttributes: bus powered */
     c[8] = 50;                   /* bMaxPower: 100 mA */
     for (unsigned i = 0; i < s->nifaces; i++) {
-        uint8_t *q =
-            c + USB_CONFIG_DESC_LEN +
-            (size_t) i * (USB_INTERFACE_DESC_LEN + USB_ENDPOINT_DESC_LEN);
+        uint8_t *q = c + USB_CONFIG_DESC_LEN + (size_t) i * if_total;
         q[0] = USB_INTERFACE_DESC_LEN;
         q[1] = USB_DT_INTERFACE;
         unsigned ifnum = s->ifnum_base + i;
         q[2] = (uint8_t) ifnum; /* bInterfaceNumber */
         q[3] = 0;               /* bAlternateSetting */
-        q[4] = 1;               /* bNumEndpoints */
+        q[4] = (uint8_t) neps;  /* bNumEndpoints */
         q[5] = 0xff;            /* bInterfaceClass: vendor-specific */
         q[6] = 0x00;
         q[7] = 0x00;
@@ -382,14 +393,18 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
          * reach the code that decides between "no such endpoint" and "bad
          * argument". Bulk IN, one per interface: 0x81, 0x82, ...
          */
-        uint8_t *e = q + USB_INTERFACE_DESC_LEN;
-        e[0] = USB_ENDPOINT_DESC_LEN;
-        e[1] = USB_DT_ENDPOINT;
-        e[2] = (uint8_t) (0x81 + i); /* bEndpointAddress: bulk IN */
-        e[3] = 0x02;                 /* bmAttributes: bulk */
-        e[4] = 0x40;                 /* wMaxPacketSize: 64 */
-        e[5] = 0x00;
-        e[6] = 0; /* bInterval */
+        for (unsigned k = 0; k < neps; k++) {
+            uint8_t *e =
+                q + USB_INTERFACE_DESC_LEN + (size_t) k * USB_ENDPOINT_DESC_LEN;
+            e[0] = USB_ENDPOINT_DESC_LEN;
+            e[1] = USB_DT_ENDPOINT;
+            e[2] = s->eps ? s->eps[k].addr : (uint8_t) (0x81 + i);
+            e[3] = s->eps ? s->eps[k].attr : 0x02;
+            uint16_t mps = s->eps ? s->eps[k].mps : 0x40;
+            e[4] = (uint8_t) (mps & 0xff);
+            e[5] = (uint8_t) (mps >> 8);
+            e[6] = s->eps ? s->eps[k].interval : 0;
+        }
     }
 }
 
@@ -415,6 +430,15 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
  * short of a fixture reaches the paths that index by that number. Added as a
  * separate mode rather than to the default set so the lanes that walk the tree
  * keep the device list they were written against.
+ *
+ * ELFUSE_USB_FIXTURE=loopback: the default set plus /dev/bus/usb/003/001, the
+ * one device with an IOKit answer behind it (syscall/usbdev-fixture.c). It
+ * carries interface 2 with bulk OUT 0x02, bulk IN 0x81 and interrupt IN 0x83,
+ * the endpoints the out-of-tree board driver uses, and the addresses come from
+ * runtime/usb-fixture.h so the descriptor blob here and GetPipeProperties there
+ * cannot drift. The default devices stay in the set, and stay service-less, so
+ * the fd-contract lane answers the same thing in this mode as in the default
+ * one.
  */
 static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
 {
@@ -422,18 +446,29 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
     int n = 0;
     if (mode && !strcmp(mode, "overflow")) {
         for (int port = 1; port <= 129 && n < cap; port++)
-            specs[n++] =
-                (usb_fixture_spec_t) {1, port, 0, 0x1d6b, 0x0002, 1, 0};
+            specs[n++] = (usb_fixture_spec_t) {1, port, 0,    0x1d6b, 0x0002,
+                                               1, 0,    NULL, 0};
         if (n < cap)
-            specs[n++] = (usb_fixture_spec_t) {2, 1, 0, 0x2109, 0x0100, 1, 0};
+            specs[n++] =
+                (usb_fixture_spec_t) {2, 1, 0, 0x2109, 0x0100, 1, 0, NULL, 0};
         return n;
     }
     if (n < cap)
-        specs[n++] = (usb_fixture_spec_t) {1, 1, 1, 0x1d6b, 0x0002, 2, 0};
+        specs[n++] =
+            (usb_fixture_spec_t) {1, 1, 1, 0x1d6b, 0x0002, 2, 0, NULL, 0};
     if (n < cap)
-        specs[n++] = (usb_fixture_spec_t) {2, 1, 1, 0x2109, 0x0100, 1, 0};
+        specs[n++] =
+            (usb_fixture_spec_t) {2, 1, 1, 0x2109, 0x0100, 1, 0, NULL, 0};
     if (mode && !strcmp(mode, "badifnum") && n < cap)
-        specs[n++] = (usb_fixture_spec_t) {1, 2, 2, 0x1d6b, 0x0002, 1, 200};
+        specs[n++] =
+            (usb_fixture_spec_t) {1, 2, 2, 0x1d6b, 0x0002, 1, 200, NULL, 0};
+    if (mode && !strcmp(mode, "loopback") && n < cap)
+        specs[n++] = (usb_fixture_spec_t) {
+            USB_FIXTURE_LOOPBACK_BUS,    USB_FIXTURE_LOOPBACK_PORT,
+            USB_FIXTURE_LOOPBACK_DEVNUM, USB_FIXTURE_LOOPBACK_VID,
+            USB_FIXTURE_LOOPBACK_PID,    1,
+            USB_FIXTURE_LOOPBACK_IFNUM,  usb_fixture_loopback_eps,
+            USB_FIXTURE_LOOPBACK_NEPS};
     return n;
 }
 
@@ -473,10 +508,10 @@ static void model_build(void)
              * canned-model allocation stashed in a callee would read to the
              * leak analyzer as unowned once it escaped into usb_devs[].
              */
-            d->blob = malloc(usb_fixture_blob_len(specs[k].nifaces));
+            d->blob = malloc(usb_fixture_blob_len(&specs[k]));
             if (!d->blob)
                 continue;
-            d->blob_len = usb_fixture_blob_len(specs[k].nifaces);
+            d->blob_len = usb_fixture_blob_len(&specs[k]);
             usb_fixture_fill(d, &specs[k]);
             usb_ndevs++;
         }

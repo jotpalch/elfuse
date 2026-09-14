@@ -67,6 +67,192 @@ int main(void)
         close(epfd);
     }
 
+    /* The read half of "epoll reads the same bits poll does". eventpoll has no
+     * mask of its own: ep_item_poll masks the file's answer by
+     * epi->event.events, so a registration naming only EPOLLRDNORM asks for one
+     * of the two bits a readable pipe raises, has to be woken by it, and has to
+     * be told EPOLLRDNORM rather than EPOLLIN. Gating the arming on EPOLLIN
+     * alone registered no filter at all and the wait ran to its timeout.
+     */
+    TEST("ADD pipe + wait EPOLLRDNORM alone");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLRDNORM, .data.fd = pipefd[0]};
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) == 0) {
+            write(pipefd[1], "x", 1);
+
+            struct epoll_event out = {0};
+            int n = epoll_wait(epfd, &out, 1, 500);
+            EXPECT_TRUE(n == 1 && (out.events & EPOLLRDNORM) &&
+                            !(out.events & EPOLLIN) && out.data.fd == pipefd[0],
+                        "EPOLLRDNORM alone did not fire as EPOLLRDNORM");
+        } else
+            FAIL("epoll_ctl ADD failed");
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
+    /* The mask is reported back as asked for, both bits or one. */
+    TEST("EPOLLIN|EPOLLRDNORM reports both");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLIN | EPOLLRDNORM,
+                                 .data.fd = pipefd[0]};
+        struct epoll_event out = {0};
+        int n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) == 0) {
+            write(pipefd[1], "x", 1);
+            n = epoll_wait(epfd, &out, 1, 500);
+        }
+        EXPECT_TRUE(n == 1 && (out.events & (EPOLLIN | EPOLLRDNORM)) ==
+                                  (EPOLLIN | EPOLLRDNORM),
+                    "both bits asked for, both not reported");
+
+        TEST("and EPOLLIN alone reports only EPOLLIN");
+        ev.events = EPOLLIN;
+        out.events = 0;
+        n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_MOD, pipefd[0], &ev) == 0)
+            n = epoll_wait(epfd, &out, 1, 500);
+        EXPECT_TRUE(
+            n == 1 && (out.events & EPOLLIN) && !(out.events & EPOLLRDNORM),
+            "EPOLLIN alone reported a bit it did not ask for");
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
+    /* A registration naming no read bit at all still has its read filter armed,
+     * to catch the EOF EPOLLRDHUP is about -- but armed with a low-water mark
+     * no readable byte can reach, so mere readability is not an event it hears.
+     * That is what Linux does: do_epoll_ctl widens the requested mask by
+     * EPOLLERR|EPOLLHUP only, ep_item_poll masks the pipe's EPOLLIN|EPOLLRDNORM
+     * by it, and nothing survives, so ep_poll waits the caller out and returns
+     * 0 at the deadline. Measured at rc=0 after 503-510 ms on Linux 6.18.50
+     * (aarch64), the qemu reference lane this file also runs in.
+     *
+     * The answer neither side may give is 0 *before* the deadline, which would
+     * make a guest treat a timeout it never waited for as one it did. So the
+     * elapsed time is the assertion, not just the count.
+     */
+    TEST("EPOLLRDHUP alone waits its timeout out on a merely readable fd");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLRDHUP, .data.fd = pipefd[0]};
+        struct epoll_event out = {0};
+        int n = -1;
+        struct timespec t0 = {0}, t1 = {0};
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) == 0) {
+            write(pipefd[1], "x", 1);
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            n = epoll_wait(epfd, &out, 1, 500);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+        }
+        long waited_ms = (long) (t1.tv_sec - t0.tv_sec) * 1000 +
+                         (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        EXPECT_TRUE(n == 0 && waited_ms >= 450,
+                    "a merely readable fd was reported to an EPOLLRDHUP-only "
+                    "registration, or the wait ended before its timeout");
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
+    /* And the hangup it did ask for still arrives at once. This is the other
+     * half of the low-water mark above: silencing readability must not silence
+     * the EOF, which activates the read filter whatever the mark is.
+     */
+    TEST("EPOLLRDHUP alone still reports the hangup when the writer closes");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLRDHUP, .data.fd = pipefd[0]};
+        struct epoll_event out = {0};
+        int n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) == 0) {
+            write(pipefd[1], "x", 1);
+            close(pipefd[1]);
+            pipefd[1] = -1;
+            n = epoll_wait(epfd, &out, 1, 500);
+        }
+
+        /* A pipe hangup is EPOLLHUP on Linux; this layer also sets EPOLLRDHUP
+         * on it, since kqueue reports one EV_EOF for both the full hangup a
+         * pipe means by it and the half-shutdown a socket does. Only the bit
+         * both agree on is asserted here.
+         */
+        EXPECT_TRUE(n == 1 && (out.events & EPOLLHUP),
+                    "a closed writer raised no hangup");
+
+        close(pipefd[0]);
+        if (pipefd[1] >= 0)
+            close(pipefd[1]);
+        close(epfd);
+    }
+
+    /* MOD onto the read pair has to arm, and DEL of it has to disarm: both
+     * decide from the same mask the ADD above does.
+     */
+    TEST("MOD to EPOLLRDNORM arms, DEL of it disarms");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLOUT, .data.fd = pipefd[0]};
+        struct epoll_event out = {0};
+        int n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) == 0) {
+            ev.events = EPOLLRDNORM;
+            if (epoll_ctl(epfd, EPOLL_CTL_MOD, pipefd[0], &ev) == 0) {
+                write(pipefd[1], "x", 1);
+                n = epoll_wait(epfd, &out, 1, 500);
+            }
+        }
+        EXPECT_TRUE(n == 1 && (out.events & EPOLLRDNORM),
+                    "MOD onto EPOLLRDNORM armed nothing");
+
+        TEST("and DEL of an EPOLLRDNORM-only registration is silent after");
+        int d = epoll_ctl(epfd, EPOLL_CTL_DEL, pipefd[0], NULL);
+        out.events = 0;
+        n = epoll_wait(epfd, &out, 1, 100);
+        EXPECT_TRUE(d == 0 && n == 0, "DEL left the read filter registered");
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
     /* Test EPOLLOUT on pipe write end (always writable) */
     TEST("ADD pipe write + EPOLLOUT");
     {
@@ -85,6 +271,106 @@ int main(void)
                         "pipe not write-ready");
         } else
             FAIL("epoll_ctl ADD failed");
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
+    /* The write half of the same rule, off the usbfs path. ep_item_poll masks
+     * the file's answer by epi->event.events, and a pipe with room raises
+     * EPOLLOUT|EPOLLWRNORM (fs/pipe.c:697 at v6.18), as a writable socket does
+     * (net/ipv4/tcp.c:606 at the same tag), so a registration naming only
+     * EPOLLWRNORM is a legal write registration Linux both wakes and reports as
+     * EPOLLWRNORM. Gating the arming on EPOLLOUT alone registered no
+     * EVFILT_WRITE and the wait ran to its timeout.
+     */
+    TEST("ADD pipe write + wait EPOLLWRNORM alone");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLWRNORM, .data.fd = pipefd[1]};
+        struct epoll_event out = {0};
+        int n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[1], &ev) == 0)
+            n = epoll_wait(epfd, &out, 1, 500);
+        EXPECT_TRUE(n == 1 && (out.events & EPOLLWRNORM) &&
+                        !(out.events & EPOLLOUT) && out.data.fd == pipefd[1],
+                    "EPOLLWRNORM alone did not fire as EPOLLWRNORM");
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
+    /* The write mask is reported back as asked for, both bits or one. */
+    TEST("EPOLLOUT|EPOLLWRNORM reports both");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLOUT | EPOLLWRNORM,
+                                 .data.fd = pipefd[1]};
+        struct epoll_event out = {0};
+        int n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[1], &ev) == 0)
+            n = epoll_wait(epfd, &out, 1, 500);
+        EXPECT_TRUE(n == 1 && (out.events & (EPOLLOUT | EPOLLWRNORM)) ==
+                                  (EPOLLOUT | EPOLLWRNORM),
+                    "both write bits asked for, both not reported");
+
+        TEST("and EPOLLOUT alone reports only EPOLLOUT");
+        ev.events = EPOLLOUT;
+        out.events = 0;
+        n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_MOD, pipefd[1], &ev) == 0)
+            n = epoll_wait(epfd, &out, 1, 500);
+        EXPECT_TRUE(
+            n == 1 && (out.events & EPOLLOUT) && !(out.events & EPOLLWRNORM),
+            "EPOLLOUT alone reported a bit it did not ask for");
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
+    /* MOD onto the write pair has to arm, and DEL of it has to disarm: both
+     * decide from the same mask the ADD above does, the way the read twins do.
+     */
+    TEST("MOD to EPOLLWRNORM arms, DEL of it disarms");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            FAIL("pipe");
+            pipefd[0] = pipefd[1] = -1;
+        }
+
+        struct epoll_event ev = {.events = EPOLLIN, .data.fd = pipefd[1]};
+        struct epoll_event out = {0};
+        int n = -1;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[1], &ev) == 0) {
+            ev.events = EPOLLWRNORM;
+            if (epoll_ctl(epfd, EPOLL_CTL_MOD, pipefd[1], &ev) == 0)
+                n = epoll_wait(epfd, &out, 1, 500);
+        }
+        EXPECT_TRUE(n == 1 && (out.events & EPOLLWRNORM),
+                    "MOD onto EPOLLWRNORM armed nothing");
+
+        TEST("and DEL of an EPOLLWRNORM-only registration is silent after");
+        int d = epoll_ctl(epfd, EPOLL_CTL_DEL, pipefd[1], NULL);
+        out.events = 0;
+        n = epoll_wait(epfd, &out, 1, 100);
+        EXPECT_TRUE(d == 0 && n == 0, "DEL left the write filter registered");
 
         close(pipefd[0]);
         close(pipefd[1]);

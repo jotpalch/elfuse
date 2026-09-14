@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-usbdev-departed check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -37,13 +37,15 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host test-elf-headers-host \
+        test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-matrix \
         test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
+        test-usbdev-urb-loopback test-usbdev-ioctl-loopback \
+        test-usbdev-ioctl-departed \
         test-dir-fd-budget-union \
         test-dir-backing-drain-error test-dir-union-fd-reuse \
         test-fstatfs-fd-identity \
@@ -80,6 +82,17 @@ test-mremap-tail-emfile: $(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile
 ## Verify dispatch.tbl coverage of the kernel-supported syscall set
 check-syscall-coverage:
 	@python3 scripts/check-syscall-coverage.py
+
+## Verify every src/proved/ header is proved by a target make actually generates
+#
+# Local as well as in CI. This was the one gate of the set that only ran in
+# .github/workflows/lint.yml, so a header added under src/proved/ with no
+# matching VERIFY_<T>_SRC block passed make check and failed the branch later.
+# It asks make for the target list rather than reading mk/verify.mk, which is
+# the whole point of it: a VERIFY_<T>_SRC written below the := that builds
+# VERIFY_TARGETS parses fine and generates no rule.
+check-proof-targets:
+	@python3 scripts/check-proof-targets.py
 
 ## Verify every path that can report EINTR states whether it may be restarted
 check-eintr-contract:
@@ -240,7 +253,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host test-elf-headers-host test-gdbstub-host)
+        test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
+        test-gdbstub-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -261,6 +275,7 @@ $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
+$(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
@@ -269,6 +284,9 @@ $(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point agains
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
 $(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
+$(call run-lane,test-usbdev-urb-loopback,the async URB engine over an IOKit loopback)
+$(call run-lane,test-usbdev-ioctl-loopback,the usbdevfs fd contract with a service behind one node)
+$(call run-lane,test-usbdev-ioctl-departed,the usbdevfs ioctls this layer names on a device that has gone)
 $(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
 $(call run-lane,test-dir-backing-drain-error,a lost union listing is reported not truncated)
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
@@ -290,7 +308,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs test-config test-runner \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs check-proof-targets check-usbdev-departed check-usb-fixture-bin test-config test-runner \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
@@ -1701,17 +1719,19 @@ test-usbdev-ioctl: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 
 ## The usbdevfs fd's failures, one forced condition per run
-# Six things this descriptor has to get right cannot be provoked from a guest on
-# a healthy host: a device declaring an interface number wider than the table
-# that indexes by it, the three ways an open can fail before it returns, and the
+# Seven things this descriptor has to get right cannot be provoked from a guest
+# on a healthy host: a device declaring an interface number wider than the table
+# that indexes by it, the three ways an open can fail before it returns, the
 # two windows an open leaves around the moment the side table binds its guest
 # fd -- before the bind, where a close finds no entry, and after it, where a
-# close can reap the entry and a sibling open can take the slot back. Each run
-# below forces exactly one and the binary asserts only that one, so a failure
-# names the condition. The malformed-descriptor run is also where the
-# out-of-bounds read lives: it is invisible in the answer -- both sides report
-# EINVAL, which is what checkintf reports -- and shows up only under
-# -fsanitize=array-bounds, which is why this lane is in the sanitizer set.
+# close can reap the entry and a sibling open can take the slot back -- and the
+# window a reap leaves between the fd-table snapshot it settles readiness from
+# and the side-table entry it settles it on. Each run below forces exactly one
+# and the binary asserts only that one, so a failure names the condition. The
+# malformed-descriptor run is also where the out-of-bounds read lives: it is
+# invisible in the answer -- both sides report EINVAL, which is what checkintf
+# reports -- and shows up only under -fsanitize=array-bounds, which is why this
+# lane is in the sanitizer set.
 test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=badifnum $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_OPEN_FAULT=info \
@@ -1724,6 +1744,103 @@ test-usbdev-faults: $(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
 	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_RETIRE_DELAY_US=20000 \
 		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=1 ELFUSE_USBDEV_REAP_DELAY_US=20000 \
+		$(ELFUSE_BIN) $(TEST_DIR)/test-usbdev-ioctl
+
+## Print the binary path this flavor links, for .ci/check-usb-fixture-bin.sh
+#
+# A goal of its own rather than a generic print-%: it is the only variable any
+# caller asks for, and mk/common.mk already filters print-% out of the flavor
+# guard so that asking costs no rebuild.
+.PHONY: print-elfuse-bin
+print-elfuse-bin:
+	@printf '%s\n' '$(ELFUSE_BIN)'
+
+## Verify the fixture build and the shipped build cannot share a binary path
+.PHONY: check-usb-fixture-bin
+check-usb-fixture-bin:
+	@bash .ci/check-usb-fixture-bin.sh
+
+## Verify the recorded departed-device answers still match the ioctl surface
+#
+# The join is the gate: the generator refuses to emit unless every request
+# usbdev_ioctl dispatches has a row in tests/usbdev-ioctl-departed.tbl saying
+# what Linux answers for it on a device that has gone.
+check-usbdev-departed: $(DEPARTED_HEADER)
+	@python3 $(DEPARTED_GENERATOR) --check --output $(DEPARTED_HEADER)
+
+## Build the fixture-enabled binary the two loopback lanes run
+#
+# The loopback fixture is not in the default build (USB_LOOPBACK_FIXTURE in
+# mk/config.mk), so a lane that needs it has to ask for a binary that has it.
+# Asking is a recursive make with the variable set rather than a second link
+# line here, so what the lanes run is the build a reader gets from
+# "make USB_LOOPBACK_FIXTURE=1" and cannot drift from it, and so nothing in this
+# file has to restate the prerequisites of $(ELFUSE_BIN).
+#
+# Into a binary of its own, so a plain make still leaves build/elfuse without
+# the fixture: the sub-make overrides ELFUSE_BIN rather than BUILD_DIR, which
+# keeps every object but the fixture's shared with the outer build. Overriding
+# BUILD_DIR instead would recompile the tree.
+#
+# Phony because the sub-make is what decides whether anything needs rebuilding.
+# The leading '+' is what keeps it expanding under -n: make looks for a literal
+# $(MAKE) in the unexpanded recipe line (make manual 9.3). A command-line
+# override reaches a sub-make through MAKEFLAGS, so the sanitizer lanes get a
+# loopback binary of their own flavor without this line naming EXTRA_CFLAGS.
+.PHONY: elfuse-loopback
+elfuse-loopback:
+	+$(Q)$(MAKE) --no-print-directory USB_LOOPBACK_FIXTURE=1 \
+		ELFUSE_BIN=$(ELFUSE_LOOPBACK_BIN) elfuse
+
+## The async URB engine, against a device that can complete a transfer
+# ELFUSE_USB_FIXTURE=loopback adds one device whose IOKit answers come from
+# src/syscall/usbdev-fixture.c: the two COM vtables are replaced and nothing
+# above them is, so submit, the per-endpoint queue, the completion callback on
+# the event thread, the readiness and disconnect maps, REAPURB, the
+# CAP_REAP_AFTER_DISCONNECT drain and the ZERO_PACKET write all run here for the
+# first time without a board. What it cannot cover -- real timing, NAKs,
+# maxpacket segmentation, exclusive-access arbitration, a physical unplug -- is
+# listed in docs/testing.md and stays on the board.
+#
+# Two runs, because one of the scenarios terminates the modeled device while
+# another fd is closing and every scenario in the main run still needs it
+# afterwards. Same shape as test-usbdev-ioctl-departed's three.
+test-usbdev-urb-loopback: elfuse-loopback $(TEST_DIR)/test-usbdev-urb-loopback
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-urb-loopback
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-urb-loopback \
+		terminate-race
+
+## The same fd contract, with an IOKit service behind one node
+# The seam is per device: the loopback model adds a device and leaves the
+# service-less ones alone, so this run must answer exactly what
+# test-usbdev-ioctl answers. It is the check that the seam did not leak into the
+# paths it is not supposed to touch.
+test-usbdev-ioctl-loopback: elfuse-loopback $(TEST_DIR)/test-usbdev-ioctl
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-ioctl
+
+## Every usbdevfs ioctl the layer implements, on a device that has gone
+#
+# The surface comes from usbdev_ioctl's own dispatch by way of
+# scripts/gen-usbdev-ioctl-departed.py, so a new ioctl joins this lane without
+# anyone remembering to add it. Three runs because one process can hold only one
+# departed device: the first -ENODEV stamps every fd open on the node, so the
+# rows that need a claim taken before the device left cannot share a process
+# with the rows that take it away.
+.PHONY: test-usbdev-ioctl-departed
+test-usbdev-ioctl-departed: elfuse-loopback check-usbdev-departed \
+		$(TEST_DIR)/test-usbdev-ioctl-departed
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-ioctl-departed fresh
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-ioctl-departed \
+		held-claim
+	ELFUSE_USB_FIXTURE=loopback \
+		$(ELFUSE_LOOPBACK_BIN) $(TEST_DIR)/test-usbdev-ioctl-departed \
+		held-release
 
 ## fstatfs answers for the descriptor it pinned, not for the fd number
 # The identity is decided from the slot's stamp and from the descriptor itself,
@@ -1871,6 +1988,10 @@ test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 ## Run the USB descriptor blob walk unit test natively on the host
 test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
 	$(BUILD_DIR)/test-usb-desc-host
+
+## Run the usbdevfs URB bookkeeping unit test (native host binary)
+test-usbdev-urb-host: $(BUILD_DIR)/test-usbdev-urb-host
+	$(BUILD_DIR)/test-usbdev-urb-host
 
 ## Run the ELF header validation host unit test
 test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host
