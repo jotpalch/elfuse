@@ -148,6 +148,7 @@
 #include "syscall/internal.h"
 #include "syscall/io.h"
 #include "syscall/linux-wire.h"
+#include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/usbdev-fixture.h"
 #include "syscall/usbdev-urb.h"
@@ -3062,6 +3063,18 @@ static int64_t usbdev_open_errno(void)
 
 static bool usbdev_parse_node(const char *path, int *bus, int *dev)
 {
+    /* Folded the way every other /dev/bus test folds: the intercept gates let
+     * //dev/bus/usb/003/001 and /dev/./bus/usb/003/001 reach this constructor
+     * on their "/dev" prefix, the literal scan below matched neither, and the
+     * open fell through to the scratch placeholder -- which usb-sysfs.c refuses
+     * with EACCES for a writable open, so one spelling of a node opened as a
+     * usbdevfs descriptor while another was denied. A trailing slash survives
+     * the fold, so "BBB/DDD/" still fails the scan and stays ENOTDIR.
+     */
+    char folded[LINUX_PATH_MAX];
+    if (path_fold_dot_components(path, folded, sizeof(folded)))
+        path = folded;
+
     unsigned b, d;
     char tail;
     if (sscanf(path, "/dev/bus/usb/%3u/%3u%c", &b, &d, &tail) != 2)

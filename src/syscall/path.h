@@ -86,6 +86,31 @@ static inline int path_translation_at_flags(const path_translation_t *tx,
  */
 bool path_prefix_match(const char *path, const char *prefix, size_t plen);
 
+/* Fold a leading "//" run and leading "." components off an absolute path, the
+ * way Linux resolves //x and /./x as /x, and return the first real component's
+ * position within it. The two spellings interleave, so the fold runs to a
+ * fixpoint rather than one pass of each: /.//dev and /././/dev reach /dev, not
+ * //dev. Pure string work; returns a pointer into @path.
+ *
+ * It settles the first component and nothing deeper. Use it for a test that
+ * reads one -- "/dev", "/sys", "/proc" -- which is what the intercept gates
+ * below and the USB layer's ownership test read; a test on a deeper literal
+ * reads past the leading run and needs path_fold_dot_components instead.
+ * Neither folds "..", and a prefix test on a descriptor's stamp folds through
+ * neither: the stamp was folded once, where it was written.
+ */
+const char *path_skip_root_noise(const char *path);
+
+/* The same fold over every component, into @out: "//dev/./bus/usb/002" becomes
+ * "/dev/bus/usb/002". ".." is left alone (Linux applies it to what the previous
+ * component resolved to, which is not a lexical question), and a trailing slash
+ * survives. Use this, not path_skip_root_noise, for a test on a literal deeper
+ * than the first component -- "/dev/bus" rather than "/dev".
+ *
+ * Returns false for a relative path or when the result does not fit.
+ */
+bool path_fold_dot_components(const char *path, char *out, size_t outsz);
+
 /* Advance *pathp to the next '/'-separated component, skipping empty segments
  * from repeated slashes.
  *

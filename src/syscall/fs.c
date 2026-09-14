@@ -195,6 +195,29 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
     if (!path || out_size == 0)
         return false;
 
+    /* A stamp is read back as a name -- getcwd, /proc/self/fd/N, the fstat
+     * identity test in fs-stat.c -- so it has to be the one canonical spelling
+     * of the object, not the spelling the guest happened to use. The intercept
+     * gates admit //dev/bus/usb/002 and /dev/./bus/usb/002 on their "/dev"
+     * prefix, and a descriptor opened through either matched none of the tests
+     * below: it carried no stamp at all, getcwd reported the host scratch
+     * directory behind it, and a relative open measured against it created
+     * files in that directory.
+     *
+     * A name that does not fold (relative, or too long) is left as it was and
+     * simply fails the tests below, which is what it did before. The stamp is
+     * canonical for the "//" and "." spellings and no further, and two residues
+     * survive it rather than one. A ".." folds to itself and is stamped as
+     * written, because Linux applies it to what the previous component resolved
+     * to; and a trailing slash survives just as deliberately, because it is
+     * what makes a device node used as a directory report ENOTDIR. getcwd
+     * therefore reports the name the guest chdir'd with for both -- both
+     * predate this series.
+     */
+    char folded[LINUX_PATH_MAX];
+    if (path_fold_dot_components(path, folded, sizeof(folded)))
+        path = folded;
+
     if (!strcmp(path, "/dev/ptmx")) {
         str_copy_trunc(out, path, out_size);
         return true;
@@ -240,6 +263,41 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
          */
         if (str_copy_trunc(out, path, out_size) >= out_size)
             return false;
+        return true;
+    }
+
+    /* Serial alias fds (usb-sysfs.c) are plain host fds on macOS cu.* callout
+     * nodes; the stamp is what lets fstat report the Linux 166/188:<n> char-dev
+     * identity instead of the host tty's. The by-id spelling names the same
+     * object through the same open, so it carries the same stamp: without it
+     * one device fstat'd as 166:0 through one name and as the macOS callout
+     * (9:7 on this host) through the other.
+     */
+    char alias_node[64];
+    if (usb_tty_alias_node(path, alias_node, sizeof(alias_node))) {
+        /* The alias node's own spelling, not the guest's: a stamp is read back
+         * as a name (fstat, getcwd, /proc/self/fd/N), so both
+         * /dev/serial/by-id/../../ttyACM0 and the by-id leaf itself are
+         * recorded as /dev/ttyACM0. Recording the by-id spelling instead lost
+         * the identity twice over -- it is a different name for the same
+         * object, and at up to 242 bytes it does not fit the 63-byte stamp, so
+         * a real device's leaf was truncated and matched nothing.
+         */
+        str_copy_trunc(out, alias_node, out_size);
+        return true;
+    }
+
+    /* The directories the alias names live in, for the /dev/pts reason above
+     * and no other: they stay host-served, but a descriptor on one has to carry
+     * its guest spelling so resolve_proc_dirfd_path can rebuild /dev/ttyACM0
+     * for openat(dirfd, "ttyACM0") and put it back through the intercepts.
+     * Unstamped, the relative call reached the placeholder file directly --
+     * readdir listed the alias, openat opened an empty regular file, and the
+     * absolute spelling of the same name opened the device.
+     */
+    if (!strcmp(path, "/dev") || !strcmp(path, "/dev/serial") ||
+        !strcmp(path, "/dev/serial/by-id")) {
+        str_copy_trunc(out, path, out_size);
         return true;
     }
 
@@ -632,6 +690,23 @@ void dir_stream_release(void *ds_ptr)
     }
 }
 
+/* The host-served directories a serial alias name appears in. A descriptor
+ * opened on one has to carry its guest spelling, because the names inside it
+ * are the layer's and not the host directory's: resolve_proc_dirfd_path
+ * rebuilds /dev/ttyACM0 from a stamped dirfd and puts openat(dirfd, "ttyACM0")
+ * back through the intercepts. Unstamped, readdir listed the alias and the
+ * relative open handed back the empty placeholder file behind it while the
+ * absolute spelling of the same name opened the character device.
+ *
+ * Only these three exact directories, and only on the host-open path: every
+ * other name here either goes through an intercept that stamps it already or
+ * has no guest spelling to stamp.
+ */
+static const char *path_alias_dir_stamp(const char *p, char *buf, size_t bufsz)
+{
+    return p && usb_tty_alias_dir(p, buf, bufsz) ? buf : NULL;
+}
+
 /* spec is the description this fd inherits from, or NULL for a fresh one. Only
  * the magic-link open passes one: it implements the open as a dup, so the host
  * flags are shared with the source and must not be probed or changed.
@@ -904,6 +979,16 @@ int64_t sys_openat_path(guest_t *g,
              * relies on close(0)+open("/dev/null") returning fd 0. Synthetic
              * /proc files use fd_alloc_from(128) to avoid races with concurrent
              * GC finalizers that may close stale low-numbered fds.
+             *
+             * The spelling is folded before the literal test, the way the gates
+             * fold: the gates admit //dev/ttyACM0 and /.//dev/bus/usb/001 on
+             * their "/dev" prefix, so the intercept serves them, and this test
+             * read past the leading run and put the descriptor at 128 for a
+             * name the canonical spelling gives the lowest free number. That is
+             * the busybox rule broken by spelling alone -- close(0) then
+             * open("//dev/ttyACM0") returned 128 where open("/dev/ttyACM0")
+             * returns 0. A first-component test, so the leading-run fold is
+             * enough; an interior "." was never affected.
              */
             int type = intercepted_fd_type(tx.intercept_path, intercepted,
                                            linux_flags);
@@ -918,7 +1003,9 @@ int64_t sys_openat_path(guest_t *g,
                 return linux_errno();
             }
             int min_guest_fd =
-                (!strncmp(tx.intercept_path, "/dev/", 5)) ? -1 : 128;
+                (!strncmp(path_skip_root_noise(tx.intercept_path), "/dev/", 5))
+                    ? -1
+                    : 128;
 
             /* An fd magic link (/dev/stdin, /dev/fd/N, /proc/self/fd/N) is
              * served by dup'ing a descriptor this process already holds, so the
@@ -999,8 +1086,11 @@ int64_t sys_openat_path(guest_t *g,
             close_keep_errno(host_fd);
             return linux_errno();
         }
-        int guest_fd = fd_alloc_opened_host(host_fd, type, linux_flags, -1,
-                                            NULL, NULL, NULL);
+        char dstamp[64];
+        int guest_fd = fd_alloc_opened_host(
+            host_fd, type, linux_flags, -1, NULL,
+            path_alias_dir_stamp(tx.intercept_path, dstamp, sizeof(dstamp)),
+            NULL);
         if (guest_fd < 0)
             return linux_errno();
         return guest_fd;
@@ -1042,8 +1132,10 @@ int64_t sys_openat_path(guest_t *g,
         close_keep_errno(host_fd);
         return linux_errno();
     }
-    int guest_fd =
-        fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL, NULL);
+    char dstamp[64];
+    int guest_fd = fd_alloc_opened_host(
+        host_fd, type, linux_flags, -1, NULL,
+        path_alias_dir_stamp(tx.intercept_path, dstamp, sizeof(dstamp)), NULL);
     if (guest_fd < 0)
         return linux_errno();
     return guest_fd;
@@ -2753,17 +2845,63 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
      * cwd, which is what makes a chdir onto a `subsystem` link land where Linux
      * lands rather than in the directory the link sits in.
      *
-     * A name the intercept does not claim falls through to the host chdir
-     * below, unchanged.
+     * The name is folded first, for the reason the gates fold: //dev/bus/usb
+     * and /dev/./bus/usb stat and open through the intercept, so a chdir onto
+     * the same directory must not be the one caller left testing the raw
+     * spelling and reporting ENOENT. The folded name is what is published as
+     * the virtual cwd too, so getcwd reports one spelling of the directory
+     * however the guest spelled it on the way in.
+     *
+     * Ownership is asked of the USB layer rather than re-spelled here. The gate
+     * applies two of the seven tests path_might_use_stat_intercept applies: a
+     * /sys literal, because that prefix fronts the syscpu stub as well and not
+     * this layer alone, and the layer's own predicate for everything that
+     * prefix does not cover. The five it leaves out are /proc, /dev/shm,
+     * /dev/fuse, /dev/pts and a FUSE mount, and all five are accounted for here
+     * rather than the two or three of them someone happened to look at. Each
+     * was read at nine entry points -- stat, lstat, access, open, fstat,
+     * fstatfs, getdents, fchdir and chdir -- in eight builds: on this commit
+     * and on main, with the matrix lane's sysroot and without one, and under
+     * ELFUSE_USB_FIXTURE=1 and against an attached board alike. All eight agree
+     * cell for cell, so one account covers them.
+     *
+     * Two of the five are claimed by the arms above and their chdir succeeds:
+     * /proc, whose cwd publishes as /proc, and a FUSE mount, whose cwd
+     * publishes as the mountpoint. The other three fall through to the host
+     * chdir below and answer ENOENT there while every other entry point is
+     * served. /dev/shm falls through because its redirect arm fires for
+     * /dev/shm/<leaf> only, so the directory itself takes the host chdir while
+     * chdir("/dev/shm/rvdir") is ok; /dev/pts and /dev/fuse have no arm at all.
+     * /dev/fuse differs from those two in nothing but not being a directory:
+     * stat, lstat, access, open and fstat on it are ok, and getdents and fchdir
+     * answer ENOTDIR where the other two succeed. The two fstatfs cells that
+     * are not ok are not about chdir either, and both are recorded as measured
+     * rather than explained here: EINVAL on /dev/fuse, which is a character
+     * device, and EBADF on a descriptor open on the FUSE mountpoint. All three
+     * ENOENT cells are inherited rather than introduced here -- main answers
+     * the same at every one of those cells -- and closing any of them means
+     * teaching the host chdir about a name this gate does not claim.
+     *
+     * Spelling the second half as a /dev/bus literal left the serial aliases
+     * out of it -- they sit directly under /dev, in neither arm -- so
+     * chdir("/dev/ttyACM0/.") fell through to the host and answered ENOENT
+     * while open, fchdir and getdents64 on the same name answered ENOTDIR, and
+     * while the usbfs node beside it, /dev/bus/usb/001/001/., answered ENOTDIR
+     * here and on main. The bare alias node parted the same way with no sysroot
+     * to plant a placeholder for the host chdir to trip over. The tty-dot-node
+     * matrix column holds it.
      */
-    if (tx.intercept_path &&
-        (path_prefix_match(tx.intercept_path, "/sys", 4) ||
-         path_prefix_match(tx.intercept_path, "/dev/bus", 8))) {
-        int host_fd =
-            proc_intercept_open(g, tx.intercept_path, LINUX_O_DIRECTORY, 0);
+    char chdir_folded[LINUX_PATH_MAX];
+    const char *chdir_path = tx.intercept_path;
+    if (chdir_path && path_fold_dot_components(chdir_path, chdir_folded,
+                                               sizeof(chdir_folded)))
+        chdir_path = chdir_folded;
+    if (chdir_path && (path_prefix_match(chdir_path, "/sys", 4) ||
+                       usb_sysfs_path_might_be_ours(chdir_path))) {
+        int host_fd = proc_intercept_open(g, chdir_path, LINUX_O_DIRECTORY, 0);
         if (host_fd >= 0) {
             char virt_buf[LINUX_PATH_MAX];
-            const char *virt_path = tx.intercept_path;
+            const char *virt_path = chdir_path;
             if (usb_sysfs_guest_path_for_fd(host_fd, virt_buf,
                                             sizeof(virt_buf)) > 0)
                 virt_path = virt_buf;
@@ -2821,7 +2959,11 @@ int64_t sys_fchdir(int fd)
      * writing into a read-only view and reporting the wrong statfs magic.
      * Publishing the stamped guest spelling instead keeps the cwd on the
      * intercepts, exactly as chdir() does for these paths.
-     * resolve_proc_cwd_path knows the same two prefixes.
+     * resolve_proc_cwd_path knows the same two prefixes, and the serial-alias
+     * directories besides. This arm needs no third prefix for those: /dev is a
+     * directory this layer plants names into rather than one it serves, so
+     * fchdir() publishes no virtual cwd for it and the refreshed cwd is already
+     * the guest spelling those relative walks read.
      */
     if (!proc_virtual && fd_table[fd].proc_path[0] &&
         (path_prefix_match(fd_table[fd].proc_path, "/sys", 4) ||

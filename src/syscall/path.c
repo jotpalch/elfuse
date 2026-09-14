@@ -44,12 +44,116 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
  * module answers, not about what the filesystem can do.
  */
 #define SYSFS_PREFIX "/sys"
-#define DEV_USB_PREFIX "/dev/bus"
+
+/* Step over a leading "//" run and leading "." components so a literal prefix
+ * test reads the first real component. Linux resolves //x and /./x as /x;
+ * matching the raw spelling put one spelling of a name outside an intercept
+ * while another went through it, which is how //dev/ttyACM0 came to stat as a
+ * character device and open as the placeholder file behind it.
+ *
+ * Shared rather than repeated: the two gates below, the USB layer's ownership
+ * test and every other literal /sys or /dev/bus prefix test have to fold the
+ * same way, and teaching the fold to some of them is what left //dev/bus/usb
+ * open to stat and open while chdir still reported ENOENT.
+ *
+ * The two spellings interleave, so one pass of each is not enough: stepping
+ * over the "." in /.//dev leaves the "//" that "." was hiding, and a loop that
+ * had already finished with "//" left //dev for the prefix test to miss. The
+ * single loop below runs to a fixpoint instead. It terminates because each arm
+ * advances path by at least one byte and neither can step past the terminator:
+ * the "//" arm needs path[1] to be a slash and the "." arm needs three matched
+ * bytes, so path stays inside the string and strlen(path) bounds the turns.
+ */
+const char *path_skip_root_noise(const char *path)
+{
+    for (;;) {
+        if (path[0] == '/' && path[1] == '/') {
+            path++;
+            continue;
+        }
+        if (!strncmp(path, "/./", 3)) {
+            path += 2;
+            continue;
+        }
+        return path;
+    }
+}
+
+/* The same fold applied to every component rather than to the leading run:
+ * "//dev/./bus/usb/002/" becomes "/dev/bus/usb/002/". Empty components and "."
+ * never change which object a path names, whatever symlinks it crosses, so
+ * folding them cannot pull a host name into an intercept.
+ *
+ * Which object, and not more than that. A trailing "." carries Linux's
+ * directory requirement the way a trailing slash does, and dropping it drops
+ * the requirement: open("/dev/bus/usb/001/001/.") is served here where Linux
+ * answers ENOTDIR. That divergence predates this helper and is the same on the
+ * unfolded paths beside it, so the fold inherits it rather than widening it;
+ * naming it here is what keeps the paragraph above from reading as a claim the
+ * fold does not make.
+ *
+ * ".." is deliberately left in place. Linux applies it to what the previous
+ * component resolved to, so folding it lexically would move a name that crosses
+ * one of the synthetic subsystem links onto a different object; that resolution
+ * belongs to usb_sysfs_resolve_guest_path, not here.
+ *
+ * path_skip_root_noise is enough for a test on a first component ("/dev",
+ * "/sys", "/proc"), which is why the intercept gates use it. A test on a deeper
+ * literal ("/dev/bus") needs this one: the gates let /dev/./bus/usb/002 through
+ * on its "/dev" prefix, and every consumer that then matched "/dev/bus" on the
+ * unfolded name disagreed with them.
+ *
+ * A trailing slash survives, because it is what makes a device node used as a
+ * directory report ENOTDIR rather than opening.
+ *
+ * Returns false for a relative path or when the result does not fit.
+ */
+bool path_fold_dot_components(const char *path, char *out, size_t outsz)
+{
+    if (!path || path[0] != '/' || outsz < 2)
+        return false;
+
+    size_t len = 0;
+    out[len++] = '/';
+    for (const char *p = path; *p;) {
+        while (*p == '/')
+            p++;
+        const char *seg = p;
+        while (*p && *p != '/')
+            p++;
+        size_t seglen = (size_t) (p - seg);
+        if (seglen == 0)
+            break;
+        if (seglen == 1 && seg[0] == '.')
+            continue;
+        if (len > 1) {
+            if (len + 1 >= outsz)
+                return false;
+            out[len++] = '/';
+        }
+        if (len + seglen >= outsz)
+            return false;
+        memcpy(out + len, seg, seglen);
+        len += seglen;
+    }
+
+    /* Only when something remains to apply it to: "/." folds to "/", which is a
+     * directory either way.
+     */
+    if (len > 1 && path[strlen(path) - 1] == '/') {
+        if (len + 1 >= outsz)
+            return false;
+        out[len++] = '/';
+    }
+    out[len] = '\0';
+    return true;
+}
 
 bool path_might_use_open_intercept(const char *path)
 {
     if (!path || path[0] != '/')
         return false;
+    path = path_skip_root_noise(path);
 
     if (!strncmp(path, "/proc", 5))
         return true;
@@ -186,6 +290,7 @@ bool path_might_use_stat_intercept(const char *path)
 {
     if (!path || path[0] != '/')
         return false;
+    path = path_skip_root_noise(path);
 
     if (!strncmp(path, "/proc", 5))
         return true;
@@ -203,9 +308,25 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
-        return true;
-    if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
+
+    /* The ttyACM/ttyUSB and by-id names are asked of the synthetic USB layer
+     * rather than matched here, so this gate and the intercept behind it decide
+     * ownership the same way. Matching a prefix here left //dev/ttyACM0 and
+     * /dev/./ttyACM0 outside the stat intercept while procemu's open intercept,
+     * which is not gated, still served them: one spelling opened the character
+     * device and stat'd the placeholder file behind it. The predicate is pure
+     * string work and takes no lock.
+     *
+     * /sys keeps its literal prefix beside it, because this gate fronts every
+     * procemu dispatcher and not the USB layer alone: /sys/devices/system/cpu
+     * belongs to the syscpu stub those dispatchers consult first, and the USB
+     * layer classifies it as nobody's (usb-sysfs.c, classify_path). Asking the
+     * USB layer alone dropped the whole cpu subtree out of stat and access
+     * while the ungated open intercept went on serving it: reading cpu/online
+     * worked and stat and access on the same name answered ENOENT.
+     */
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1) ||
+        usb_sysfs_path_might_be_ours(path))
         return true;
 
     return false;
@@ -534,27 +655,47 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    /* A /sys walk that passes through one of the synthetic USB `subsystem`
-     * symlinks is rewritten to the canonical guest spelling of where it lands,
-     * before anything decides whose name it is. The links exist only in the
-     * synthetic tree, so no other layer can resolve them: the sysroot has no
-     * such link, and a lexical fold puts the walk back in the device directory
-     * it had just left. Doing it here, once, is what makes open, stat, lstat,
-     * readlink and getdents64 answer from one name -- the union listing of
-     * `<dev>/subsystem/..` offered /sys/bus/pci while every lookup of
-     * `<dev>/subsystem/../pci` denied it, because each entry point folded the
+    /* A /sys walk that passes through one of the synthetic USB symlinks is
+     * rewritten to the canonical guest spelling of where it lands, before
+     * anything decides whose name it is. The links exist only in the synthetic
+     * tree, so no other layer can resolve them: the sysroot has no such link,
+     * and a lexical fold puts the walk back in the directory it had just left.
+     * Doing it here, once, is what makes open, stat, lstat, readlink and
+     * getdents64 answer from one name -- the union listing of
+     * <dev>/subsystem/.. offered /sys/bus/pci while every lookup of
+     * <dev>/subsystem/../pci denied it, because each entry point folded the
      * name for itself.
+     *
+     * /sys/class/tty is here for the same reason /sys/bus/usb/devices is: the
+     * tty alias directories carry a device link and a subsystem link, and both
+     * are walked through.
      *
      * Cheap for everything else: the prefix test rejects every path that cannot
      * contain such a link before the USB layer is called at all.
+     *
+     * Folded first, because the literal read here is deeper than the first
+     * component and the intercept gates step over the leading "//" and "."
+     * runs: on the raw spelling, under the USB fixture, and with a sysroot and
+     * without one alike, //sys/bus/usb/devices/1-1/subsystem/../usb was served
+     * by stat, lstat, access, fstatat, open, fstat, fstatfs, chdir, fchdir and
+     * getdents, each folding for itself past this point, while statfs alone
+     * answered ENOENT. The device key is whichever source presents it, so an
+     * attached board's own parts the same way. The folded name is what the
+     * rewrite reads too, so one walk through the link resolves the same way for
+     * every entry point.
      */
-    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21)) {
+    char folded[LINUX_PATH_MAX];
+    const char *sys_name = tx->guest_path;
+    if (path_fold_dot_components(sys_name, folded, sizeof(folded)))
+        sys_name = folded;
+    if (!strncmp(sys_name, "/sys/bus/usb/devices/", 21) ||
+        !strncmp(sys_name, "/sys/class/tty/", 15)) {
         /* Through a local buffer, not straight into guest_buf: guest_path may
          * already be guest_buf (the FUSE resolver above puts it there), and the
          * rewrite reads its input while writing its output.
          */
         char resolved[LINUX_PATH_MAX];
-        if (usb_sysfs_resolve_guest_path(tx->guest_path, resolved,
+        if (usb_sysfs_resolve_guest_path(sys_name, resolved,
                                          sizeof(resolved)) == 1) {
             str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
             tx->guest_path = tx->guest_buf;
@@ -1282,10 +1423,32 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * set by fchdir() onto a synthetic USB directory would resolve relative
      * names straight against the scratch tree. The component walk below is
      * base-agnostic.
+     *
+     * The directories the serial aliases appear in are asked of the USB layer
+     * rather than spelled here, for the reason the descriptor stamp asks it:
+     * they stay the sysroot's own directories and a literal list is not what
+     * decides them. Leaving them out was the cwd half of the split the stamp
+     * closed for a descriptor -- chdir("/dev") then open("ttyACM0") reached the
+     * placeholder file the alias sits on top of with a sysroot, and answered
+     * ENOENT without one, while /dev/ttyACM0 and openat(dirfd_of_dev,
+     * "ttyACM0") both opened the character device. chdir and fchdir part
+     * together and are repaired together: fchdir() onto /dev publishes no
+     * virtual cwd, because /dev is a directory this layer plants names into
+     * rather than one it serves, so the refreshed cwd is the guest spelling
+     * /dev and this test is the one that reads it. The same relative walk is
+     * how /dev/stdout and /dev/stderr are reached, and they parted with the
+     * aliases.
+     *
+     * The canonical spelling the layer hands back is unused: the seed below is
+     * view.path, which is already the guest's own absolute name for the cwd. So
+     * the buffer is sized to the longest name the layer can return rather than
+     * to a path.
      */
+    char alias_dir[sizeof("/dev/serial/by-id")];
     int rc = 0;
     if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
-        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8)) {
+        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8) ||
+        usb_tty_alias_dir(view.path, alias_dir, sizeof(alias_dir))) {
         size_t marks[PROC_PATH_COMPONENTS_MAX];
         size_t depth;
         if (proc_seed_absolute_path(view.path, out, outsz, marks,
