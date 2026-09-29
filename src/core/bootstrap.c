@@ -437,10 +437,20 @@ int guest_bootstrap_prepare(guest_t *g,
          */
         boot->elf_load_base = 0;
         g->elf_load_min = ELF_DEFAULT_BASE;
-        g->brk_base = BRK_BASE_DEFAULT;
-        g->brk_current = g->brk_base;
-        g->stack_top = STACK_TOP_DEFAULT;
-        g->stack_base = g->stack_top - STACK_SIZE;
+
+        /* load_max 0, because the x86_64 image lives behind a fd rather than in
+         * guest memory: the break does not follow it. That floors to
+         * BRK_BASE_DEFAULT and clamps the stack to STACK_TOP_DEFAULT, which is
+         * the layout this site used to spell out, and now cannot drift from the
+         * one every other image gets. It cannot fail at load_max 0, the way
+         * compute_infra_layout's underflow check cannot fire today; both are
+         * checked so a later change to the layout constants is caught here
+         * rather than in the guest.
+         */
+        if (!guest_place_image(g, 0)) {
+            log_error("no room for the guest stack");
+            return -1;
+        }
     } else {
         boot->elf_load_base =
             (boot->elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
@@ -466,16 +476,11 @@ int guest_bootstrap_prepare(guest_t *g,
          */
         g->elf_load_min = boot->elf_info.load_min + boot->elf_load_base;
 
-        g->brk_base =
-            PAGE_ALIGN_UP(boot->elf_info.load_max + boot->elf_load_base);
-        if (g->brk_base < BRK_BASE_DEFAULT)
-            g->brk_base = BRK_BASE_DEFAULT;
-        g->brk_current = g->brk_base;
-
-        g->stack_top = ALIGN_UP(g->brk_base, BLOCK_2MIB) + STACK_SIZE;
-        if (g->stack_top < STACK_TOP_DEFAULT)
-            g->stack_top = STACK_TOP_DEFAULT;
-        g->stack_base = g->stack_top - STACK_SIZE;
+        if (!guest_place_image(g,
+                               boot->elf_info.load_max + boot->elf_load_base)) {
+            log_error("ELF leaves no room for the guest stack");
+            return -1;
+        }
 
         t0 = startup_trace_now_ns();
         if (!load_interpreter(g, sysroot, boot))
@@ -829,10 +834,14 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
      * with the target's load_max.
      */
     g->elf_load_min = ELF_DEFAULT_BASE;
-    g->brk_base = BRK_BASE_DEFAULT;
-    g->brk_current = g->brk_base;
-    g->stack_top = STACK_TOP_DEFAULT;
-    g->stack_base = g->stack_top - STACK_SIZE;
+
+    /* Same placement, and the same unreachable-today failure, as the bootstrap
+     * site above.
+     */
+    if (!guest_place_image(g, 0)) {
+        log_error("no room for the guest stack");
+        return -1;
+    }
 
     mem_region_t regions[MAX_BOOT_REGIONS];
     int nregions = 0;

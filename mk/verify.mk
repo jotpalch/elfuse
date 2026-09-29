@@ -449,6 +449,14 @@ VERIFY_ALIGN_SCAN := src/proved/align.h
 VERIFY_ALIGN_CLAIM := for ANY address, alignment, and search window
 VERIFY_ALIGN_UNPROVED := the region-array walk around them stays test-covered
 
+VERIFY_BRK_SRC  := src/proved/brk.h
+VERIFY_BRK_FCTS := brk_limit_region
+VERIFY_BRK_MIN_GOALS ?= 11
+VERIFY_BRK_MODEL := typed
+VERIFY_BRK_SCAN := src/proved/brk.h
+VERIFY_BRK_CLAIM := for ANY break, bound, and tracked region a guest can reach
+VERIFY_BRK_UNPROVED := the region search around it stays test-covered
+
 VERIFY_FUTEXHASH_SRC  := src/proved/futexhash.h
 VERIFY_FUTEXHASH_FCTS := futex_bucket_index
 VERIFY_FUTEXHASH_MIN_GOALS ?= 3

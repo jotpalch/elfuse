@@ -109,6 +109,16 @@ _Static_assert(sizeof(_Atomic uint64_t) == sizeof(uint64_t) &&
 
 /* Used when brk_start is below 128MiB; otherwise placed above brk. */
 #define STACK_TOP_DEFAULT 0x08000000ULL
+
+/* Heap the stack placement must leave above brk_base when it lands above brk
+ * rather than at STACK_TOP_DEFAULT. Without it, an image whose load_max is
+ * itself 2MiB-aligned puts stack_base exactly on brk_base, and sys_brk then
+ * refuses the first grow: static glibc dies on that inside __libc_setup_tls,
+ * which calls __sbrk and writes errno before the thread pointer exists. Only
+ * images loading above ~118MiB see this term at all; everything else is held at
+ * STACK_TOP_DEFAULT and keeps the layout it had.
+ */
+#define BRK_MIN_WINDOW 0x00200000ULL
 #define STACK_GUARD_SIZE 0x00001000ULL /* 4KiB guard at stack bottom */
 
 /* mmap RX region for PROT_EXEC; placed below 8GiB to leave the high mmap region
@@ -301,8 +311,8 @@ typedef struct {
  *   TLBI_BROADCAST -> X8 = 1  (TLBI VMALLE1IS, broadest)
  *   TLBI_RANGE     -> X8 = 3, X9 = start VA, X10 = page count
  *                     (TLBI VAE1IS loop preserves unrelated TLB entries)
- * X8 = 2 is reserved for the execve drop-frame marker the shim handles
- * separately; it is never produced by the accumulator.
+ * X8 = 2 is reserved for the drop-frame marker the shim handles separately; it
+ * is never produced by the accumulator.
  */
 typedef enum {
     TLBI_NONE = 0,
@@ -539,12 +549,16 @@ typedef struct {
     guest_region_t regions[GUEST_MAX_REGIONS];
     int nregions;         /* Number of active regions */
     uint64_t next_vma_id; /* Last logical-VMA lineage ID allocated. */
-    /* Sticky flag set when guest_region_set_prot could not honor a request
-     * because the region table was full. After this point the tracker no longer
-     * faithfully reflects PTE state, so the mprotect fast path must fall back
-     * to unconditional PTE work. Propagated across fork IPC with the semantic
-     * region snapshot so children inherit the same fast-path guard as the
-     * parent.
+    /* Set when a full region table stopped a mutation from being recorded:
+     * guest_region_set_prot unable to split (leaving a region's old prot, or
+     * applying the new one to a tail no PTE work covered), a munmap split
+     * dropping its tail, or sys_brk failing to add a heap record. After that
+     * the tracker no longer faithfully reflects PTE state, so the mprotect fast
+     * path must fall back to unconditional PTE work and sys_brk must refuse to
+     * grow into a neighbor it can no longer see. Propagated across fork IPC
+     * with the semantic region snapshot so children inherit the same guard as
+     * the parent, and cleared in guest_region_clear along with the table it
+     * doubts, so it binds this image rather than the process.
      */
     bool regions_tracker_stale;
     guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
@@ -789,10 +803,29 @@ static inline uint64_t guest_ipa(const guest_t *g, uint64_t offset)
     return g->ipa_base + offset;
 }
 
-/* The runtime infra reserve, [interp_base - INFRA_RESERVE, interp_base): page
- * table pool, shim text, shim data, vDSO. One definition, because the two
- * predicates below and every caller that has to hand the bounds to a callee
- * were each deriving it themselves.
+/* Whether an image whose highest loaded address is load_max can be placed at
+ * all, and where. Either output may be NULL for a caller that only wants the
+ * verdict. The answer depends on load_max alone and commits nothing, so execve
+ * can settle the question while a refusal is still recoverable.
+ * guest_place_image is what writes it into a guest.
+ *
+ * Returns false when the heap and stack cannot fit below MMAP_RX_BASE, where
+ * the mmap RX region begins.
+ */
+bool guest_image_placement(uint64_t load_max,
+                           uint64_t *brk_base_out,
+                           uint64_t *stack_top_out);
+
+/* Place brk_base, brk_current, stack_top, and stack_base for an image whose
+ * highest loaded address is load_max.
+ *
+ * Returns false on the same terms as guest_image_placement, and leaves all four
+ * fields untouched when it does.
+ */
+bool guest_place_image(guest_t *g, uint64_t load_max);
+
+/* The runtime infrastructure reserve, [interp_base - INFRA_RESERVE,
+ * interp_base): page table pool, shim text, shim data, and vDSO.
  */
 static inline void guest_infra_window(const guest_t *g,
                                       uint64_t *lo,

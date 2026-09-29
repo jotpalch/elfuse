@@ -9,29 +9,45 @@
  * src/syscall/fs.c, the access arm of sys_faccessat, and the fd-side sysfs
  * identity in sys_fstatfs (src/syscall/fs-stat.c).
  *
- * The layer synthesizes exactly one subtree on each side, /sys/bus/usb and
- * /dev/bus/usb, on top of a backing /sys and /dev/bus that a sysroot supplies.
- * Its contract is not per-syscall: a name is this layer's or it is not, and
- * every entry point has to answer from that one decision. Four regressions all
- * came from an entry point re-deriving it -- lstat/open(O_NOFOLLOW)/readlink
- * shadowed the backing because their resolve succeeded where stat's failed,
- * getdents64 replaced the backing listing instead of extending it, /dev/bus had
- * no fall-through arm at all while access(2) fell through anyway, and fstatfs
- * never saw the sysfs identity statfs was handing out. Pinning them one
- * assertion at a time is what let them appear, so this is a matrix instead:
- * every entry point against every path class, so a fix that unifies one pair
- * and splits another cannot pass.
+ * The layer synthesizes /sys/bus/usb, /sys/class/tty, /sys/bus/usb-serial and
+ * /dev/bus/usb whole, and plants individual names -- ttyACM<n>, ttyUSB<n> and
+ * the by-id leaves -- into /dev and /dev/serial/by-id, which stay the sysroot's
+ * directories. Everything else on both sides is the sysroot's. Its contract is
+ * not per-syscall: a name is this layer's or it is not, and every entry point
+ * has to answer from that one decision. Four regressions all came from an entry
+ * point re-deriving it -- lstat/open(O_NOFOLLOW)/readlink shadowed the backing
+ * because their resolve succeeded where stat's failed, getdents64 replaced the
+ * backing listing instead of extending it, /dev/bus had no fall-through arm at
+ * all while access(2) fell through anyway, fstatfs never saw the sysfs identity
+ * statfs was handing out, and the alias names were claimed by shape so an
+ * alias-shaped file the sysroot really had answered ENOENT to every lookup
+ * while readdir went on listing it. Pinning them one assertion at a time is
+ * what let them appear, so this is a matrix instead: every entry point against
+ * every path class, so a fix that unifies one pair and splits another cannot
+ * pass.
  *
  * EXPECTED VALUES ARE MEASURED, NOT ASSUMED. Every cell below was recorded by
- * running this same binary natively on Linux (docker gcc:14, aarch64, kernel
- * 6.x) with MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev/bus
- * carrying a mknod'd usb node next to a foreign bus directory. Re-record with:
+ * running this same binary natively on Linux (docker gcc:14, aarch64) with
+ * MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev carrying a
+ * mknod'd usb node next to a foreign bus directory, an alias node, an
+ * alias-shaped regular file and a by-id link onto the alias. Re-record with:
  *
  *   docker run --rm -v "$PWD:/w" -w /w gcc:14 sh -c \
- *     'mkdir -p /dev/bus/usb/001 /dev/bus/other && : > /dev/bus/other/f && \
- *      mknod /dev/bus/usb/001/001 c 189 0 && \
+ *     'mkdir -p /dev/bus/usb/001 /dev/bus/other /dev/serial/by-id && \
+ *      : > /dev/bus/other/f && mknod /dev/bus/usb/001/001 c 189 0 && \
+ *      mknod /dev/ttyACM0 c 166 0 && printf planted > /dev/ttyACM7 && \
+ *      ln -sf ../../ttyACM0 /dev/serial/by-id/usb-Rec_Device_0001-if00 && \
  *      gcc -D MATRIX_STANDALONE -o /tmp/m tests/test-usb-sysfs-matrix.c && \
  *      MATRIX_RECORD=1 /tmp/m'
+ *
+ * The block was first recorded on a 6.x Linux kernel and re-recorded on a 7.0
+ * one for the tty-dot-node column. Comparing that recording against this file,
+ * 19 of the 23 rows come back byte-identical; open, open_nofollow, openat_dirfd
+ * and epoll_ctl differ in 31 cells, every one of them a cell this file writes
+ * as "-" where the recorder printed E1. That is the per-class case the notes on
+ * COL_SUBSYS and COL_NODE describe rather than a kernel difference, and reading
+ * both markers back in makes the two recordings agree, so no value here rests
+ * on one Linux kernel version alone.
  *
  * Cells the guest cannot match byte-for-byte are recorded per class rather than
  * per spelling; see the notes on COL_SUBSYS and COL_NODE.
@@ -76,7 +92,7 @@ int passes = 0, fails = 0;
 #endif
 
 #define SYSFS_MAGIC 0x62656572
-#define CELL_MAX 24
+#define CELL_MAX 40
 
 /* path classes (columns) */
 enum {
@@ -95,16 +111,77 @@ enum {
     COL_SUBSYS_OUT, /* a walk through the subsystem link and back out of usb */
     COL_FOLD_OUT, /* a '..' out of /dev/bus/usb onto a name the backing owns */
     COL_FOLD_IN,  /* a '..' out of a foreign bus and back into /dev/bus/usb */
-    COL_SYS_FOLD_IN, /* a '..' out of a backing /sys name and back into ours */
+    COL_SYS_FOLD_IN,  /* a '..' out of a backing /sys name and back into ours */
+    COL_SYS_FOLD_IN2, /* the same, through a /sys name the scratch tree lacks */
+    COL_TTY,          /* a live ttyACM alias node */
+    COL_TTY_BACK,     /* an alias-shaped name only the backing has */
+    COL_TTY_ABSENT,   /* an alias-shaped name absent on both sides */
+    COL_BYID,         /* a /dev/serial/by-id leaf, discovered */
+    COL_TTY_FOLD,     /* the alias node spelled through a '..' */
+    COL_SLASH_DIR,    /* a /dev/bus/usb directory spelled with a leading "//" */
+    COL_DOT_DIR,      /* the same directory spelled with a "." component */
+    COL_SLASH_NODE,   /* a usbfs node spelled with a leading "//" */
+    COL_DOT_NODE,     /* the same node spelled with a "." component */
+    COL_FOLD2_DIR,    /* the same directory, "." and "//" interleaved */
+    COL_FOLD2_NODE,   /* the same node, "." and "//" interleaved */
+    COL_FOLD2_SYS,    /* a /sys directory, "." and "//" interleaved */
+    COL_FOLD3_DIR,    /* the same directory, two "." before the "//" */
+    COL_SUBSYS_OUT_SLASH, /* subsys-out spelled with a leading "//" */
+    COL_TTY_DOT_NODE,     /* an alias node with a trailing "." component */
     COL_COUNT,
 };
 
 static const char *col_name[COL_COUNT] = {
-    "synth-dir",  "back-sys",     "back-dev",    "subsys",
-    "escape",     "escape-syn",   "usb-node",    "absent",
-    "long-sys",   "sys-root",     "dev-bus",     "shadow",
-    "subsys-out", "dev-fold-out", "dev-fold-in", "sys-fold-in",
+    "synth-dir",    "back-sys",     "back-dev",         "subsys",
+    "escape",       "escape-syn",   "usb-node",         "absent",
+    "long-sys",     "sys-root",     "dev-bus",          "shadow",
+    "subsys-out",   "dev-fold-out", "dev-fold-in",      "sys-fold-in",
+    "sys-fold-in2", "tty-alias",    "tty-planted",      "tty-absent",
+    "byid-link",    "tty-fold",     "slash-dir",        "dot-dir",
+    "slash-node",   "dot-node",     "fold2-dir",        "fold2-node",
+    "fold2-sys",    "fold3-dir",    "subsys-out-slash", "tty-dot-node",
 };
+
+/* The fold2/fold3 columns spell the objects of the four columns above them with
+ * a "." component and a "//" run interleaved rather than one or the other.
+ * "/.//x" is the shortest name where stepping over the "." uncovers a "//" that
+ * was not there to be seen first, and "/././/x" is the same one turn deeper, so
+ * a fold that runs one pass of each rather than to a fixpoint leaves "//x" and
+ * every literal prefix test behind it misses. That is not hypothetical: the
+ * commit that taught the gates to fold introduced exactly that shape, and these
+ * spellings then stat'd, access'd and opened as ENOENT while statfs answered
+ * TMPFS_MAGIC and chdir landed the process inside the tree. The statfs row
+ * stays green through all of that, folding every component rather than the
+ * leading run; fstatfs is the row that reddens with the three above it, needing
+ * the open that failed. fold2-sys walks the /sys half of the same split, which
+ * parted the same way.
+ *
+ * Like the four columns above, every cell here is the cell of the canonical
+ * spelling beside it, because a leading "." or "//" run never changes which
+ * object a path names however many times the two alternate. Leading: a trailing
+ * "." carries Linux's directory requirement the way a trailing slash does, and
+ * no column here spells one.
+ */
+
+/* COL_TTY_DOT_NODE is the alias node with a trailing "." component, and it is
+ * the column that holds chdir to the answer the other entry points give for a
+ * device node used as a directory. The gate that routes a chdir into the
+ * synthetic trees used to spell its own prefix list -- /sys and /dev/bus --
+ * while the alias names sit directly under /dev, so a chdir onto one matched
+ * neither arm and fell through to the host, where the name is a placeholder
+ * file in the sysroot or nothing at all: chdir answered ENOENT where open,
+ * fchdir and getdents answered ENOTDIR, and where the /dev/bus node beside it
+ * has answered ENOTDIR since before this series. The gate asks the USB layer
+ * the ownership question now, so the two spellings agree.
+ *
+ * Thirteen of its cells are the inherited trailing-"." divergence, recorded as
+ * XFAIL: the component fold drops the "." and the node is served where Linux
+ * answers ENOTDIR, exactly as it is for /dev/bus/usb/001/001/. on main. That
+ * divergence is what leaves the four cells below it -- getdents64, chdir,
+ * fchdir and getcwd -- as the ones this column asserts, and chdir is the one
+ * that was wrong: with the gate's literal put back, chdir and the getcwd that
+ * follows it go red and the rest stay green.
+ */
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
  * bus carries whatever devices it has, and the guest's carries the fixture's.
@@ -127,6 +204,39 @@ static char subsys_path[512];
  */
 static char subsys_out_path[512];
 
+/* COL_SUBSYS_OUT_SLASH is subsys-out with a leading "//", and it is the cell
+ * that holds the link-rewrite gate to the fold the entry points behind it do.
+ * That gate reads a literal deeper than the first component, so it has to fold
+ * the whole name; the gates in front of it step over the leading run, so an
+ * unfolded spelling reaches the layer with the link unresolved and each entry
+ * point then answers from whatever it folds for itself.
+ *
+ * What this column holds is that failure in its uniform form, not a split
+ * between entry points. It walks out onto /sys/bus/pci, a bus only the sysroot
+ * has, so an unresolved link leaves nothing for any entry point to find:
+ * measured with the gate fold reverted, //sys/bus/usb/devices/<dev>/subsystem/
+ * ../pci answers ENOENT at every entry point with a sysroot and without one,
+ * and seventeen of its cells go red. fold2-sys cannot hold that: it spells a
+ * directory no synthetic link is walked through, so the gate literal matches it
+ * before and after.
+ *
+ * The split itself is one cell further along and no column spells it. It needs
+ * a name that ends inside the subtree this layer owns, so the entry points that
+ * fold for themselves can still find it: with the same gate fold reverted,
+ * //sys/bus/usb/devices/<dev>/subsystem/../usb is served by stat, lstat,
+ * access, fstatat, open, fstat, fstatfs, chdir, fchdir and getdents while
+ * statfs alone answers ENOENT -- ten entry points in, one out, with a sysroot
+ * and without one, and under the fixture this lane runs and against an attached
+ * board alike, each with the device key its own source presents. The two
+ * spellings are the same defect seen at two depths, and the one that reddens
+ * seventeen cells is the one worth asserting.
+ *
+ * Every cell is subsys-out's, for the reason the fold columns give: a leading
+ * "//" run never changes which object a path names.
+ */
+
+static char subsys_out_slash_path[512];
+
 /* COL_LONG is a >63-byte spelling of a synthetic sysfs *attribute*, not of a
  * backing file: the 63-byte virtual-path stamp a descriptor carries is only
  * written for the names this layer serves, so that is where a truncation would
@@ -137,6 +247,13 @@ static char subsys_out_path[512];
  * recording host and the guest fixture, so it is discovered too.
  */
 static char long_path[512];
+
+/* COL_BYID is discovered for the same reason COL_SUBSYS is: the leaf udev
+ * builds carries the device's own strings, so the recording host's spelling and
+ * the guest fixture's are different names for the same class of object -- a
+ * symlink in /dev/serial/by-id pointing at a ttyACM node.
+ */
+static char byid_path[512];
 
 static const char *col_path(int c)
 {
@@ -171,6 +288,38 @@ static const char *col_path(int c)
         return "/dev/bus/other/../usb/001/001";
     case COL_SYS_FOLD_IN:
         return "/sys/class/../bus/usb/devices";
+    case COL_SYS_FOLD_IN2:
+        return "/sys/devices/../bus/usb/devices";
+    case COL_TTY:
+        return "/dev/ttyACM0";
+    case COL_TTY_BACK:
+        return "/dev/ttyACM7";
+    case COL_TTY_ABSENT:
+        return "/dev/ttyACM31";
+    case COL_BYID:
+        return byid_path;
+    case COL_TTY_FOLD:
+        return "/dev/serial/by-id/../../ttyACM0";
+    case COL_SLASH_DIR:
+        return "//dev/bus/usb/001";
+    case COL_DOT_DIR:
+        return "/dev/./bus/usb/001";
+    case COL_SLASH_NODE:
+        return "//dev/bus/usb/001/001";
+    case COL_DOT_NODE:
+        return "/dev/./bus/usb/001/001";
+    case COL_FOLD2_DIR:
+        return "/.//dev/bus/usb/001";
+    case COL_FOLD2_NODE:
+        return "/.//dev/bus/usb/001/001";
+    case COL_FOLD2_SYS:
+        return "/.//sys/bus/usb/devices";
+    case COL_FOLD3_DIR:
+        return "/././/dev/bus/usb/001";
+    case COL_SUBSYS_OUT_SLASH:
+        return subsys_out_slash_path;
+    case COL_TTY_DOT_NODE:
+        return "/dev/ttyACM0/.";
     default:
         return "/dev/bus";
     }
@@ -205,15 +354,35 @@ static const char *col_path(int c)
  * applied to only one direction cannot pass.
  */
 
-/* COL_SYS_FOLD_IN is the /sys mirror of COL_FOLD_IN, and the one direction that
- * stays unmet. /sys/class/../bus/usb/devices folds to a name this layer owns
- * and serves, and ownership is decided on that folded name -- but the resolve
- * behind it joins the unfolded suffix onto the scratch tree, which carries no
- * `class`, so the lookup fails and the layer answers its own authoritative
- * ENOENT for a directory it does serve. Recorded as XFAIL rather than repaired:
- * it is not this series\' doing, and the vectors header carries the measurement
- * against the merge base and the reason a fold cannot fix this half the way it
- * fixed the /dev one.
+/* COL_SYS_FOLD_IN and COL_SYS_FOLD_IN2 are the /sys mirror of COL_FOLD_IN, and
+ * they are the same spelling through two different intermediate components:
+ * /sys/class is a directory this layer materializes, /sys/devices is one only
+ * the sysroot has. Both fold to a name this layer owns and serves, so ownership
+ * is decided correctly for both -- but the resolve behind it joins the unfolded
+ * suffix onto the scratch tree, so the first walks and the second answers the
+ * layer's own authoritative ENOENT for a directory it does serve. The second
+ * stays an XFAIL; it is not this series' doing, and the vectors header carries
+ * the reason a fold cannot fix this half the way it fixed the /dev one.
+ *
+ * Two columns rather than one because the first was an XFAIL until the alias
+ * layer put a class directory in the tree, and eighteen of its cells then went
+ * green without the resolver changing at all. A pair holds the distinction the
+ * defect actually turns on.
+ */
+
+/* COL_TTY, COL_TTY_BACK, COL_TTY_ABSENT, COL_BYID and COL_TTY_FOLD are the /dev
+ * half of the ownership question for the names this layer plants in a directory
+ * it does not own. COL_TTY is one it serves; COL_TTY_BACK is an alias-shaped
+ * name the backing carries and this layer must not shadow; COL_TTY_ABSENT is
+ * alias-shaped and on neither side; COL_BYID is the symlink spelling of
+ * COL_TTY, which Linux stats as the device and lstats as the link; COL_TTY_FOLD
+ * is COL_TTY reached through a '..' out of /dev/serial/by-id, the spelling that
+ * used to name the placeholder file instead of the node.
+ *
+ * COL_TTY_BACK is the column that holds the fall-through: claiming every
+ * parseable alias name and answering ENOENT for the ones with no device made a
+ * rootfs image's own /dev/ttyUSB0 unreachable and left readdir listing names
+ * that no lookup resolved.
  */
 
 /* Names that must be listed by the union directories, one comma-free name per
@@ -256,6 +425,30 @@ static void discover_long(void)
     closedir(d);
 }
 
+static void discover_byid(void)
+{
+    strcpy(byid_path, "/dev/serial/by-id/@none@");
+    DIR *d = opendir("/dev/serial/by-id");
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        char cand[512], tgt[128];
+        snprintf(cand, sizeof(cand), "/dev/serial/by-id/%s", e->d_name);
+        ssize_t n = readlink(cand, tgt, sizeof(tgt) - 1);
+        if (n <= 0)
+            continue;
+        tgt[n] = '\0';
+        if (strncmp(tgt, "../../tty", 9))
+            continue;
+        strcpy(byid_path, cand);
+        break;
+    }
+    closedir(d);
+}
+
 static void discover_subsys(void)
 {
     strcpy(subsys_path, "/sys/bus/usb/devices/@none@/subsystem");
@@ -278,6 +471,8 @@ static void discover_subsys(void)
     closedir(d);
     snprintf(subsys_out_path, sizeof(subsys_out_path), "%s/../pci",
              subsys_path);
+    snprintf(subsys_out_slash_path, sizeof(subsys_out_slash_path), "/%s",
+             subsys_out_path);
 }
 
 /* cell encodings */
@@ -324,18 +519,29 @@ static void enc_fs(char *out, int rc, const struct statfs *sf)
  * *at() rows: they must reach the same answer through a relative walk that the
  * absolute spelling reaches directly.
  */
-static int parent_fd(const char *path, char *base, size_t basesz)
+static bool parent_name(const char *path,
+                        char *dir,
+                        size_t dirsz,
+                        char *base,
+                        size_t basesz)
 {
     const char *slash = strrchr(path, '/');
     if (!slash || slash == path)
-        return -1;
-    char dir[512];
+        return false;
     size_t n = (size_t) (slash - path);
-    if (n >= sizeof(dir) || strlen(slash + 1) >= basesz)
-        return -1;
+    if (n >= dirsz || strlen(slash + 1) >= basesz)
+        return false;
     memcpy(dir, path, n);
     dir[n] = '\0';
     snprintf(base, basesz, "%s", slash + 1);
+    return true;
+}
+
+static int parent_fd(const char *path, char *base, size_t basesz)
+{
+    char dir[512];
+    if (!parent_name(path, dir, sizeof(dir), base, basesz))
+        return -1;
     return open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 }
 
@@ -552,6 +758,122 @@ static void r_fchdir(const char *p, char *out)
         snprintf(out, CELL_MAX, "stuck");
 }
 
+/* The spelling a correct getcwd reports for a chdir onto @p: "//" runs and "."
+ * components folded away, ".." left alone. Computed rather than tabulated so
+ * the expected cell is one string on the recording host and in the guest.
+ */
+static void fold_spelling(const char *p, char *out, size_t outsz)
+{
+    size_t len = 0;
+    out[len++] = '/';
+    for (const char *q = p; *q;) {
+        while (*q == '/')
+            q++;
+        const char *seg = q;
+        while (*q && *q != '/')
+            q++;
+        size_t seglen = (size_t) (q - seg);
+        if (seglen == 0)
+            break;
+        if (seglen == 1 && seg[0] == '.')
+            continue;
+        if (len > 1 && len + 1 < outsz)
+            out[len++] = '/';
+        if (len + seglen >= outsz)
+            break;
+        memcpy(out + len, seg, seglen);
+        len += seglen;
+    }
+    out[len] = '\0';
+}
+
+/* Where a chdir onto this name leaves the process, by name rather than by
+ * return code. chdir alone cannot see the defect this row exists for: a
+ * descriptor opened through an unfolded spelling of a synthetic directory
+ * carried no guest-path stamp, so getcwd reported the host scratch directory
+ * behind the tree -- a path the guest must never see, and one a relative open
+ * measured against it would then write into. "self" is the folded spelling of
+ * the column, "at:<path>" anything else (a chdir onto a symlink legitimately
+ * lands elsewhere).
+ */
+static void r_getcwd(const char *p, char *out)
+{
+    if (chdir(p) != 0) {
+        enc_rc(out, -1);
+        return;
+    }
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        enc_rc(out, -1);
+        if (chdir("/") != 0)
+            snprintf(out, CELL_MAX, "stuck");
+        return;
+    }
+    char folded[4096];
+    fold_spelling(p, folded, sizeof(folded));
+    if (!strcmp(cwd, folded))
+        snprintf(out, CELL_MAX, "self");
+    else
+        snprintf(out, CELL_MAX, "at:%s", cwd);
+    if (chdir("/") != 0)
+        snprintf(out, CELL_MAX, "stuck");
+}
+
+/* The cwd spellings of the two *at rows above. openat(dirfd, base) and
+ * fstatat(dirfd, base) ask whether a descriptor on the parent keeps a relative
+ * lookup on the intercepts; these ask the same of a cwd, which is decided by a
+ * different predicate and so can part from them. It did: with the alias
+ * directories missing from that predicate, chdir("/dev") followed by
+ * stat("ttyACM0") reached the placeholder file the alias node sits on top of
+ * where /dev/ttyACM0 and openat(dirfd_of_dev, "ttyACM0") reached the character
+ * device, and with no sysroot to plant a placeholder it answered ENOENT.
+ *
+ * fchdir is measured beside chdir rather than assumed to follow it, because the
+ * two publish the cwd through different code: chdir names the directory and
+ * fchdir has only a descriptor, so a repair that reaches one need not reach the
+ * other.
+ *
+ * "skip" is a parent this host cannot chdir onto, matching the *at rows, which
+ * skip a parent they cannot open.
+ */
+static void r_cwd_stat(const char *p, char *out)
+{
+    char dir[512], base[256];
+    if (!parent_name(p, dir, sizeof(dir), base, sizeof(base)) ||
+        chdir(dir) != 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    struct stat st;
+    enc_stat(out, stat(base, &st), &st);
+    if (chdir("/") != 0)
+        snprintf(out, CELL_MAX, "stuck");
+}
+
+static void r_fcwd_stat(const char *p, char *out)
+{
+    char dir[512], base[256];
+    if (!parent_name(p, dir, sizeof(dir), base, sizeof(base))) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    int rc = fchdir(dfd);
+    close(dfd);
+    if (rc != 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    struct stat st;
+    enc_stat(out, stat(base, &st), &st);
+    if (chdir("/") != 0)
+        snprintf(out, CELL_MAX, "stuck");
+}
+
 static void r_epoll_ctl(const char *p, char *out)
 {
     int ep = epoll_create1(0);
@@ -602,6 +924,9 @@ static const struct {
     {"fstat_type", r_fstat_type},
     {"chdir", r_chdir},
     {"fchdir", r_fchdir},
+    {"getcwd", r_getcwd},
+    {"cwd_stat", r_cwd_stat},
+    {"fcwd_stat", r_fcwd_stat},
     {"epoll_ctl", r_epoll_ctl},
     {"union_listing", r_union},
 };
@@ -662,6 +987,7 @@ int main(void)
 {
     discover_subsys();
     discover_long();
+    discover_byid();
 
     if (getenv("MATRIX_RECORD")) {
         record();
@@ -722,9 +1048,19 @@ int main(void)
                 rows[r].fn(col_path(c), cell);
             }
 
+            /* Both directions are printed. A '?' cell that starts matching is
+             * an XPASS and says so: eighteen of them went green when the
+             * scratch tree gained a /sys/class directory, and the silent
+             * "continue" that used to cover it meant the recorded expectation
+             * and the comment explaining it stayed false with nothing in the
+             * lane's output to say the fact had changed.
+             */
             if (xfail) {
                 if (strcmp(cell, want))
                     printf("XFAIL: %s [%s] %s: Linux %s, elfuse %s\n",
+                           rows[r].name, col_name[c], col_path(c), want, cell);
+                else
+                    printf("XPASS: %s [%s] %s: Linux %s, elfuse %s\n",
                            rows[r].name, col_name[c], col_path(c), want, cell);
                 continue;
             }

@@ -1753,6 +1753,19 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         goto fail;
     }
 
+    /* Segments that fit still leave the heap and stack to place, and an image
+     * loading close enough to the reserve has nowhere to put them.
+     * guest_place_image decides that past the point of no return, where the
+     * only refusal left is exit(128); ask it here on the same inputs so the
+     * guest gets ENOEXEC instead.
+     */
+    if (!target_is_rosetta &&
+        !guest_image_placement(elf_info.load_max + elf_load_base, NULL, NULL)) {
+        log_error("execve: %s leaves no room for the guest stack", path);
+        err = -LINUX_ENOEXEC;
+        goto fail;
+    }
+
     /* Pre-load the interpreter before the point of no return. */
     err = exec_preload_interp(g, &elf_info, target_is_rosetta, &interp);
     if (err < 0)
@@ -2077,20 +2090,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     }
     sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base, shim_size);
 
-    /* Reset brk to the first page after loaded executable data. */
-    uint64_t brk_start = PAGE_ALIGN_UP(elf_info.load_max + elf_load_base);
-    if (brk_start < BRK_BASE_DEFAULT)
-        brk_start = BRK_BASE_DEFAULT;
-    g->brk_base = brk_start;
-    g->brk_current = brk_start;
-
-    /* Keep exec stack placement consistent with initial process startup. */
-    uint64_t stack_top = ALIGN_UP(brk_start, BLOCK_2MIB);
-    stack_top += STACK_SIZE;
-    if (stack_top < STACK_TOP_DEFAULT)
-        stack_top = STACK_TOP_DEFAULT;
-    g->stack_top = stack_top;
-    g->stack_base = stack_top - STACK_SIZE;
+    /* Heap and stack, placed the same way the initial load places them. */
+    if (!guest_place_image(g, elf_info.load_max + elf_load_base)) {
+        log_fatal("execve failed after point of no return: no stack space");
+        exit(128);
+    }
 
     const exec_image_t image = {.shim_size = shim_size,
                                 .elf_info = &elf_info,

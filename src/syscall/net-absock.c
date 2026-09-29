@@ -58,7 +58,16 @@ static pthread_mutex_t absock_lock = PTHREAD_MUTEX_INITIALIZER;
 static absock_entry_t absock_table[ABSOCK_MAX_ENTRIES];
 static char absock_dir[128];
 static bool absock_dir_created;
+
+/* Identifies one fork family: the root mints it, children receive it over fork
+ * IPC, and it names the on-disk state the family shares (the absock directory,
+ * the process registry, the lifecycle registry, the pid sequence) as well as
+ * tagging cross-process signals. A host pid cannot serve, because macOS
+ * recycles it: a later root landing on a dead family's pid would adopt that
+ * family's files and answer signals addressed to it.
+ */
 static _Atomic uint64_t absock_namespace_id;
+static _Atomic bool absock_namespace_owner;
 static _Atomic uint32_t absock_autobind_counter;
 
 /* Shortening links this process minted, recorded so exit unlinks exactly its
@@ -86,8 +95,7 @@ static int absock_dir_format(char *out, size_t out_sz, uint64_t namespace_id)
 
 static int absock_ensure_dir_locked(void)
 {
-    uint64_t namespace_id =
-        atomic_load_explicit(&absock_namespace_id, memory_order_relaxed);
+    uint64_t namespace_id = absock_get_namespace_id();
 
     if (absock_dir_created) {
         struct stat st;
@@ -103,11 +111,6 @@ static int absock_ensure_dir_locked(void)
         return create_private_dir(absock_dir);
     }
 
-    if (namespace_id == 0) {
-        namespace_id = (uint64_t) getpid();
-        atomic_store_explicit(&absock_namespace_id, namespace_id,
-                              memory_order_relaxed);
-    }
     absock_dir_format(absock_dir, sizeof(absock_dir), namespace_id);
 
     /* The namespace-id path is guessable; create_private_dir rejects a
@@ -130,21 +133,52 @@ static int absock_ensure_dir_locked(void)
     return 0;
 }
 
+/* The id is the release store that publishes both halves of the family state,
+ * and every reader acquires it. A thread that observes an id therefore observes
+ * the matching ownership: two guest threads reaching the first fork together
+ * must not have one of them see a family it is a member of but not the owner
+ * of, which would skip the owner-only pid-sequence reset and then lose its
+ * sequence file to the other thread's reset.
+ */
+static void absock_mint_namespace_id(void)
+{
+    if (atomic_load_explicit(&absock_namespace_id, memory_order_acquire))
+        return;
+    uint64_t minted = 0;
+    while (minted == 0)
+        arc4random_buf(&minted, sizeof(minted));
+    atomic_store_explicit(&absock_namespace_owner, true, memory_order_relaxed);
+    atomic_store_explicit(&absock_namespace_id, minted, memory_order_release);
+}
+
 uint64_t absock_get_namespace_id(void)
 {
     uint64_t namespace_id =
-        atomic_load_explicit(&absock_namespace_id, memory_order_relaxed);
-    if (namespace_id == 0)
-        return (uint64_t) getpid();
-    return namespace_id;
+        atomic_load_explicit(&absock_namespace_id, memory_order_acquire);
+    if (namespace_id)
+        return namespace_id;
+
+    static pthread_once_t mint_once = PTHREAD_ONCE_INIT;
+    pthread_once(&mint_once, absock_mint_namespace_id);
+    return atomic_load_explicit(&absock_namespace_id, memory_order_acquire);
 }
 
+/* A fork child adopts its parent's family, so it is never the owner. An id of 0
+ * carries no family and leaves this process to mint its own.
+ */
 void absock_set_namespace_id(uint64_t namespace_id)
 {
     if (namespace_id == 0)
-        namespace_id = (uint64_t) getpid();
+        return;
+    atomic_store_explicit(&absock_namespace_owner, false, memory_order_relaxed);
     atomic_store_explicit(&absock_namespace_id, namespace_id,
-                          memory_order_relaxed);
+                          memory_order_release);
+}
+
+bool absock_namespace_is_owner(void)
+{
+    (void) absock_get_namespace_id(); /* mints when this process has no id */
+    return atomic_load_explicit(&absock_namespace_owner, memory_order_relaxed);
 }
 
 void absock_encode_name(const char *dir,

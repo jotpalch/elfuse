@@ -31,6 +31,11 @@ enum log_level {
 #define log_error(...) log_impl(LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
 #define log_fatal(...) log_impl(LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
 
+/* Same, for a site whose severity is decided at runtime rather than written
+ * into the call.
+ */
+#define log_at(level, ...) log_impl((level), __FILE__, __LINE__, __VA_ARGS__)
+
 /* Initialize the logging subsystem. Installs a default pthread-based lock and
  * detects ANSI color support via isatty(STDERR_FILENO). Call once at program
  * startup before any log output.

@@ -11,12 +11,13 @@
  * Syscalls exercised: mmap(222), mremap(216), munmap(215)
  */
 
+#include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <sys/wait.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -397,6 +398,94 @@ static void test_source_range_hole(void)
     munmap(p, 4096);
 }
 
+static void check_grow_occupied_suffix(unsigned char *first,
+                                       unsigned char *neighbor)
+{
+    const size_t page = 4096;
+    memset(first, 0x5A, page);
+    memset(neighbor, 0xA5, page);
+
+    errno = 0;
+    void *q = mremap(first, page, 2 * page, 0);
+    if (q != MAP_FAILED) {
+        FAIL("growth without MAYMOVE succeeded");
+        munmap(q, 2 * page);
+        return;
+    }
+    if ((errno != ENOMEM) || (first[0] != 0x5A) || (first[page - 1] != 0x5A) ||
+        (neighbor[0] != 0xA5) || (neighbor[page - 1] != 0xA5)) {
+        FAIL("failed growth changed mapped pages");
+        munmap(first, page);
+        munmap(neighbor, page);
+        return;
+    }
+
+    q = mremap(first, page, 2 * page, MREMAP_MAYMOVE);
+    if ((q == MAP_FAILED) || (q == first)) {
+        FAIL("growth with MAYMOVE did not relocate");
+        munmap(first, page);
+        munmap(neighbor, page);
+        return;
+    }
+
+    unsigned char *grown = q;
+    bool ok = (neighbor[0] == 0xA5) && (neighbor[page - 1] == 0xA5) &&
+              (grown[0] == 0x5A) && (grown[page - 1] == 0x5A) &&
+              (grown[page] == 0) && (grown[2 * page - 1] == 0);
+    EXPECT_TRUE(ok, "relocation corrupted mapping contents");
+
+    munmap(grown, 2 * page);
+    munmap(neighbor, page);
+}
+
+/* Test 10: an adjacent coalesced mapping blocks in-place growth */
+
+static void test_grow_adjacent_mapping(void)
+{
+    TEST("mremap grow preserves adjacent mapping");
+
+    const size_t page = 4096;
+    unsigned char *base = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((base == MAP_FAILED) || (munmap(base, 3 * page) != 0)) {
+        FAIL("reserve failed");
+        return;
+    }
+
+    unsigned char *first = mmap(base, page, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    unsigned char *neighbor =
+        mmap(base + page, page, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if ((first != base) || (neighbor != base + page)) {
+        FAIL("adjacent mmap failed");
+        if (first == base)
+            munmap(first, page);
+        if (neighbor == base + page)
+            munmap(neighbor, page);
+        return;
+    }
+
+    check_grow_occupied_suffix(first, neighbor);
+}
+
+/* Test 11: a mapped suffix blocks partial-range growth */
+
+static void test_grow_mapped_suffix(void)
+{
+    TEST("mremap grow preserves mapped suffix");
+
+    const size_t page = 4096;
+    unsigned char *base = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        FAIL("mmap failed");
+        return;
+    }
+
+    check_grow_occupied_suffix(base, base + page);
+}
+
 int main(void)
 {
     printf("test-mremap: mremap syscall tests\n");
@@ -410,6 +499,8 @@ int main(void)
     test_invalid_args();
     test_prot_none_mremap();
     test_source_range_hole();
+    test_grow_adjacent_mapping();
+    test_grow_mapped_suffix();
 
     SUMMARY("test-mremap");
     return fails > 0 ? 1 : 0;

@@ -94,6 +94,23 @@ LOGS = ROOT / "build" / "verify-mutants"
 # "function" names the proved function the mutation breaks; it is what the
 # coverage summary at the end counts, not decoration.
 MUTATIONS = [
+    # ---- verify-brk -------------------------------------------------------
+    (
+        "brk",
+        "src/proved/brk.h",
+        "brk_limit_region",
+        "use a straddling start (the limit falls below the current break)",
+        "    return start <= from ? from : start;\n",
+        "    return start;\n",
+    ),
+    (
+        "brk",
+        "src/proved/brk.h",
+        "brk_limit_region",
+        "forget that a region behind the break is not in its way",
+        "    if (start >= limit || end <= from)\n",
+        "    if (start >= limit)\n",
+    ),
     # ---- verify-netlink ---------------------------------------------------
     (
         "netlink",

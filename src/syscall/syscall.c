@@ -1083,7 +1083,7 @@ static int64_t sc_kill(guest_t *g,
         }
         int64_t r = (pid == (int) our_pid) ? 0 : -LINUX_ESRCH;
         if (r == -LINUX_ESRCH) {
-            pid_t hpid = proc_guest_to_host_pid((int64_t) pid);
+            pid_t hpid = proc_resolve_guest_pid((int64_t) pid);
             if (hpid > 0)
                 r = (kill(hpid, 0) == 0) ? 0 : -LINUX_ESRCH;
         }
@@ -1148,7 +1148,7 @@ static int64_t sc_kill(guest_t *g,
         signal_queue(sig);
         return 0;
     }
-    pid_t hpid = proc_guest_to_host_pid((int64_t) pid);
+    pid_t hpid = proc_resolve_guest_pid((int64_t) pid);
     if (hpid > 0)
         return (proc_send_guest_signal(hpid, (int64_t) pid, sig) == 0)
                    ? 0

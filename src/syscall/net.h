@@ -353,6 +353,14 @@ int64_t netlink_getsockname(int guest_fd,
 /* Clean up abstract socket filesystem entry for a fd being closed. */
 void absock_unregister_fd(int guest_fd);
 
-/* Get/set the abstract socket namespace identifier shared across fork IPC. */
+/* Get/set the fork-family identifier shared across fork IPC. The first reader
+ * in a process with no id mints one and becomes the family root.
+ */
 uint64_t absock_get_namespace_id(void);
 void absock_set_namespace_id(uint64_t namespace_id);
+
+/* True in the process that minted the family id, the one that owns the family's
+ * on-disk state. A fork child never owns it. Calling this in a process that has
+ * no family id mints one and returns true, the same as reading the id.
+ */
+bool absock_namespace_is_owner(void);

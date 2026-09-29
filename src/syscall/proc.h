@@ -368,8 +368,13 @@ const char *proc_resolve_sysroot_create_path(const char *path,
  * a signal really did arrive. And the frame the handler returns through carries
  * the live X8, which by then is the TLBI wire value the shim epilogue wrote
  * rather than the syscall number the shim would have restored from its own
- * saved frame. That is harmless while the saved PC is past the SVC, but a
- * rewound PC would make rt_sigreturn re-execute the SVC as the wrong call.
+ * saved frame. A rewound PC makes rt_sigreturn re-execute that SVC as the call
+ * the wire value names. Leaving the PC past the SVC narrows that rather than
+ * closing it, because the instruction after an SVC can be another SVC; that
+ * residue is pre-existing, measured beside exec_drop_frame in core/shim.S, and
+ * out of reach of this cancel. The drop-frame marker is the other value that
+ * displaces the guest's X8, and signal.c keeps that one out of both the frame
+ * and the ERET on its own.
  *
  * Cancel is a no-op unless ELR_EL1 still holds the value the arm wrote, so a
  * later delivery on an unrelated path cannot disturb a guest that has moved on.
@@ -494,6 +499,27 @@ typedef struct {
 int proc_get_namespace_targets(proc_signal_target_t *out,
                                int max,
                                int64_t pgid_filter);
+
+/* Resolve one guest pid to its host pid through the same fork-family registry
+ * proc_get_namespace_targets reads. The child table only holds descendants, so
+ * this is what lets a process signal a relative that is not its own child (its
+ * parent, most commonly).
+ *
+ * Returns the host pid, or -1 when the registry holds no live member with that
+ * guest pid.
+ */
+pid_t proc_namespace_host_pid(int64_t guest_pid);
+
+/* Resolve one guest pid the way pid-directed signalling does: the child table
+ * answers for descendants, the fork-family registry for every other relative.
+ * Every caller that turns a guest pid the guest named into a host pid -- kill,
+ * pidfd_open, pidfd_send_signal -- goes through here, so they all reach the
+ * same set of processes.
+ *
+ * Returns the host pid, or -1 when no live fork-family member carries that
+ * guest pid.
+ */
+pid_t proc_resolve_guest_pid(int64_t guest_pid);
 
 /* Publish the caller's current guest pid/pgid to the fork-family registry. */
 void proc_registry_publish_self(void);

@@ -9,6 +9,14 @@
  * called from syscall_dispatch() in syscall/syscall.c.
  */
 
+/*
+ * Lets select() take descriptors at or above FD_SETSIZE in a caller-sized
+ * bitmap (select(2)); epoll_wait_slice parks on a kqueue fd that can be one.
+ */
+#ifndef _DARWIN_UNLIMITED_SELECT
+#define _DARWIN_UNLIMITED_SELECT
+#endif
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1171,8 +1179,11 @@ int64_t sys_pselect6(guest_t *g,
     if (mask_rc < 0)
         goto pselect_inval;
 
-    /* For indefinite selects, add the wakeup pipe so exit_group/futex/signal
-     * requests can interrupt.
+    /* Add the wakeup pipe so exit_group/futex/signal requests interrupt the
+     * wait at once. A finite wait needs it as much as an indefinite one:
+     * without it a queued signal waits out the current slice. A zero timeout is
+     * a poll, not a wait, and would only drain a wake meant for a parked
+     * sibling.
      */
     bool added_wakeup = false;
 
@@ -1180,7 +1191,8 @@ int64_t sys_pselect6(guest_t *g,
      * FD_ISSET/FD_CLR after the wait must name the same descriptor.
      */
     int wake_fd = wakeup_pipe_read_fd();
-    if (!has_timeout && wake_fd >= 0) {
+    bool zero_timeout = has_timeout && ts.tv_sec == 0 && ts.tv_nsec == 0;
+    if (!zero_timeout && wake_fd >= 0) {
         if (RANGE_CHECK(wake_fd, 0, FD_SETSIZE)) {
             FD_SET(wake_fd, &read_set);
             if (wake_fd > max_host_fd)
@@ -2612,6 +2624,50 @@ static int epoll_mute_usb_wakes(int kq,
     return muted_now;
 }
 
+/* One slice of an epoll_pwait wait: park in select() on the kqueue alongside
+ * the wakeup pipe, then collect without blocking. kevent() cannot watch the
+ * pipe without registering it on the guest's instance, and parked on the kqueue
+ * alone a queued signal would wait out the slice. select() rather than poll(),
+ * which answers POLLNVAL for a kqueue descriptor (see poll_eval_unpollable) and
+ * would never park. A descriptor at or above FD_SETSIZE gets a heap bitmap, and
+ * only a failed allocation keeps the plain kevent() slice.
+ */
+static int epoll_wait_slice(int kq,
+                            struct kevent *kevents,
+                            int cap,
+                            int slice_ms)
+{
+    int wake_fd = wakeup_pipe_read_fd();
+    if (slice_ms > 0 && wake_fd >= 0) {
+        int nfds = (kq > wake_fd ? kq : wake_fd) + 1;
+        fd_set stack_set;
+        fd_set *rset = &stack_set;
+        if (nfds > FD_SETSIZE)
+            rset = calloc(howmany(nfds, NFDBITS), sizeof(int32_t));
+        else
+            FD_ZERO(rset);
+        if (rset) {
+            FD_SET(kq, rset);
+            FD_SET(wake_fd, rset);
+            struct timeval tv = {
+                .tv_sec = slice_ms / 1000,
+                .tv_usec = (slice_ms % 1000) * 1000,
+            };
+            if (select(nfds, rset, NULL, NULL, &tv) > 0 &&
+                FD_ISSET(wake_fd, rset))
+                wakeup_pipe_drain();
+            slice_ms = 0;
+            if (rset != &stack_set)
+                free(rset);
+        }
+    }
+    struct timespec slice_ts = {
+        .tv_sec = slice_ms / 1000,
+        .tv_nsec = (slice_ms % 1000) * 1000000L,
+    };
+    return kevent(kq, NULL, 0, kevents, cap, &slice_ts);
+}
+
 int64_t sys_epoll_pwait(guest_t *g,
                         int epfd,
                         uint64_t events_gva,
@@ -2705,9 +2761,7 @@ epoll_rewait:
         int slice_ms = (hup_ready || signal_pending_interruption(NULL))
                            ? 0
                            : poll_slice_ms(deadline_ms);
-        struct timespec slice_ts = {.tv_sec = slice_ms / 1000,
-                                    .tv_nsec = (slice_ms % 1000) * 1000000L};
-        nready = kevent(epoll_ref.fd, NULL, 0, kevents, cap, &slice_ts);
+        nready = epoll_wait_slice(epoll_ref.fd, kevents, cap, slice_ms);
 
         /* Ready events outrank an interruption; see poll_wait_interrupted.
          *

@@ -418,7 +418,7 @@ int64_t proc_alloc_pid(void)
     if (!process_pid_sequence_path(path, sizeof(path)))
         return -LINUX_EAGAIN;
 
-    if (absock_get_namespace_id() == (uint64_t) getpid() &&
+    if (absock_namespace_is_owner() &&
         !atomic_exchange_explicit(&owner_sequence_reset, true,
                                   memory_order_relaxed))
         unlink(path);
@@ -749,7 +749,7 @@ static int lifecycle_open_locked(char *path, size_t path_size)
     static _Atomic bool owner_reset_done;
     if (!lifecycle_registry_path(path, path_size))
         return -1;
-    if (absock_get_namespace_id() == (uint64_t) getpid() &&
+    if (absock_namespace_is_owner() &&
         !atomic_exchange_explicit(&owner_reset_done, true,
                                   memory_order_relaxed))
         unlink(path);
@@ -1150,18 +1150,21 @@ static void lifecycle_import_children(void)
 static void proc_registry_reset_if_owner(const char *path)
 {
     static _Atomic bool reset_done;
-    if (absock_get_namespace_id() != (uint64_t) getpid())
+    if (!absock_namespace_is_owner())
         return;
     if (atomic_exchange_explicit(&reset_done, true, memory_order_relaxed))
         return;
     unlink(path);
 }
 
-/* One live member of a process group registry. */
+/* One live member of a process group registry. start_us is the host process's
+ * start time: a host pid alone matches whatever process macOS hands it to next.
+ */
 typedef struct {
     pid_t host_pid;
     int64_t guest_pid;
     int64_t pgid;
+    uint64_t start_us;
 } registry_entry_t;
 
 #define REGISTRY_MAX_ENTRIES 4096
@@ -1178,10 +1181,10 @@ static int flock_retry(int fd, int op)
 
 /* Read @fd from its current offset and invoke @cb once per newline-terminated
  * record, passing a NUL-terminated copy. Records must fit in 159 bytes; both
- * the registry ("hostpid guestpid pgid") and signal/control transport records
- * use bounded numeric lines. Overlong records and an unterminated trailing
- * token are dropped -- every writer appends a whole record under an exclusive
- * lock, so a partial line only appears after a crash mid-write.
+ * the registry ("hostpid guestpid pgid startus") and signal/control transport
+ * records use bounded numeric lines. Overlong records and an unterminated
+ * trailing token are dropped -- every writer appends a whole record under an
+ * exclusive lock, so a partial line only appears after a crash mid-write.
  */
 static void for_each_record(int fd, void (*cb)(char *rec, void *ctx), void *ctx)
 {
@@ -1217,19 +1220,37 @@ typedef struct {
     bool truncated;
 } registry_parse_ctx_t;
 
-/* Upsert one "hostpid guestpid pgid" record, keeping the latest guest_pid/pgid
- * per LIVE host pid. Dead, malformed, and out-of-range records are dropped.
+/* Start time of host process @pid in microseconds.
+ *
+ * Returns false once @pid has exited.
+ */
+static bool host_start_us(pid_t pid, uint64_t *out)
+{
+    struct proc_bsdinfo info;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) !=
+        (int) sizeof(info))
+        return false;
+    *out = info.pbi_start_tvsec * 1000000ULL + info.pbi_start_tvusec;
+    return true;
+}
+
+/* Upsert one "hostpid guestpid pgid startus" record, keeping the latest
+ * guest_pid/pgid per LIVE host pid. A record whose start time differs from the
+ * running process's names an exited member whose host pid was reused, so it is
+ * dropped along with dead, malformed, and out-of-range records.
  */
 static void registry_parse_cb(char *rec, void *vctx)
 {
     registry_parse_ctx_t *c = vctx;
     long hp;
     long long gp, pg;
-    if (sscanf(rec, "%ld %lld %lld", &hp, &gp, &pg) != 3)
+    unsigned long long st;
+    if (sscanf(rec, "%ld %lld %lld %llu", &hp, &gp, &pg, &st) != 4)
         return;
     if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
         return;
-    if (kill((pid_t) hp, 0) != 0)
+    uint64_t live_us;
+    if (!host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
         return;
     int idx = -1;
     for (int k = 0; k < c->n; k++)
@@ -1244,6 +1265,7 @@ static void registry_parse_cb(char *rec, void *vctx)
         }
         idx = c->n++;
         c->entries[idx].host_pid = (pid_t) hp;
+        c->entries[idx].start_us = live_us;
     }
     c->entries[idx].guest_pid = (int64_t) gp;
     c->entries[idx].pgid = (int64_t) pg;
@@ -1255,24 +1277,26 @@ typedef struct {
     bool found;
 } registry_find_ctx_t;
 
-/* Locate @target's guest pid without registry_parse_cb's per-record kill(2)
- * liveness probe: that check exists to build a filtered live- membership list
- * for group-signal delivery, but a host_pid ->guest_pid lookup is only ever
- * done for a pid the caller just observed to be alive (e.g. it holds a
- * conflicting file lock right now), so it is redundant here.
- * proc_host_to_guest_pid still verifies the match via proc_pidpath to guard
- * against the pid having been recycled.
+/* Locate @target's guest pid. The caller looks up a pid it just observed to be
+ * alive (e.g. it holds a conflicting file lock right now), but liveness alone
+ * does not say the record describes that process: an exited member's record
+ * outlives it, and macOS reuses host pids. The start time settles it, as it
+ * does in registry_parse_cb.
  */
 static void registry_find_by_host_cb(char *rec, void *vctx)
 {
     registry_find_ctx_t *c = vctx;
     long hp;
     long long gp, pg;
-    if (sscanf(rec, "%ld %lld %lld", &hp, &gp, &pg) != 3)
+    unsigned long long st;
+    if (sscanf(rec, "%ld %lld %lld %llu", &hp, &gp, &pg, &st) != 4)
         return;
     if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
         return;
     if ((pid_t) hp != c->target)
+        return;
+    uint64_t live_us;
+    if (!host_start_us((pid_t) hp, &live_us) || live_us != (uint64_t) st)
         return;
     c->guest_pid = (int64_t) gp;
     c->found = true;
@@ -1328,7 +1352,8 @@ static void proc_registry_publish(pid_t host_pid,
             idx = i;
             break;
         }
-    if (idx < 0) {
+    uint64_t start_us;
+    if (idx < 0 && host_start_us(host_pid, &start_us)) {
         if (n == REGISTRY_MAX_ENTRIES)
 
             /* No slot for a new live member: group signals (kill(-1),
@@ -1342,6 +1367,7 @@ static void proc_registry_publish(pid_t host_pid,
         else {
             idx = n++;
             entries[idx].host_pid = host_pid;
+            entries[idx].start_us = start_us;
         }
     }
     if (idx >= 0) {
@@ -1351,11 +1377,12 @@ static void proc_registry_publish(pid_t host_pid,
 
     if (ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) == 0) {
         for (int i = 0; i < n; i++) {
-            char lineb[64];
-            int len = snprintf(lineb, sizeof(lineb), "%ld %lld %lld\n",
+            char lineb[96];
+            int len = snprintf(lineb, sizeof(lineb), "%ld %lld %lld %llu\n",
                                (long) entries[i].host_pid,
                                (long long) entries[i].guest_pid,
-                               (long long) entries[i].pgid);
+                               (long long) entries[i].pgid,
+                               (unsigned long long) entries[i].start_us);
             if (len > 0 && (size_t) len < sizeof(lineb) &&
                 write_all(fd, lineb, (size_t) len) < 0)
                 break;
@@ -1708,9 +1735,14 @@ int proc_set_child_pgid(int64_t guest_pid_val, int64_t pgid)
     return ret;
 }
 
-int proc_get_namespace_targets(proc_signal_target_t *out,
-                               int max,
-                               int64_t pgid_filter)
+/* Shared body for the group/broadcast collector and the single-pid lookup.
+ * guest_filter of 0 accepts every member; a positive value stops at the one
+ * member carrying that guest pid.
+ */
+static int registry_collect(proc_signal_target_t *out,
+                            int max,
+                            int64_t pgid_filter,
+                            int64_t guest_filter)
 {
     /* No republish here: every group change already publishes (fork, setpgid,
      * setsid), and this reader excludes its own entry anyway.
@@ -1749,6 +1781,8 @@ int proc_get_namespace_targets(proc_signal_target_t *out,
             continue;
         if (pgid_filter != PROC_PGID_ANY && entries[i].pgid != pgid_filter)
             continue;
+        if (guest_filter > 0 && entries[i].guest_pid != guest_filter)
+            continue;
         char ppath[PROC_PIDPATHINFO_MAXSIZE];
         int plen = proc_pidpath(entries[i].host_pid, ppath, sizeof(ppath));
         if (plen != our_len || memcmp(ppath, our_path, (size_t) our_len))
@@ -1758,6 +1792,32 @@ int proc_get_namespace_targets(proc_signal_target_t *out,
         count++;
     }
     return count;
+}
+
+int proc_get_namespace_targets(proc_signal_target_t *out,
+                               int max,
+                               int64_t pgid_filter)
+{
+    return registry_collect(out, max, pgid_filter, 0);
+}
+
+pid_t proc_namespace_host_pid(int64_t guest_pid)
+{
+    /* registry_collect reads a guest_filter of 0 as "every member", so a caller
+     * passing 0 or a negative pid would get an arbitrary one.
+     */
+    if (guest_pid <= 0)
+        return -1;
+    proc_signal_target_t target;
+    return registry_collect(&target, 1, PROC_PGID_ANY, guest_pid) > 0
+               ? target.host_pid
+               : -1;
+}
+
+pid_t proc_resolve_guest_pid(int64_t guest_pid)
+{
+    pid_t host_pid = proc_guest_to_host_pid(guest_pid);
+    return host_pid > 0 ? host_pid : proc_namespace_host_pid(guest_pid);
 }
 
 int64_t proc_host_to_guest_pid(pid_t host_pid)
@@ -1915,9 +1975,10 @@ int64_t sys_ptrace(guest_t *g,
          * whatever the tracer writes back, since the shim restores its own
          * frame over it. The HVC #5 epilogue consumes the flag and then either
          * stops right there, on the tails whose live registers are already the
-         * final EL0 set, or asks the shim through X7 to restore the frame and
-         * come back at HVC #13. The canceled-exit handler consumes it once it
-         * has established the vCPU is at EL0.
+         * final EL0 set bar the X8 the tail reloads from the frame, or asks the
+         * shim through X7 to restore the frame and come back at HVC #13. The
+         * canceled-exit handler consumes it once it has established the vCPU is
+         * at EL0.
          *
          * Attention goes up before the kick, the same order
          * shim_globals_raise_attention uses and for the same reason: a fast
@@ -3116,11 +3177,11 @@ static void unlink_own_transport(void)
     /* The namespace owner cleans the registry, but only once no other live
      * member still needs it: if the owner exits while fork children survive,
      * deleting the file would blind their kill(-1)/kill(0)/kill(-pgid). A rare
-     * orphaned family that outlives its owner leaves the file for the next
-     * same-pid run's reset (proc_registry_reset_if_owner) or the OS temp-dir
-     * purge.
+     * orphaned family that outlives its owner leaves its file for the OS
+     * temp-dir purge; no later run can claim it, since the name carries a
+     * minted id rather than a recyclable pid.
      */
-    if (absock_get_namespace_id() != (uint64_t) getpid())
+    if (!absock_namespace_is_owner())
         return;
     if (!process_registry_path(path, sizeof(path)))
         return;
@@ -3672,6 +3733,13 @@ static bool vcpu_handle_brk(guest_t *g,
          * until tracer CONT's.
          */
         int cont_sig = thread_ptrace_stop(current_thread, 5);
+
+        /* handle_brk reloads X8 from its frame, which still holds the value the
+         * BRK was taken with. Publish the live one, so an X8 the tracer wrote
+         * is what the guest resumes with, or enters a handler with when a
+         * signal is injected below.
+         */
+        signal_publish_live_x8(vcpu, g);
         if (cont_sig > 0) {
             signal_queue(cont_sig);
             int sr = signal_deliver(vcpu, g, exit_code);
@@ -3801,23 +3869,32 @@ static bool vcpu_handle_el0_fault(guest_t *g,
      *
      * Only EC 0x20 (instruction abort from a lower EL) and EC 0x24 (data abort
      * from a lower EL) are intentionally routed to the SIGSEGV path that
-     * follows. Every other forwarded EC lands here as SIGILL: 0x00 (undefined
-     * instruction), 0x18 (system instruction trap), 0x32/0x33 (software step),
-     * 0x3C (BRK), and any unrecognized class. If a future change adds a new
-     * lower-EL abort class (e.g. 0x21 / 0x25 for higher exception levels) that
-     * should map to SIGSEGV, the test below needs explicit widening; do NOT
-     * relax the check casually.
+     * follows. Everything else the shim forwards on HVC #11 lands here as
+     * SIGILL, and that is more than undefined instructions: src/core/shim.S
+     * dispatches 0x18 to HVC #12 and 0x3C to HVC #10 before the catch-all, so
+     * what arrives is 0x00, 0x32/0x33 (software step), and any class the shim
+     * does not recognize, which includes 0x07 (SIMD/FP access), 0x0E (illegal
+     * execution state) and the alignment classes. The message below says
+     * "non-abort" rather than naming one of them, and carries the EC.
+     *
+     * If a future change adds a new lower-EL abort class (e.g. 0x21 / 0x25 for
+     * higher exception levels) that should map to SIGSEGV, the test below needs
+     * explicit widening; do NOT relax the check casually.
      */
     if (fault_ec != 0x20 && fault_ec != 0x24) {
-        if (verbose)
-            log_debug(
-                "%s: EL0 undefined insn at "
-                "PC=0x%llx (ESR=0x%llx EC=0x%x) "
-                "-> SIGILL/ILL_ILLOPC",
-                prefix, (unsigned long long) elr_addr, (unsigned long long) esr,
-                fault_ec);
         signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
         int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGILL, exit_code);
+
+        /* Warn on a terminating return, debug otherwise, on the same terms as
+         * the SIGSEGV exit below, so neither fault class is the one only
+         * --verbose can see.
+         */
+        log_at(sig_ret < 0 ? LOG_WARN : LOG_DEBUG,
+               "%s: EL0 non-abort exception at "
+               "PC=0x%llx (ESR=0x%llx EC=0x%x) "
+               "-> SIGILL/ILL_ILLOPC",
+               prefix, (unsigned long long) elr_addr, (unsigned long long) esr,
+               fault_ec);
 
         /* HVC #11 consumes X8 as the post-fault TLBI opcode. signal_deliver()
          * may leave it unchanged when no handler is materialized, or set the
@@ -3962,20 +4039,21 @@ static bool vcpu_handle_el0_fault(guest_t *g,
      * Linux.
      */
     int si_code = (fsc_type == 0x03) ? LINUX_SEGV_ACCERR : LINUX_SEGV_MAPERR;
-    if (verbose) {
-        const char *fault_type = (fault_ec == 0x20) ? "inst" : "data";
-        const char *code_name =
-            (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR";
-        log_debug(
-            "%s: EL0 %s fault at 0x%llx "
-            "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
-            "-> SIGSEGV/%s",
-            prefix, fault_type, (unsigned long long) far_addr,
-            (unsigned long long) elr_addr, (unsigned long long) esr, fsc,
-            code_name);
-    }
     signal_set_fault_info(si_code, far_addr, esr);
     int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGSEGV, exit_code);
+
+    /* A negative return is terminating: either the default disposition kills or
+     * the handler frame could not be installed. Keep its address and PC visible
+     * without the full syscall trace from --verbose.
+     */
+    log_at(sig_ret < 0 ? LOG_WARN : LOG_DEBUG,
+           "%s: EL0 %s fault at 0x%llx "
+           "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
+           "-> SIGSEGV/%s",
+           prefix, (fault_ec == 0x20) ? "inst" : "data",
+           (unsigned long long) far_addr, (unsigned long long) elr_addr,
+           (unsigned long long) esr, fsc,
+           (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR");
 
     /* Clear X8 for the same reason as the SIGILL exit above. */
     hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
@@ -4029,6 +4107,13 @@ static bool ptrace_take_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
     if (cont_sig > 0)
         signal_queue(cont_sig);
 
+    /* The stop above returns with whatever registers the tracer wrote, PC among
+     * them. An X8 parked by an rt_sigreturn earlier in this same epilogue is
+     * still the X8 the guest is owed at the PC it now resumes from, so the
+     * record follows it before the delivery below reads it.
+     */
+    signal_repark_sigreturn_x8(vcpu);
+
     /* One delivery covers both the injected resume signal and anything that
      * arrived while the tracee was stopped, so neither caller repeats it.
      */
@@ -4074,7 +4159,8 @@ static bool syscall_return_epilogue(guest_t *g,
      * host-only. The vector entry clobbers no GPR below X9, so the live set at
      * HVC #5 is still the guest's, and only that restore puts a host write to
      * X7 back. Two tails skip it: X8 == 2, where the host has rebuilt EL0 state
-     * and the live registers are already final, and an execve re-entry, which
+     * and the live registers are already final bar X8, which carries the marker
+     * and is reloaded from the frame by the tail, and an execve re-entry, which
      * goes through the MMU-off _start with no tail at all.
      *
      * Only the exec-happened return has to ask the vCPU which of those it is.
@@ -4099,7 +4185,11 @@ static bool syscall_return_epilogue(guest_t *g,
         ptrace_consume_owed_stop(g)) {
         if (regs_final) {
             /* Live registers are already the architectural EL0 set, which is
-             * what the detour exists to produce. Stop here instead.
+             * what the detour exists to produce. Stop here instead. One
+             * register is not the guest's: X8 still holds the drop-frame
+             * marker, which the tail reloads from the frame after this stop, so
+             * PTRACE_GETREGSET here reports 2 where the guest's X8 belongs.
+             * Pre-existing and unchanged; docs/internals.md measures it.
              */
             running = ptrace_take_stop(g, vcpu, exit_code);
             stop_taken = true;
@@ -4675,8 +4765,8 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
          * so it is the only thread that can survive one. Running it at the top
          * of the loop puts the rebuilt EL0 state in place before the vCPU is
          * resumed, whether this thread was preempted in guest code or is
-         * returning from its own syscall (sys_execve sets the X8=2 frame-drop
-         * marker either way).
+         * returning from its own syscall (sys_execve writes no frame-drop
+         * marker either way: its MMU-off _start re-entry never pops a frame).
          */
         if (thread_current_is_leader() && thread_leader_work_pending())
             exec_run_handoff(vcpu, g, verbose);
@@ -4707,6 +4797,12 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         if (is_main)
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 1,
                                   memory_order_relaxed);
+
+        /* The guest owns X8 again from here, so the X8 an rt_sigreturn parked
+         * for a delivery in its own epilogue must not survive into the next
+         * exception. See signal_forget_sigreturn_x8 in syscall/signal.h.
+         */
+        signal_forget_sigreturn_x8();
 
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 

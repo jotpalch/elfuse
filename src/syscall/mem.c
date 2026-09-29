@@ -24,6 +24,7 @@
 #include "utils.h"
 
 #include "proved/align.h"
+#include "proved/brk.h"
 
 #include "runtime/thread.h"
 #include "syscall/linux-wire.h"
@@ -2539,20 +2540,104 @@ int mmap_exec_drop_overlays(guest_t *g)
 
 /* Memory syscalls (tightly coupled to guest.h). */
 
-static bool heap_tail_can_extend(const guest_region_t *tail,
-                                 const guest_region_t *heap,
-                                 uint64_t old_brk)
+/* Is r an ordinary piece of this process's heap, safe for a growth to widen?
+ *
+ * Everything a growth would otherwise adopt by widening r is checked here, and
+ * prot above all: the pages a growth exposes are RW in the page tables, so a
+ * record claiming anything else makes the tracker disagree with them. A guest
+ * that seals the top of its heap with mprotect(PROT_READ | PROT_EXEC) and then
+ * grows the break used to have the new pages absorbed into that record, after
+ * which the next mprotect over them took the same-prot fast path and did no PTE
+ * work at all. Measured: the sealed range stayed writable, and the guest was
+ * never told.
+ *
+ * The field list is the one regions_mergeable_layout (guest.c) compares to
+ * decide two pieces are interchangeable, asked of one piece against a fixed
+ * shape. Adding a field there that affects interchangeability means adding it
+ * here too, and missing it is silent.
+ *
+ * Not r->offset: a piece a munmap split off carries the split's offset, which
+ * for an anonymous mapping names nothing (regions_mergeable_layout ignores it
+ * for exactly that reason). Requiring zero there sent every grow after a hole
+ * down the add path instead, which the merge usually absorbs, but not on a full
+ * table, where the add fails and the tracker goes stale for good.
+ */
+static bool heap_piece_is_plain(const guest_region_t *r)
 {
     const int heap_flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
 
-    return tail->start == heap->end && tail->end == old_brk &&
-           tail->end > tail->start && tail->gpa_base == tail->start &&
-           tail->vma_id == heap->vma_id &&
-           tail->prot == (LINUX_PROT_READ | LINUX_PROT_WRITE) &&
-           tail->flags == heap_flags && tail->offset == 0 &&
-           tail->backing_fd < 0 && !tail->shared && !tail->noreserve &&
-           !tail->backing_ro && !tail->inherited_at_fork &&
-           !region_has_live_overlay(tail) && !strcmp(tail->name, "[heap]");
+    return r->end > r->start && r->gpa_base == r->start &&
+           r->prot == (LINUX_PROT_READ | LINUX_PROT_WRITE) &&
+           r->flags == heap_flags && r->backing_fd < 0 && !r->shared &&
+           !r->noreserve && !r->backing_ro && !r->inherited_at_fork &&
+           !region_has_live_overlay(r) && !strcmp(r->name, "[heap]");
+}
+
+
+/* How far the break may grow from its current position.
+ *
+ * The first tracked mapping above the break is where Linux stops a grow. An
+ * unbounded grow can zero the stack or a mapping in the gap above the heap.
+ *
+ * The answer starts at g->stack_base and only comes down from there. That is
+ * not a backstop under the table but the operative bound at the stack: it is
+ * the same address the "[stack-guard]" record starts at, so the scan below
+ * stops before ever reading that record, and the stack stays bounded whether or
+ * not the record is there to say so.
+ *
+ * Below the stack the table is the only account of what is in the way, and a
+ * full one loses entries: a munmap split it had no room to record leaves its
+ * tail mapped but untracked. The head record that would have stopped a grow
+ * short of that tail is itself removable, so once regions_tracker_stale is set
+ * the table cannot answer the question and the grow is refused outright.
+ * Reaching it takes all 4096 entries, and a fork child inherits the doubt with
+ * the table. (fork-state.c also sets the flag when it receives fewer records
+ * than the header announced, but the sender is bounded by the same 4096, so
+ * within one build that guard describes a peer that cannot exist.) The flag is
+ * cleared when the table it doubts is discarded (guest_region_clear), so the
+ * refusal does not outlive an execve.
+ */
+static uint64_t brk_grow_limit(const guest_t *g, uint64_t from, int *adjoining)
+{
+    *adjoining = -1;
+
+    /* A table that has lost entries cannot say what is in the way, so nothing
+     * it reports below can be trusted to bound anything.
+     */
+    if (g->regions_tracker_stale)
+        return from;
+
+    uint64_t limit = g->stack_base > from ? g->stack_base : from;
+
+    /* guest_region_first_end_above is the binary search that fits: it searches
+     * ends, not starts, so the record it lands on is the first that can be in
+     * the way, straddler included. Everything below it ends at or below the
+     * break and could only return the limit unchanged. (The search that does
+     * not fit is region_lower_bound_start, which searches starts and would step
+     * over a record starting below the break and ending above it.)
+     *
+     * Its contract, stated at its declaration, is that regions[] is
+     * start-sorted and non-overlapping so ends are monotonic. Four callers in
+     * guest.c and the mmap gap finder in this file already rely on that; a heap
+     * hole followed by a grow used to violate it, which is fixed here, and it
+     * is the array's documented invariant either way.
+     *
+     * One record answers the whole question. If it starts at or below the break
+     * the limit collapses there; otherwise the limit is its start, and starts
+     * are sorted so nothing above can lower it further. The record the growth
+     * extends is the one ending exactly at the break, which by monotonicity can
+     * only be the one below.
+     */
+    int i = guest_region_first_end_above(g, from);
+
+    if (i > 0 && g->regions[i - 1].end == from &&
+        heap_piece_is_plain(&g->regions[i - 1]))
+        *adjoining = i - 1;
+
+    if (i < g->nregions)
+        limit = brk_limit_region(from, limit, g->regions[i].start,
+                                 g->regions[i].end);
+    return limit;
 }
 
 int64_t sys_brk(guest_t *g, uint64_t addr)
@@ -2573,6 +2658,32 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
     /* Convert IPA back to offset for internal tracking */
     uint64_t new_off = addr - g->ipa_base;
     if (new_off >= g->guest_size) {
+        return (int64_t) ipa_brk;
+    }
+
+    /* Linux refuses a break that would run into the next mapping (do_brk_flags,
+     * via find_vma_intersection), leaving a page between the two. Nothing here
+     * faults on the way to tell the grow to stop: the heap is premapped RW to
+     * MMAP_RX_BASE and the grow re-maps what it crosses, so an unbounded one
+     * extends page tables over whatever sits above the heap and memsets it to
+     * zero. Report the unchanged break, which glibc and musl read as "no more
+     * heap" before falling back to mmap.
+     *
+     * The comparison is >=, so the highest break granted is one byte below the
+     * neighbor rather than the one page below that Linux leaves, and the
+     * further 1 MiB stack_guard_gap Linux puts in front of a VM_GROWSDOWN stack
+     * is not modeled at all, because this stack does not grow: its extent is
+     * fixed at bootstrap and published as a region. Neither gap is load bearing
+     * here. The page tables a grow extends reach PAGE_ALIGN_UP(new_off) and the
+     * neighbor starts on a page boundary, so a break that stops one byte short
+     * still leaves the neighbor's first page untouched (measured on a PROT_READ
+     * neighbor: byte-intact, and still faulting on write). brk_grow_limit also
+     * hands back the record a growth would extend, since its search lands one
+     * slot above that record.
+     */
+    int adjoining = -1;
+    if (new_off > old_brk &&
+        new_off >= brk_grow_limit(g, old_brk, &adjoining)) {
         return (int64_t) ipa_brk;
     }
 
@@ -2622,52 +2733,44 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
          */
         guest_region_remove_reserved(g, new_off, old_brk, shrink_remove_fd);
     } else if (new_off > g->brk_base) {
-        bool found = false;
-        for (int i = 0; i < g->nregions; i++) {
-            if (g->regions[i].start == g->brk_base &&
-                !strcmp(g->regions[i].name, "[heap]")) {
-                guest_region_t *heap = &g->regions[i];
-                uint64_t old_heap_end = heap->end;
-                if (new_off > old_heap_end && heap->inherited_at_fork) {
-                    /* Keep the fork-snapshot portion separate from pages
-                     * materialized by post-fork brk growth. On later growths,
-                     * extend the existing child-private tail rather than adding
-                     * an overlapping range from the old boundary.
-                     */
-                    guest_region_t *right =
-                        i + 1 < g->nregions ? &g->regions[i + 1] : NULL;
-                    guest_region_t *tail =
-                        right && heap_tail_can_extend(right, heap, old_brk)
-                            ? right
-                            : NULL;
-                    if (tail) {
-                        if (new_off > tail->end)
-                            tail->end = new_off;
-                    } else if (new_off > old_brk &&
-                               guest_region_add_ex_owned(
-                                   g, old_brk, new_off,
-                                   LINUX_PROT_READ | LINUX_PROT_WRITE,
-                                   LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0,
-                                   "[heap]", -1, false, heap->vma_id) < 0) {
-                        /* Widening the inherited prefix would either overlap an
-                         * incompatible child-private tail or mislabel new pages
-                         * as inherited. Keep the original boundary; brk memory
-                         * already grew successfully, so only the semantic
-                         * tracker becomes stale.
-                         */
-                        g->regions_tracker_stale = true;
-                    }
-                } else {
-                    heap->end = new_off;
-                }
-                found = true;
-                break;
+        /* The growth adjoins the piece that ends at the old break, which is the
+         * piece at brk_base only while the heap is in one piece. A hole splits
+         * it, and widening the piece at brk_base then writes an end straight
+         * over the pieces above it: /proc/self/maps published the overlap, a
+         * later shrink could not trim what it could no longer find in order,
+         * and brk_grow_limit read the survivor as a mapping straddling the
+         * break and refused every further grow (measured: 48 hole, grow and
+         * shrink shapes wedged the heap for the life of the process).
+         *
+         * brk_grow_limit already found that piece while bounding the growth, so
+         * there is nothing to search for here. What is looked up is the lineage
+         * of the record at brk_base, and only that: a fork child's inherited
+         * prefix is not a plain piece, so a growth off it lands in a record of
+         * its own, which has to carry the prefix's vma_id for
+         * find_mremap_source to keep reading the two as one logical VMA.
+         */
+        if (adjoining >= 0) {
+            g->regions[adjoining].end = new_off;
+        } else if (new_off > old_brk) {
+            /* brk_base is the heap record's own start, so the tracker's finder
+             * answers this without a scan, and only the path that uses the
+             * lineage pays for it. A vma_id of 0 asks for a fresh one, which is
+             * what a heap with no record left wants.
+             */
+            const guest_region_t *base = guest_region_find(g, g->brk_base);
+            uint64_t heap_vma =
+                (base && !strcmp(base->name, "[heap]")) ? base->vma_id : 0;
+
+            if (guest_region_add_ex_owned(
+                    g, old_brk, new_off, LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[heap]", -1,
+                    false, heap_vma) < 0) {
+                /* A full table. The break already moved, so only the tracker is
+                 * behind: an mprotect over a heap the table does not describe
+                 * would find vacuously uniform prot and skip the PTE work.
+                 */
+                g->regions_tracker_stale = true;
             }
-        }
-        if (!found) {
-            guest_region_add(
-                g, g->brk_base, new_off, LINUX_PROT_READ | LINUX_PROT_WRITE,
-                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[heap]");
         }
     } else {
         /* brk shrank back to base; remove heap region */
@@ -3897,19 +4000,8 @@ int64_t sys_mremap(guest_t *g,
 
         /* Check if the space after the old region is free (overflow-safe) */
         if (grow_off <= g->guest_size && grow_len <= g->guest_size - grow_off) {
-            bool can_grow = true;
-            for (int i = 0; i < g->nregions; i++) {
-                if (g->regions[i].start >= grow_off + grow_len)
-                    break;
-                if (g->regions[i].end > grow_off &&
-                    g->regions[i].start < grow_off + grow_len) {
-                    /* Skip the region being extended */
-                    if (g->regions[i].start == old_off)
-                        continue;
-                    can_grow = false;
-                    break;
-                }
-            }
+            bool can_grow =
+                !region_range_overlaps(g, grow_off, grow_off + grow_len);
 
             if (can_grow) {
                 remove_range_t removed = {old_off, old_off + old_size};

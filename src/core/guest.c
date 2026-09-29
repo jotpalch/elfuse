@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "core/guest.h"
+#include "proved/align.h"
 #include "proved/gva.h"
 #include "core/startup-trace.h"
 #include "debug/log.h"
@@ -212,18 +213,58 @@ static void guest_region_clip_overlay(guest_region_t *r)
     r->overlay_end = overlay_end;
 }
 
-/* Compute infra reserve placement from guest_size and store derived fields in
- * @g. Called from guest_init and guest_init_from_shm.
- *
- * Layout: a 16MiB region anchored at [interp_base - INFRA_RESERVE, interp_base)
- * sits in the dead zone between mmap_limit and interp_base. PT pool, shim, and
- * shim data fall at fixed offsets within the reserve (see guest.h).
- *
- * Returns 0 on success, -1 if the layout cannot be derived (interp_base too
- * small to fit the reserve). Today guest_init enforces a 64GiB minimum so the
- * underflow path is unreachable, but the explicit check guards future
- * configurations and any IPC restore that bypasses size selection.
+/* Where the heap and stack would land, deciding nothing. Held apart from the
+ * publish below so execve can ask the question before its point of no return,
+ * where the answer is still a recoverable ENOEXEC rather than exit(128).
  */
+bool guest_image_placement(uint64_t load_max,
+                           uint64_t *brk_base_out,
+                           uint64_t *stack_top_out)
+{
+    uint64_t brk_base = PAGE_ALIGN_UP(load_max);
+    if (brk_base < BRK_BASE_DEFAULT)
+        brk_base = BRK_BASE_DEFAULT;
+
+    /* BRK_MIN_WINDOW is what keeps the two from meeting: rounded up alone, an
+     * image whose load_max is already 2 MiB-aligned puts the stack exactly on
+     * the break and leaves no heap at all. MMAP_RX_BASE, not the infra reserve:
+     * the mmap RX region starts there and grows to mmap_limit, so it is the
+     * stack's real neighbor and always the tighter bound. elf_place_segment
+     * refuses only a segment that overlaps the infra reserve, so an image
+     * linked near 250 MiB reaches here with its segments accepted and nowhere
+     * to put a stack.
+     */
+    uint64_t above_brk;
+    if (!align_up_ok(brk_base, BLOCK_2MIB, &above_brk) ||
+        !window_fits(above_brk, BRK_MIN_WINDOW + STACK_SIZE, MMAP_RX_BASE))
+        return false;
+
+    uint64_t stack_top = above_brk + BRK_MIN_WINDOW + STACK_SIZE;
+    if (stack_top < STACK_TOP_DEFAULT)
+        stack_top = STACK_TOP_DEFAULT;
+
+    if (brk_base_out)
+        *brk_base_out = brk_base;
+    if (stack_top_out)
+        *stack_top_out = stack_top;
+    return true;
+}
+
+/* Place the heap and stack below the mmap RX region. */
+bool guest_place_image(guest_t *g, uint64_t load_max)
+{
+    uint64_t brk_base, stack_top;
+    if (!guest_image_placement(load_max, &brk_base, &stack_top))
+        return false;
+
+    g->brk_base = brk_base;
+    g->brk_current = brk_base;
+    g->stack_top = stack_top;
+    g->stack_base = stack_top - STACK_SIZE;
+    return true;
+}
+
+/* Compute infrastructure placement from guest_size. */
 static bool compute_infra_layout(guest_t *g)
 {
     if (g->interp_base < INFRA_RESERVE) {
@@ -2420,9 +2461,9 @@ int guest_region_remove_reserved(guest_t *g,
                  * the simple "trim end" treatment of *r. The tail stays mapped
                  * in page tables but is now untracked, so a later mprotect over
                  * that range would otherwise see vacuously uniform prot in the
-                 * tracker and skip PTE work. Mark the tracker permanently stale
-                 * to disarm the mprotect fast path for the lifetime of the
-                 * process.
+                 * tracker and skip PTE work. Mark the tracker stale to disarm
+                 * the mprotect fast path; guest.h's declaration of the flag
+                 * carries what that costs and how long it lasts.
                  */
                 log_error(
                     "guest: region table full, "
@@ -2589,9 +2630,10 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
             if (g->nregions >= GUEST_MAX_REGIONS) {
                 /* The region keeps its old prot in the tracker, but PTEs for
                  * [start, r->end) have already been updated. Mark the tracker
-                 * permanently stale so the mprotect fast path falls back to
-                 * unconditional PTE work and cannot be fooled by a tracker that
-                 * lags actual PTE state.
+                 * stale so the mprotect fast path falls back to unconditional
+                 * PTE work and cannot be fooled by a tracker that lags actual
+                 * PTE state. It stays set for the life of this image, not the
+                 * process; see the munmap-split site above.
                  */
                 log_error(
                     "guest: region table full, "
@@ -2703,6 +2745,12 @@ static void guest_region_clear(guest_t *g)
     }
     g->nregions = 0;
     g->npreannounced = 0;
+
+    /* The flag describes the table being discarded here, so it goes with it:
+     * execve rebuilds a complete one, and carrying the doubt across meant a new
+     * image inheriting every refusal the old one had earned.
+     */
+    g->regions_tracker_stale = false;
 }
 
 /* Page table builder. */

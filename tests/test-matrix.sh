@@ -646,10 +646,17 @@ test_pipe()
 # check") binary except the handful that assert elfuse-internal implementation
 # details with no meaningful counterpart on a real kernel (most of the EL1 shim
 # fast-path suite -- test-shim-* and test-shim-cred-race, which probe elfuse's
-# own shim_data block and identity cache; test-shim-futex-fast is the exception
-# and does run here, because every assertion in it is plain Linux futex ABI that
-# a real kernel adjudicates (unlike test-mremap-infra, which guards elfuse's
-# guest-IPA infra reserve, and test-oom-proc, documented in its own header).
+# own shim_data block and identity cache). Two test-shim-* binaries are listed
+# below rather than held out, each because every assertion in it is ABI a real
+# kernel adjudicates: test-shim-futex-fast, which is plain Linux futex ABI, and
+# test-shim-sigreturn-x8, which is plain Linux signal ABI throughout -- what
+# rt_sigreturn restores, and what a handler enters with after a W^X permission
+# fault or a BRK. Both are named here on purpose: a reader who finds one
+# exception recorded takes it for the whole rule and holds the next one out.
+# test-shim-sigreturn-x8 was run against this lane by hand when it was
+# registered, on the fixture kernel of the day (Alpine 6.18.52-0-virt), and
+# passes there. Contrast test-mremap-infra, which guards elfuse's guest-IPA
+# infra reserve, and test-oom-proc, documented in its own header.
 # test-mremap-tail-emfile is listed here as an elfuse-lane regression and marked
 # QEMU_SKIP because its host-reserve assertion has no Linux analogue. There is
 # no "core" vs "extended" split here; everything below runs in both
@@ -724,10 +731,14 @@ run_unit_tests()
         "$bindir/test-nanosleep-signal-latency"
     test_check "$runner" "test-nanosleep-process-signal" "PASS" \
         "$bindir/test-nanosleep-process-signal"
+    test_check "$runner" "test-wait-signal-latency" "PASS" \
+        "$bindir/test-wait-signal-latency"
     test_check "$runner" "test-wait-process-signal" " - PASS" \
         "$bindir/test-wait-process-signal"
     test_check "$runner" "test-wait-sigmask-signal" " - PASS" \
         "$bindir/test-wait-sigmask-signal"
+    test_check "$runner" "test-shim-sigreturn-x8" "0 failed" \
+        "$bindir/test-shim-sigreturn-x8"
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
         "$bindir/test-ptrace-interrupt"
     test_check "$runner" "test-sigsuspend" "PASS|0 failed" "$bindir/test-sigsuspend"
@@ -737,6 +748,10 @@ run_unit_tests()
         "$bindir/test-kill-broadcast"
     test_check "$runner" "test-kill-pgroup" "0 failed" \
         "$bindir/test-kill-pgroup"
+    test_check "$runner" "test-kill-parent" "0 failed" \
+        "$bindir/test-kill-parent"
+    test_check "$runner" "test-pidfd-targets" "0 failed" \
+        "$bindir/test-pidfd-targets"
     test_rc "$runner" "test-sigio" 0 "$bindir/test-sigio"
     test_rc "$runner" "test-fault-signal-mt" 0 "$bindir/test-fault-signal-mt"
     test_rc "$runner" "test-exit-group-worker" 0 "$bindir/test-exit-group-worker"
@@ -863,6 +878,7 @@ run_unit_tests()
     test_rc "$runner" "test-mmap-hint" 0 "$bindir/test-mmap-hint"
 
     test_rc "$runner" "test-mmap-sigbus-efault" 0 "$bindir/test-mmap-sigbus-efault"
+    test_check "$runner" "test-brk-stack" "0 failed" "$bindir/test-brk-stack"
 
     printf "\nLow-base ET_EXEC memory regression\n"
     test_rc "$runner" "test-lowbase-mem-200000" 0 "$bindir/test-lowbase-mem-200000"
@@ -1506,9 +1522,14 @@ run_suite()
 # Both went up by one again for test-futex-wake-pi, which regression-tests the
 # EINVAL a plain wake owes a PI waiter, and which runs in both lanes for the
 # same two reasons. 252 and 227, observed here at 286 and 264.
+#
+# And once more for test-brk-stack, the issue #320 regression: a brk grow must
+# stop at its neighbors rather than extend page tables over them. No fixture,
+# not in either skip list, so it runs in both lanes. 253 and 228, observed here
+# at 295 and 273.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|252|0"
-    "qemu-aarch64|227|0"
+    "elfuse-aarch64|253|0"
+    "qemu-aarch64|228|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

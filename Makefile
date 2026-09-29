@@ -37,6 +37,7 @@ SRCS := \
     runtime/procemu-pty.c \
     runtime/usb-sysfs.c \
     runtime/usb-desc.c \
+    runtime/tty-alias-pool.c \
     runtime/proctitle.c \
     syscall/syscall.c \
     syscall/fdtable.c \
@@ -330,6 +331,15 @@ $(BUILD_DIR)/test-usbdev-urb-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the sticky tty alias pool host unit test (native macOS binary)
+# tty-alias-pool.o is a pure leaf translation unit (string/array bookkeeping
+# only), so the test links the code under test and nothing else.
+$(BUILD_DIR)/test-tty-alias-pool-host: \
+		$(BUILD_DIR)/test-tty-alias-pool-host.o \
+		$(BUILD_DIR)/runtime/tty-alias-pool.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the guest environment merge host test (native macOS binary)
 # guest-env.o's only dependency is the log macro, which the test stubs.
 $(BUILD_DIR)/test-guest-env-host: $(BUILD_DIR)/test-guest-env-host.o \
@@ -459,6 +469,13 @@ $(BUILD_DIR)/test-socket-accept-contended: \
 # times the delivery.
 $(BUILD_DIR)/test-nanosleep-signal-latency: \
 		tests/test-nanosleep-signal-latency.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-wait-signal-latency aims a signal at a sibling thread parked in select or
+# epoll_wait.
+$(BUILD_DIR)/test-wait-signal-latency: \
+		tests/test-wait-signal-latency.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 

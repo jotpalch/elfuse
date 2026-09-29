@@ -2239,7 +2239,10 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
      * child and write the guest FD number to ca.pidfd.
      */
     if (ret > 0 && want_pidfd && ca.pidfd != 0) {
-        int pfd = pidfd_create(g, ret);
+        /* A CLONE_VM child has no host pid of its own, so it resolves to -1 and
+         * its pidfd carries no monitor.
+         */
+        int pfd = pidfd_create(g, ret, proc_resolve_guest_pid(ret));
         if (pfd >= 0) {
             int32_t pfd32 = (int32_t) pfd;
             if (guest_write_small(g, ca.pidfd, &pfd32, sizeof(pfd32)) < 0) {

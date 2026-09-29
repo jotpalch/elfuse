@@ -115,6 +115,7 @@ test-mprotect-mt               # diff=skip
 [section] Signal + thread tests
 test-signal-thread
 test-signal-in-shim           # diff=skip
+test-shim-sigreturn-x8
 test-sigsuspend
 test-fault-signal-mt           # diff=skip
 test-exit-group-worker
@@ -133,6 +134,7 @@ test-fork-synthetic-fd
 test-guard-page
 test-mmap-hint
 test-mmap-sigbus-efault
+test-brk-stack
 
 [section] mremap tests
 test-mremap
