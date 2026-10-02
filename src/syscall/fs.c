@@ -243,6 +243,27 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
         return true;
     }
 
+    /* A serial alias fd is a host fd on the macOS cu.* node, so fstat answers
+     * from the stamp to report the Linux 166:n or 188:n identity. Every
+     * spelling of the node, the by-id leaf included, is stamped as the node: a
+     * leaf runs to 242 bytes and the stamp holds 63.
+     */
+    char alias_node[64];
+    if (usb_tty_alias_node(path, alias_node, sizeof(alias_node))) {
+        str_copy_trunc(out, alias_node, out_size);
+        return true;
+    }
+
+    /* While an alias exists, /dev, /dev/serial and /dev/serial/by-id are served
+     * from a scratch directory, so a descriptor on one carries its guest name
+     * for the /dev/pts reason above.
+     */
+    char alias_dir[sizeof("/dev/serial/by-id")];
+    if (usb_tty_alias_dir(path, alias_dir, sizeof(alias_dir))) {
+        str_copy_trunc(out, alias_dir, out_size);
+        return true;
+    }
+
     if (strncmp(path, "/proc", 5) != 0)
         return false;
 
@@ -2836,11 +2857,15 @@ int64_t sys_fchdir(int fd)
      * writing into a read-only view and reporting the wrong statfs magic.
      * Publishing the stamped guest spelling instead keeps the cwd on the
      * intercepts, exactly as chdir() does for these paths.
-     * resolve_proc_cwd_path knows the same two prefixes.
+     * resolve_proc_cwd_path knows the same prefixes, and the alias directories,
+     * which are scratch-backed while an alias exists.
      */
+    char alias_dir[sizeof("/dev/serial/by-id")];
     if (!proc_virtual && fd_table[fd].proc_path[0] &&
         (path_prefix_match(fd_table[fd].proc_path, "/sys", 4) ||
-         path_prefix_match(fd_table[fd].proc_path, "/dev/bus", 8)))
+         path_prefix_match(fd_table[fd].proc_path, "/dev/bus", 8) ||
+         usb_tty_alias_dir(fd_table[fd].proc_path, alias_dir,
+                           sizeof(alias_dir))))
         proc_virtual = fd_table[fd].proc_path;
     if (fchdir(host_ref.fd) < 0) {
         host_fd_ref_close(&host_ref);

@@ -1147,6 +1147,241 @@ static int check_devices(void)
     return ndev;
 }
 
+/* Every alias, from each end: /sys/class/tty/<name>/dev against a stat of the
+ * node (pyserial reads one, an open goes through the other), access against
+ * open on write permission, fstat against stat, a trailing slash against
+ * ENOTDIR, and O_CREAT|O_EXCL against EEXIST. The rdev composition is the one
+ * place a major is shifted into a signed 32-bit dev_t, which puts it in front
+ * of UBSAN on the sanitizer lane.
+ *
+ * Returns the number of aliases examined, which the caller prints.
+ */
+static void check_alias_node(const char *classdir, const char *name, bool acm)
+{
+    char node[128], val[64], why[256];
+    snprintf(node, sizeof(node), "/dev/%s", name);
+
+    TEST("the tty alias dev attribute matches the node's rdev");
+    struct stat nst;
+    if (attr_str(classdir, "dev", val, sizeof(val)) != 0) {
+        FAIL("dev attribute missing");
+        return;
+    }
+    if (stat(node, &nst) != 0) {
+        printf("      %s: %s\n", node, strerror(errno));
+        FAIL("stat the node");
+        return;
+    }
+    char want[64];
+    snprintf(want, sizeof(want), "%u:%u", (unsigned) major(nst.st_rdev),
+             (unsigned) minor(nst.st_rdev));
+    snprintf(why, sizeof(why), "%s: dev reads \"%s\", node rdev is \"%s\"",
+             name, val, want);
+    EXPECT_VALUE(S_ISCHR(nst.st_mode) && !strcmp(val, want), why);
+
+    TEST("the tty alias carries the major Linux gives its kind");
+    snprintf(why, sizeof(why), "%s has major %u", name,
+             (unsigned) major(nst.st_rdev));
+    EXPECT_VALUE((unsigned) major(nst.st_rdev) == (acm ? 166u : 188u), why);
+
+    /* The guest's uid need not be the host uid the node reports, so a mode
+     * denying "other" would refuse here what the open below serves.
+     */
+    TEST("access() and open() agree on writing the alias node");
+    int acc = access(node, R_OK | W_OK);
+    int aerr = errno;
+    int wfd = open(node, O_RDWR | O_NONBLOCK | O_NOCTTY);
+    int werr = errno;
+    snprintf(why, sizeof(why), "%s: access(R|W)=%s, open(O_RDWR)=%s", name,
+             acc == 0 ? "ok" : strerror(aerr),
+             wfd >= 0 ? "ok" : strerror(werr));
+    EXPECT_VALUE((acc == 0) == (wfd >= 0), why);
+    if (wfd >= 0)
+        close(wfd);
+
+    /* The host fd is on the cu.* node; fstat has to report the Linux node. */
+    TEST("the alias fd fstats as the node stat described");
+    int fd = open(node, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+    if (fd < 0) {
+        printf("      %s: %s\n", node, strerror(errno));
+        FAIL("open the alias node");
+    } else {
+        struct stat fst;
+        int rc = fstat(fd, &fst);
+        snprintf(why, sizeof(why),
+                 "%s: stat rdev %u:%u ino %llu, fstat rdev %u:%u ino %llu",
+                 name, (unsigned) major(nst.st_rdev),
+                 (unsigned) minor(nst.st_rdev), (unsigned long long) nst.st_ino,
+                 (unsigned) major(fst.st_rdev), (unsigned) minor(fst.st_rdev),
+                 (unsigned long long) fst.st_ino);
+        EXPECT_VALUE(rc == 0 && S_ISCHR(fst.st_mode) &&
+                         fst.st_rdev == nst.st_rdev &&
+                         fst.st_ino == nst.st_ino && fst.st_dev == nst.st_dev,
+                     why);
+        close(fd);
+    }
+
+    /* The node through a cwd of /dev, set by chdir and by fchdir, which publish
+     * the cwd through different code. This lane has no sysroot; the matrix
+     * lane's cwd rows run with one.
+     */
+    TEST("a cwd-relative name reaches the node the absolute spelling reaches");
+    {
+        int dfd = open("/dev", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        struct stat cst, fst2;
+        int crc = chdir("/dev") == 0 ? stat(name, &cst) : -1;
+        int cerr = errno;
+        int frc = -1, ferr = 0;
+        if (dfd >= 0 && chdir("/") == 0 && fchdir(dfd) == 0) {
+            frc = stat(name, &fst2);
+            ferr = errno;
+        }
+        if (dfd >= 0)
+            close(dfd);
+        if (chdir("/") != 0)
+            FAIL("chdir back to /");
+        else {
+            snprintf(why, sizeof(why),
+                     "%s: chdir+stat=%s, fchdir+stat=%s, absolute rdev %u:%u",
+                     name, crc == 0 ? "ok" : strerror(cerr),
+                     frc == 0 ? "ok" : strerror(ferr),
+                     (unsigned) major(nst.st_rdev),
+                     (unsigned) minor(nst.st_rdev));
+            EXPECT_VALUE(
+                crc == 0 && frc == 0 && S_ISCHR(cst.st_mode) &&
+                    S_ISCHR(fst2.st_mode) && cst.st_rdev == nst.st_rdev &&
+                    fst2.st_rdev == nst.st_rdev && cst.st_ino == nst.st_ino &&
+                    fst2.st_ino == nst.st_ino,
+                why);
+        }
+    }
+
+    /* A device node takes the lowest free fd, which busybox sh relies on when
+     * it closes 0 and opens a node as stdin; a synthetic /proc file starts at
+     * 128. Asserted for every spelling of the node.
+     */
+    TEST("every spelling of the alias node takes the lowest free fd");
+    static const char *const forms[] = {"/dev/%s", "//dev/%s", "/.//dev/%s",
+                                        "/dev/./%s"};
+    int got[4];
+    bool lowest = true;
+    for (unsigned i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        char spelled[136];
+        snprintf(spelled, sizeof(spelled), forms[i], name);
+        int keep = dup(STDIN_FILENO);
+        close(STDIN_FILENO);
+        got[i] = open(spelled, O_RDWR | O_NONBLOCK | O_NOCTTY);
+        if (got[i] != STDIN_FILENO)
+            lowest = false;
+        if (got[i] >= 0)
+            close(got[i]);
+        if (keep >= 0) {
+            dup2(keep, STDIN_FILENO);
+            close(keep);
+        }
+    }
+    snprintf(why, sizeof(why),
+             "%s: /dev/=%d, //dev/=%d, /.//dev/=%d, /dev/./=%d", name, got[0],
+             got[1], got[2], got[3]);
+    EXPECT_VALUE(lowest, why);
+
+    TEST("a character device named as a directory is ENOTDIR");
+    char slashed[136];
+    snprintf(slashed, sizeof(slashed), "%s/", node);
+    struct stat sst;
+    int srt = stat(slashed, &sst);
+    int serr = errno;
+    int dfd = open(node, O_RDONLY | O_DIRECTORY);
+    int derr = errno;
+    snprintf(why, sizeof(why), "%s/: stat=%s, O_DIRECTORY=%s", node,
+             srt == 0 ? "ok" : strerror(serr),
+             dfd >= 0 ? "ok" : strerror(derr));
+    EXPECT_VALUE(srt < 0 && serr == ENOTDIR && dfd < 0 && derr == ENOTDIR, why);
+    if (dfd >= 0)
+        close(dfd);
+
+    TEST("O_CREAT|O_EXCL on a node that exists is EEXIST");
+    int cfd = open(node, O_RDWR | O_CREAT | O_EXCL | O_NONBLOCK, 0644);
+    int cerr = errno;
+    snprintf(why, sizeof(why), "%s: %s", node,
+             cfd >= 0 ? "created" : strerror(cerr));
+    EXPECT_VALUE(cfd < 0 && cerr == EEXIST, why);
+    if (cfd >= 0)
+        close(cfd);
+}
+
+/* Divergences from Linux this layer knows about and does not close, printed
+ * with both values rather than asserted, the way the matrix lane prints its
+ * XFAIL cells. Printing them is the point: a fidelity gap that nothing reports
+ * is one nobody re-measures.
+ */
+static void report_alias_divergences(const char *classdir, const char *alias)
+{
+    struct stat st;
+    char p[512];
+
+    /* pyserial reads <tty>/device/interface into ListPortInfo.interface. Linux
+     * has it whenever the interface descriptor carries a non-zero iInterface; a
+     * string descriptor needs an ep0 control transfer on an open device, which
+     * this layer deliberately does not do, so it is absent here and pyserial
+     * reports None.
+     */
+    snprintf(p, sizeof(p), "%s/device/interface", classdir);
+    if (stat(p, &st) != 0)
+        printf(
+            "XFAIL: %s/device/interface: Linux the iInterface string when the "
+            "descriptor carries one, elfuse absent (no ep0 string fetch)\n",
+            alias);
+
+    /* Linux publishes one interface directory and makes the flat
+     * /sys/bus/usb/devices/<if> name a symlink to it. This layer emits two
+     * directories with the same attributes so libusb keeps the flat name it
+     * walks, so the same interface has two inodes.
+     */
+    char target[512];
+    ssize_t n;
+    snprintf(p, sizeof(p), "%s/device", classdir);
+    n = readlink(p, target, sizeof(target) - 1);
+    if (n <= 0)
+        return;
+    target[n] = '\0';
+    const char *leaf = strrchr(target, '/');
+    if (!leaf || !strchr(leaf, ':'))
+        return; /* the ttyUSB port level, not an interface dir */
+    struct stat nested, flat;
+    char flatp[512];
+    snprintf(flatp, sizeof(flatp), "/sys/bus/usb/devices/%s", leaf + 1);
+    if (stat(p, &nested) == 0 && stat(flatp, &flat) == 0 &&
+        nested.st_ino != flat.st_ino)
+        printf(
+            "XFAIL: interface %s: Linux one inode (the flat name is a symlink "
+            "to the nested one), elfuse two directories, ino %llu and %llu\n",
+            leaf + 1, (unsigned long long) nested.st_ino,
+            (unsigned long long) flat.st_ino);
+}
+
+static int check_tty_aliases(void)
+{
+    DIR *dp = opendir("/sys/class/tty");
+    if (!dp)
+        return 0;
+
+    int n = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dp))) {
+        if (strncmp(ent->d_name, "ttyACM", 6) &&
+            strncmp(ent->d_name, "ttyUSB", 6))
+            continue;
+        n++;
+        char classdir[256];
+        snprintf(classdir, sizeof(classdir), "/sys/class/tty/%s", ent->d_name);
+        check_alias_node(classdir, ent->d_name, ent->d_name[3] == 'A');
+        report_alias_divergences(classdir, ent->d_name);
+    }
+    closedir(dp);
+    return n;
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1159,6 +1394,7 @@ int main(void)
      * against, and a zero here means those assertions did not execute.
      */
     printf("  devices examined: %d\n", ndev);
+    printf("  tty aliases examined: %d\n", check_tty_aliases());
 
     SUMMARY("test-usb-sysfs");
     return fails > 0 ? 1 : 0;
