@@ -18,6 +18,7 @@
 #include "debug/log.h"
 
 #include "runtime/procemu.h"
+#include "runtime/usb-sysfs.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
@@ -154,7 +155,8 @@ static int write_linux_statx(guest_t *g,
 
 /* Whether a descriptor's identity comes from the stamp rather than from the
  * host object underneath it: O_PATH, /sys and /dev/bus do, /proc does not. See
- * docs/internals.md, "Filesystem Identity Of A Descriptor", for why.
+ * docs/internals.md, "Filesystem Identity Of A Descriptor", for why. A serial
+ * alias node does too: its host fd is on the macOS cu.* node.
  */
 static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
 {
@@ -162,7 +164,8 @@ static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
         return false;
     return snap->type == FD_PATH ||
            path_prefix_match(snap->proc_path, "/sys", 4) ||
-           path_prefix_match(snap->proc_path, "/dev/bus", 8);
+           path_prefix_match(snap->proc_path, "/dev/bus", 8) ||
+           usb_tty_alias_path(snap->proc_path);
 }
 
 static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
@@ -576,11 +579,13 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
  * sys_faccessat had: a sysroot carrying a name inside /dev/bus/usb -- on a bus
  * number no device has -- would otherwise have its file answer statfs while
  * open, stat and access all report ENOENT for the same path. Only
- * PROC_NOT_INTERCEPTED means "ask the backing".
+ * PROC_NOT_INTERCEPTED means "ask the backing". The serial alias nodes and
+ * their directories are on the same devtmpfs on Linux.
  */
 static int statfs_dev_bus_class(const char *path)
 {
-    if (!path || !path_prefix_match(path, "/dev/bus", 8))
+    if (!path || !path_prefix_match(path, "/dev", 4) ||
+        !usb_sysfs_path_might_be_ours(path))
         return PROC_NOT_INTERCEPTED;
     struct stat st;
     return proc_intercept_stat_at(path, &st, true);

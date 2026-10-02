@@ -132,3 +132,24 @@ int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out);
  * Returns 0, or -1 with errno set.
  */
 int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st);
+
+/* Whether @path is exactly "/dev/ttyACM<n>", "/dev/ttyUSB<n>" or
+ * "/dev/serial/by-id/<leaf>". String work only; for a descriptor stamp, which
+ * is canonical.
+ */
+bool usb_tty_alias_path(const char *path);
+
+/* Whether @path names /dev, /dev/serial or /dev/serial/by-id; @out receives the
+ * canonical spelling.
+ */
+bool usb_tty_alias_dir(const char *path, char *out, size_t outsz);
+
+/* The alias node a name resolves to, by-id leaves included, or false when no
+ * such alias exists. Takes usb_lock and looks the device up.
+ */
+bool usb_tty_alias_node(const char *path, char *out, size_t outsz);
+
+/* Whether @path could name something under /sys or /dev this layer serves,
+ * decided as the intercepts decide it. String work only.
+ */
+bool usb_sysfs_path_might_be_ours(const char *path);

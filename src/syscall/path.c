@@ -44,7 +44,6 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
  * module answers, not about what the filesystem can do.
  */
 #define SYSFS_PREFIX "/sys"
-#define DEV_USB_PREFIX "/dev/bus"
 
 static size_t bare_len(const char *path)
 {
@@ -240,9 +239,14 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
-        return true;
-    if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
+
+    /* The /dev names the USB layer serves (/dev/bus and the serial aliases) are
+     * asked of it, so this gate and the intercept decide ownership the same
+     * way. /sys keeps its literal, since it also fronts the syscpu stub, which
+     * the USB layer disowns.
+     */
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1) ||
+        usb_sysfs_path_might_be_ours(path))
         return true;
 
     /* Synthesized on open, so it has to exist for stat too. */
@@ -655,12 +659,14 @@ int path_translate_at(guest_fd_t dirfd,
      * readlink and getdents64 answer from one name -- the union listing of
      * `<dev>/subsystem/..` offered /sys/bus/pci while every lookup of
      * `<dev>/subsystem/../pci` denied it, because each entry point folded the
-     * name for itself.
+     * name for itself. A tty alias directory under /sys/class/tty carries a
+     * device link and a subsystem link of the same kind.
      *
      * Cheap for everything else: the prefix test rejects every path that cannot
      * contain such a link before the USB layer is called at all.
      */
-    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21)) {
+    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21) ||
+        !strncmp(tx->guest_path, "/sys/class/tty/", 15)) {
         /* Through a local buffer, not straight into guest_buf: guest_path may
          * already be guest_buf (the FUSE resolver above puts it there), and the
          * rewrite reads its input while writing its output.
@@ -1415,11 +1421,15 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * re-offered to the intercepts. Without the /sys and /dev/bus arms a cwd
      * set by fchdir() onto a synthetic USB directory would resolve relative
      * names straight against the scratch tree. The component walk below is
-     * base-agnostic.
+     * base-agnostic. The alias directories join them while an alias exists; the
+     * canonical name the layer hands back is unused, since view.path is already
+     * the guest's own.
      */
+    char alias_dir[sizeof("/dev/serial/by-id")];
     int rc = 0;
     if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
-        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8)) {
+        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8) ||
+        usb_tty_alias_dir(view.path, alias_dir, sizeof(alias_dir))) {
         size_t marks[PROC_PATH_COMPONENTS_MAX];
         size_t depth;
         if (proc_seed_absolute_path(view.path, out, outsz, marks,

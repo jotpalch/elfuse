@@ -1647,11 +1647,13 @@ that string on Linux and shows nothing here.
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 `src/syscall/fs.c`, `src/syscall/proc-state.c`, `src/runtime/usb-sysfs.c`.
 
-### Ownership Of `/sys` And `/dev/bus` Names
+### Ownership Of `/sys` And `/dev` Names
 
-The layer synthesizes exactly one subtree on each side, `/sys/bus/usb` and
-`/dev/bus/usb`, on top of a `/sys` and a `/dev/bus` that a sysroot supplies.
-Which of the two answers a name is one decision, taken once in
+The layer synthesizes `/sys/bus/usb`, `/sys/class/tty`, `/sys/bus/usb-serial`
+and `/dev/bus/usb` on top of a `/sys` and a `/dev` that a sysroot supplies, and
+adds the serial alias names, `ttyACM<n>` and `ttyUSB<n>` in `/dev` and the
+leaves of `/dev/serial/by-id`. Which side answers a name is one decision, taken
+once in
 `classify_and_normalize`, and every entry point -- `open`, `stat`, `lstat`,
 `readlink`, `access`, `getdents64`, `statfs`, `chdir` -- answers from it.
 An entry point that re-derives the decision is how four regressions arrived,
@@ -1670,19 +1672,38 @@ The classes and who answers them:
 | `USB_PATH_DEV_NODE_SUB` | a node used as a directory | the layer (`ENOTDIR` once the node exists) |
 | `USB_PATH_DEV_ABSENT` | under `/dev/bus/usb`, no such device | the layer, `ENOENT` |
 | `USB_PATH_DEV_FOREIGN` | under `/dev/bus`, a bus we do not model | the backing |
+| `USB_PATH_TTY` | `/dev/ttyACM<n>`, `/dev/ttyUSB<n>` | the layer when the alias exists; otherwise the backing |
+| `USB_PATH_TTY_SUB` | an alias used as a directory | the layer (`ENOTDIR`) when the alias exists; otherwise the backing |
+| `USB_PATH_BYID` | `/dev/serial/by-id/<leaf>` | the layer when the leaf is one of ours; otherwise the backing |
+| `USB_PATH_BYID_SUB` | a leaf used as a directory | the layer (`ENOTDIR`) when the leaf is one of ours; otherwise the backing |
+| `USB_PATH_DEV_ROOT`, `USB_PATH_SERIAL_DIR`, `USB_PATH_BYID_DIR` | `/dev`, `/dev/serial`, `/dev/serial/by-id` | the layer, listing the union with the backing, while an alias exists; otherwise the backing |
 | `USB_PATH_NONE` | anything else, and a name that folds above its root | the backing |
+
+Unlike `/dev/bus/usb`, `/dev` and `/dev/serial/by-id` are the sysroot's
+directories, so an absence there is never authoritative: an alias-shaped name
+with no alias behind it, such as a rootfs image's own `/dev/ttyUSB0`, is the
+backing's. Nothing is written into the sysroot; the alias names live in a
+scratch directory and are listed as a union, the way `/dev/bus` is.
+
+Mutating entry points are not modeled for the alias names. `unlink`, `rename`
+and `chmod` reach the backing, which does not have the name, so they answer
+`ENOENT` while `open` and `stat` serve the node.
 
 Only `PROC_NOT_INTERCEPTED` means "ask the backing". A name the layer claims
 and then fails to serve is an answer, not a fall-through: taking the failure
 for one let `access(2)`, and then `statfs(2)`, answer from the backing while
 `open` and `stat` reported `ENOENT` for the same path.
 
-`.` and `..` are folded lexically before ownership is decided, on both halves.
-The fold is the ours/not-ours gate and nothing else -- the served path is built
-by `usb_sys_resolve_suffix`, which resolves symlinks and applies each `..` to
-what the previous component resolved to, the way the kernel does, so
-`<dev>/subsystem/..` names `/sys/bus`. Deciding ownership on the guest's
-spelling instead splits the two halves apart in both directions:
+`.` and `..` are folded before ownership is decided, on both halves. On `/sys`
+the fold is lexical and is the ours/not-ours gate and nothing else: the served
+path is built by `usb_sys_resolve_suffix`, which resolves symlinks and applies
+each `..` to what the previous component resolved to, the way the kernel does,
+so `<dev>/subsystem/..` names `/sys/bus`. On `/dev` the fold starts at `/dev`,
+so the alias names fold too, and a `..` is applied only to a directory, as the
+kernel applies it: after an alias node, a by-id leaf or a usbfs node the name
+answers `ENOTDIR`, and after a name the layer does not serve, such as
+`/dev/null/..`, the whole path is the backing's. Deciding ownership on the
+guest's spelling instead splits the two halves apart in both directions:
 `/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
 and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
 A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
@@ -1701,7 +1722,12 @@ The rules:
   covers the scratch-dir backed names, where the host `fstatfs` would leak the
   `/tmp` filesystem's magic, and the ones that fell through to a sysroot's own
   `/sys`, where it would leak the sysroot's.
-- `/dev/bus` reports devtmpfs, on both entry points.
+- `/dev/bus` reports devtmpfs, on both entry points, and so do the serial
+  alias nodes and their directories.
+- A by-id descriptor is stamped with the alias node it resolves to, since the
+  stamp holds 63 bytes and a leaf can be longer. An `O_PATH|O_NOFOLLOW` open of
+  a leaf therefore `fstat`s as the character device where Linux reports the
+  link; the matrix lane carries it as an XFAIL.
 - `..` is folded and a relative name is resolved against the cwd before either
   entry point decides, so the two cannot be handed different spellings of one
   object.

@@ -23,18 +23,23 @@
  * and splits another cannot pass.
  *
  * EXPECTED VALUES ARE MEASURED, NOT ASSUMED. Every cell below was recorded by
- * running this same binary natively on Linux (docker gcc:14, aarch64, kernel
- * 6.x) with MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev/bus
- * carrying a mknod'd usb node next to a foreign bus directory. Re-record with:
+ * running this same binary natively on Linux (docker gcc:14, aarch64) with
+ * MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev carrying a
+ * mknod'd usb node next to a foreign bus directory, an alias node, an
+ * alias-shaped regular file and a by-id link onto the alias. Re-record with:
  *
  *   docker run --rm -v "$PWD:/w" -w /w gcc:14 sh -c \
- *     'mkdir -p /dev/bus/usb/001 /dev/bus/other && : > /dev/bus/other/f && \
- *      mknod /dev/bus/usb/001/001 c 189 0 && \
+ *     'mkdir -p /dev/bus/usb/001 /dev/bus/other /dev/serial/by-id && \
+ *      : > /dev/bus/other/f && mknod /dev/bus/usb/001/001 c 189 0 && \
+ *      mknod /dev/ttyACM0 c 166 0 && printf planted > /dev/ttyACM7 && \
+ *      ln -sf ../../ttyACM0 /dev/serial/by-id/usb-Rec_Device_0001-if00 && \
  *      gcc -D MATRIX_STANDALONE -o /tmp/m tests/test-usb-sysfs-matrix.c && \
  *      MATRIX_RECORD=1 /tmp/m'
  *
  * Cells the guest cannot match byte-for-byte are recorded per class rather than
  * per spelling; see the notes on COL_SUBSYS and COL_NODE.
+ *
+ * The serial alias names in /dev and /sys/class/tty are columns too.
  */
 
 #ifndef _GNU_SOURCE
@@ -76,7 +81,7 @@ int passes = 0, fails = 0;
 #endif
 
 #define SYSFS_MAGIC 0x62656572
-#define CELL_MAX 24
+#define CELL_MAX 40
 
 /* path classes (columns) */
 enum {
@@ -95,16 +100,36 @@ enum {
     COL_SUBSYS_OUT, /* a walk through the subsystem link and back out of usb */
     COL_FOLD_OUT, /* a '..' out of /dev/bus/usb onto a name the backing owns */
     COL_FOLD_IN,  /* a '..' out of a foreign bus and back into /dev/bus/usb */
-    COL_SYS_FOLD_IN, /* a '..' out of a backing /sys name and back into ours */
+    COL_SYS_FOLD_IN,  /* a '..' out of a backing /sys name and back into ours */
+    COL_SYS_FOLD_IN2, /* the same, through a /sys name the scratch tree lacks */
+    COL_TTY,          /* a live ttyACM alias node */
+    COL_TTY_BACK,     /* an alias-shaped name only the backing has */
+    COL_TTY_ABSENT,   /* an alias-shaped name absent on both sides */
+    COL_BYID,         /* a /dev/serial/by-id leaf, discovered */
+    COL_TTY_FOLD,     /* the alias node spelled through a '..' */
+    COL_TTY_DOT_NODE, /* an alias node with a trailing "." component */
+    COL_TTY_DOTDOT,   /* an alias node followed by '..' */
+    COL_BYID_DOTDOT,  /* a by-id leaf followed by '..', discovered */
+    COL_DEV_DOTDOT,   /* /dev/null followed by '..' */
     COL_COUNT,
 };
 
 static const char *col_name[COL_COUNT] = {
-    "synth-dir",  "back-sys",     "back-dev",    "subsys",
-    "escape",     "escape-syn",   "usb-node",    "absent",
-    "long-sys",   "sys-root",     "dev-bus",     "shadow",
-    "subsys-out", "dev-fold-out", "dev-fold-in", "sys-fold-in",
+    "synth-dir",    "back-sys",     "back-dev",     "subsys",
+    "escape",       "escape-syn",   "usb-node",     "absent",
+    "long-sys",     "sys-root",     "dev-bus",      "shadow",
+    "subsys-out",   "dev-fold-out", "dev-fold-in",  "sys-fold-in",
+    "sys-fold-in2", "tty-alias",    "tty-planted",  "tty-absent",
+    "byid-link",    "tty-fold",     "tty-dot-node", "tty-dotdot",
+    "byid-dotdot",  "dev-dotdot",
 };
+
+/* COL_TTY_DOT_NODE is the alias node with a trailing "." component: a character
+ * device used as a directory, which every entry point, chdir among them,
+ * answers ENOTDIR for. COL_TTY_DOTDOT and COL_BYID_DOTDOT put a '..' there
+ * instead, which a lexical fold would turn into /dev or /dev/serial/by-id, and
+ * COL_DEV_DOTDOT does the same to a node this layer does not serve.
+ */
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
  * bus carries whatever devices it has, and the guest's carries the fixture's.
@@ -137,6 +162,14 @@ static char subsys_out_path[512];
  * recording host and the guest fixture, so it is discovered too.
  */
 static char long_path[512];
+
+/* COL_BYID is discovered for the same reason COL_SUBSYS is: the leaf udev
+ * builds carries the device's own strings, so the recording host's spelling and
+ * the guest fixture's are different names for the same class of object: a
+ * symlink in /dev/serial/by-id pointing at a ttyACM node.
+ */
+static char byid_path[512];
+static char byid_dotdot_path[520];
 
 static const char *col_path(int c)
 {
@@ -171,6 +204,26 @@ static const char *col_path(int c)
         return "/dev/bus/other/../usb/001/001";
     case COL_SYS_FOLD_IN:
         return "/sys/class/../bus/usb/devices";
+    case COL_SYS_FOLD_IN2:
+        return "/sys/devices/../bus/usb/devices";
+    case COL_TTY:
+        return "/dev/ttyACM0";
+    case COL_TTY_BACK:
+        return "/dev/ttyACM7";
+    case COL_TTY_ABSENT:
+        return "/dev/ttyACM31";
+    case COL_BYID:
+        return byid_path;
+    case COL_TTY_FOLD:
+        return "/dev/serial/by-id/../../ttyACM0";
+    case COL_TTY_DOT_NODE:
+        return "/dev/ttyACM0/.";
+    case COL_TTY_DOTDOT:
+        return "/dev/ttyACM0/..";
+    case COL_BYID_DOTDOT:
+        return byid_dotdot_path;
+    case COL_DEV_DOTDOT:
+        return "/dev/null/..";
     default:
         return "/dev/bus";
     }
@@ -205,15 +258,17 @@ static const char *col_path(int c)
  * applied to only one direction cannot pass.
  */
 
-/* COL_SYS_FOLD_IN is the /sys mirror of COL_FOLD_IN, and the one direction that
- * stays unmet. /sys/class/../bus/usb/devices folds to a name this layer owns
- * and serves, and ownership is decided on that folded name -- but the resolve
- * behind it joins the unfolded suffix onto the scratch tree, which carries no
- * `class`, so the lookup fails and the layer answers its own authoritative
- * ENOENT for a directory it does serve. Recorded as XFAIL rather than repaired:
- * it is not this series\' doing, and the vectors header carries the measurement
- * against the merge base and the reason a fold cannot fix this half the way it
- * fixed the /dev one.
+/* COL_SYS_FOLD_IN and COL_SYS_FOLD_IN2 are the /sys mirror of COL_FOLD_IN, the
+ * same spelling through /sys/class, which the scratch tree carries, and
+ * /sys/devices, which only the sysroot has. The resolve joins the unfolded
+ * suffix onto the scratch tree, so the first resolves and the second is an
+ * XFAIL; the vectors header says why a fold cannot repair it.
+ */
+
+/* The /dev half of the ownership question for the alias names. COL_TTY is a
+ * node this layer serves; COL_TTY_BACK is alias-shaped and only the backing has
+ * it, so it must fall through; COL_TTY_ABSENT is on neither side; COL_BYID is
+ * the by-id link onto COL_TTY; COL_TTY_FOLD reaches COL_TTY through a '..'.
  */
 
 /* Names that must be listed by the union directories, one comma-free name per
@@ -254,6 +309,32 @@ static void discover_long(void)
         break;
     }
     closedir(d);
+}
+
+static void discover_byid(void)
+{
+    strcpy(byid_path, "/dev/serial/by-id/@none@");
+    strcpy(byid_dotdot_path, "/dev/serial/by-id/@none@/..");
+    DIR *d = opendir("/dev/serial/by-id");
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        char cand[512], tgt[128];
+        snprintf(cand, sizeof(cand), "/dev/serial/by-id/%s", e->d_name);
+        ssize_t n = readlink(cand, tgt, sizeof(tgt) - 1);
+        if (n <= 0)
+            continue;
+        tgt[n] = '\0';
+        if (strncmp(tgt, "../../tty", 9))
+            continue;
+        strcpy(byid_path, cand);
+        break;
+    }
+    closedir(d);
+    snprintf(byid_dotdot_path, sizeof(byid_dotdot_path), "%s/..", byid_path);
 }
 
 static void discover_subsys(void)
@@ -324,18 +405,29 @@ static void enc_fs(char *out, int rc, const struct statfs *sf)
  * *at() rows: they must reach the same answer through a relative walk that the
  * absolute spelling reaches directly.
  */
-static int parent_fd(const char *path, char *base, size_t basesz)
+static bool parent_name(const char *path,
+                        char *dir,
+                        size_t dirsz,
+                        char *base,
+                        size_t basesz)
 {
     const char *slash = strrchr(path, '/');
     if (!slash || slash == path)
-        return -1;
-    char dir[512];
+        return false;
     size_t n = (size_t) (slash - path);
-    if (n >= sizeof(dir) || strlen(slash + 1) >= basesz)
-        return -1;
+    if (n >= dirsz || strlen(slash + 1) >= basesz)
+        return false;
     memcpy(dir, path, n);
     dir[n] = '\0';
     snprintf(base, basesz, "%s", slash + 1);
+    return true;
+}
+
+static int parent_fd(const char *path, char *base, size_t basesz)
+{
+    char dir[512];
+    if (!parent_name(path, dir, sizeof(dir), base, basesz))
+        return -1;
     return open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 }
 
@@ -552,6 +644,49 @@ static void r_fchdir(const char *p, char *out)
         snprintf(out, CELL_MAX, "stuck");
 }
 
+/* The two *at rows asked of a cwd on the parent instead of a descriptor. A
+ * relative lookup tests the cwd separately from a descriptor's stamp, and chdir
+ * and fchdir publish the cwd through different code. "skip" is a parent this
+ * host cannot chdir onto.
+ */
+static void r_cwd_stat(const char *p, char *out)
+{
+    char dir[512], base[256];
+    if (!parent_name(p, dir, sizeof(dir), base, sizeof(base)) ||
+        chdir(dir) != 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    struct stat st;
+    enc_stat(out, stat(base, &st), &st);
+    if (chdir("/") != 0)
+        snprintf(out, CELL_MAX, "stuck");
+}
+
+static void r_fcwd_stat(const char *p, char *out)
+{
+    char dir[512], base[256];
+    if (!parent_name(p, dir, sizeof(dir), base, sizeof(base))) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    int rc = fchdir(dfd);
+    close(dfd);
+    if (rc != 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    struct stat st;
+    enc_stat(out, stat(base, &st), &st);
+    if (chdir("/") != 0)
+        snprintf(out, CELL_MAX, "stuck");
+}
+
 static void r_epoll_ctl(const char *p, char *out)
 {
     int ep = epoll_create1(0);
@@ -602,6 +737,8 @@ static const struct {
     {"fstat_type", r_fstat_type},
     {"chdir", r_chdir},
     {"fchdir", r_fchdir},
+    {"cwd_stat", r_cwd_stat},
+    {"fcwd_stat", r_fcwd_stat},
     {"epoll_ctl", r_epoll_ctl},
     {"union_listing", r_union},
 };
@@ -662,6 +799,7 @@ int main(void)
 {
     discover_subsys();
     discover_long();
+    discover_byid();
 
     if (getenv("MATRIX_RECORD")) {
         record();
@@ -722,9 +860,19 @@ int main(void)
                 rows[r].fn(col_path(c), cell);
             }
 
+            /* Both directions are printed. A '?' cell that starts matching is
+             * an XPASS and says so: eighteen of them went green when the
+             * scratch tree gained a /sys/class directory, and the silent
+             * "continue" that used to cover it meant the recorded expectation
+             * and the comment explaining it stayed false with nothing in the
+             * lane's output to say the fact had changed.
+             */
             if (xfail) {
                 if (strcmp(cell, want))
                     printf("XFAIL: %s [%s] %s: Linux %s, elfuse %s\n",
+                           rows[r].name, col_name[c], col_path(c), want, cell);
+                else
+                    printf("XPASS: %s [%s] %s: Linux %s, elfuse %s\n",
                            rows[r].name, col_name[c], col_path(c), want, cell);
                 continue;
             }
