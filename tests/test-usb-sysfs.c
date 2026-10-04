@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Code under test: src/runtime/usb-sysfs.c, plus the sysfs statfs arms in
- * src/syscall/fs-stat.c.
+ * src/syscall/fs-stat.c and the /dev/bus joins and rewrite in
+ * src/syscall/path.c.
  *
  * Two halves. The first asserts what holds with no USB device attached at all:
  * SYSFS_MAGIC from statfs and fstatfs alike, the read-only open contract, and
@@ -21,6 +22,9 @@
  * `subsystem` links the tree emits are reachable the way Linux makes them
  * reachable: followed on a plain open, ELOOP only when the caller asked for
  * O_NOFOLLOW, and readable as a target either way.
+ *
+ * The '..' checks at the end name the fixture's node 001/001, which the lane
+ * always provides.
  *
  * A run with no devices is not a pass by default: the device count is printed,
  * so a lane that quietly stopped covering the second half is visible rather
@@ -1147,6 +1151,134 @@ static int check_devices(void)
     return ndev;
 }
 
+/* openat from the host directory @dir, which the host refuses and openat
+ * retries through the absolute spelling: @err, or 0 for success.
+ */
+static void check_hostdir_openat(const char *dir, const char *rel, int err)
+{
+    char what[96];
+    snprintf(what, sizeof(what), "openat(%s, \"%s\")", dir, rel);
+    TEST(what);
+    int hfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (hfd < 0) {
+        FAIL(dir);
+        return;
+    }
+    errno = 0;
+    int fd = openat(hfd, rel, O_RDONLY | O_DIRECTORY);
+    if (err ? fd < 0 && errno == err : fd >= 0)
+        PASS();
+    else
+        FAIL(what);
+    if (fd >= 0)
+        close(fd);
+    close(hfd);
+}
+
+/* A '..' after a usbfs node is ENOTDIR however the name is reached: spelled in
+ * full, relative to a descriptor or a cwd on the bus directory, which chdir and
+ * fchdir publish through different code, and through openat from a host
+ * directory.
+ */
+static void check_node_dotdot_relative(void)
+{
+    struct stat st;
+    int dfd = open("/dev/bus/usb/001", O_RDONLY | O_DIRECTORY);
+    TEST("a '..' after a usbfs node is ENOTDIR relative to a dirfd");
+    if (dfd < 0) {
+        FAIL("open /dev/bus/usb/001");
+        return;
+    }
+    EXPECT_ERRNO(fstatat(dfd, "001/..", &st, 0), ENOTDIR,
+                 "fstatat(/dev/bus/usb/001, \"001/..\")");
+
+    TEST("a '..' after a usbfs node is ENOTDIR relative to a chdir cwd");
+    if (chdir("/dev/bus/usb/001") != 0)
+        FAIL("chdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+
+    TEST("a '..' after a usbfs node is ENOTDIR relative to a fchdir cwd");
+    if (chdir("/") != 0 || fchdir(dfd) != 0)
+        FAIL("fchdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+    close(dfd);
+
+    TEST("a '..' after a node used as a directory is ENOTDIR");
+    EXPECT_ERRNO(stat("/dev/bus/usb/001/001/x/..", &st), ENOTDIR,
+                 "stat(\"/dev/bus/usb/001/001/x/..\")");
+
+    /* The retry folds the name only until the walk reaches /dev/bus, so the
+     * node is not folded away and a walk from / or out of /dev still arrives.
+     */
+    check_hostdir_openat("/dev", "bus/usb/001/001/..", ENOTDIR);
+    check_hostdir_openat("/", "dev/bus/usb/001/001/..", ENOTDIR);
+    check_hostdir_openat("/dev", "../dev/bus/usb/001/001/..", ENOTDIR);
+    check_hostdir_openat("/", "dev/bus/usb/001", 0);
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+}
+
+/* A '..' out of /dev/bus lands in /dev however the name is reached. */
+static void check_dotdot_leaves_bus(void)
+{
+    struct stat st;
+    char cwd[64];
+
+    TEST("/dev/bus/../null is /dev/null");
+    if (stat("/dev/bus/../null", &st) == 0 && S_ISCHR(st.st_mode))
+        PASS();
+    else
+        FAIL("stat(\"/dev/bus/../null\")");
+
+    TEST("/dev/bus/../bus/../null is /dev/null");
+    if (stat("/dev/bus/../bus/../null", &st) == 0 && S_ISCHR(st.st_mode))
+        PASS();
+    else
+        FAIL("stat(\"/dev/bus/../bus/../null\")");
+
+    TEST("/dev/bus/.././bus/../null is /dev/null");
+    if (stat("/dev/bus/.././bus/../null", &st) == 0 && S_ISCHR(st.st_mode))
+        PASS();
+    else
+        FAIL("stat(\"/dev/bus/.././bus/../null\")");
+
+    TEST("/dev/bus/.. is a directory");
+    if (stat("/dev/bus/..", &st) == 0 && S_ISDIR(st.st_mode))
+        PASS();
+    else
+        FAIL("stat(\"/dev/bus/..\")");
+
+    TEST("a '..' out through a bus no device has is ENOENT");
+    EXPECT_ERRNO(stat("/dev/bus/usb/099/../../../null", &st), ENOENT,
+                 "stat(\"/dev/bus/usb/099/../../../null\")");
+
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    TEST("../null relative to a /dev/bus dirfd");
+    if (dfd < 0) {
+        FAIL("open /dev/bus");
+        return;
+    }
+    if (fstatat(dfd, "../null", &st, 0) == 0 && S_ISCHR(st.st_mode))
+        PASS();
+    else
+        FAIL("fstatat(/dev/bus, \"../null\")");
+    close(dfd);
+
+    TEST("chdir .. from /dev/bus reaches /dev");
+    if (chdir("/dev/bus") != 0 || chdir("..") != 0)
+        FAIL("chdir /dev/bus, then ..");
+    else if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/dev"))
+        FAIL("getcwd after chdir ..");
+    else if (stat("null", &st) != 0 || !S_ISCHR(st.st_mode))
+        FAIL("stat(\"null\") in /dev");
+    else
+        PASS();
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1154,6 +1286,8 @@ int main(void)
     check_tree_contract();
     check_slurp_reads_whole_files();
     int ndev = check_devices();
+    check_node_dotdot_relative();
+    check_dotdot_leaves_bus();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.
