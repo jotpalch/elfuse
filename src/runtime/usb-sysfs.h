@@ -75,6 +75,18 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
                                  char *out,
                                  size_t outsz);
 
+/* Rewrite a /dev/bus name whose '..' climb above /dev/bus, popping only
+ * directories the layer serves, to the name under /dev it lands on, the rest
+ * kept as written, and again while that name climbs out of /dev/bus. A backing
+ * without /dev/bus, the macOS host's, cannot apply those '..'; a walk through
+ * any other name is left to the backing.
+ *
+ * Returns true with @out filled, or false when nothing is rewritten.
+ */
+bool usb_dev_resolve_guest_path(const char *guest_path,
+                                char *out,
+                                size_t outsz);
+
 /* Malloc'd copy of the usbfs descriptors blob (18-byte little-endian device
  * descriptor followed by every raw configuration descriptor in index order) for
  * the device at busnum/devnum. This is the exact byte sequence read() returns

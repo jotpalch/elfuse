@@ -632,8 +632,8 @@ int path_translate_at(guest_fd_t dirfd,
      * syscall shares, so no filesystem is handed them. The intercepts match
      * literal prefixes, here and behind this function, so the name is folded
      * here once rather than by each of them. A relative name needs nothing: the
-     * two resolvers above fold what they join, and what they decline goes to
-     * the host as written.
+     * two resolvers above hand back an absolute name, which this block folds,
+     * and what they decline goes to the host as written.
      */
     if (tx->guest_path[0] == '/' && path_has_foldable(tx->guest_path)) {
         char *folded =
@@ -668,6 +668,19 @@ int path_translate_at(guest_fd_t dirfd,
         char resolved[LINUX_PATH_MAX];
         if (usb_sysfs_resolve_guest_path(tx->guest_path, resolved,
                                          sizeof(resolved)) == 1) {
+            str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
+            tx->guest_path = tx->guest_buf;
+            tx->intercept_path = tx->guest_buf;
+        }
+    }
+
+    /* A /dev/bus name whose '..' leave it is rewritten the same way, so the
+     * absolute spelling and one joined to a cwd or dirfd there land together.
+     */
+    if (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
+        char resolved[LINUX_PATH_MAX];
+        if (usb_dev_resolve_guest_path(tx->guest_path, resolved,
+                                       sizeof(resolved))) {
             str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
             tx->guest_path = tx->guest_buf;
             tx->intercept_path = tx->guest_buf;
@@ -1352,6 +1365,38 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
     return true;
 }
 
+/* Rebuild @path against the guest directory @base as an absolute guest path.
+ * Under /dev/bus the name is joined as written: the USB layer folds it and
+ * stops at a '..' after a usbfs node, which a lexical fold here would pop.
+ * Elsewhere the components are folded.
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG.
+ */
+static int path_rebuild_under(const char *base,
+                              const char *path,
+                              char *out,
+                              size_t outsz)
+{
+    if (path_prefix_match(base, "/dev/bus", 8)) {
+        int n = snprintf(out, outsz, "%s/%s", base, path);
+        if (n < 0 || (size_t) n >= outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 0;
+    }
+    size_t marks[PROC_PATH_COMPONENTS_MAX];
+    size_t depth;
+    if (proc_seed_absolute_path(base, out, outsz, marks, ARRAY_SIZE(marks),
+                                &depth) < 0 ||
+        proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
+                              &depth) < 0) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
 int resolve_proc_dirfd_path(guest_fd_t dirfd,
                             const char *path,
                             char *out,
@@ -1387,16 +1432,8 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
         return -1;
     }
 
-    size_t marks[PROC_PATH_COMPONENTS_MAX];
-    size_t depth;
-    if (proc_seed_absolute_path(snap.proc_path, out, outsz, marks,
-                                ARRAY_SIZE(marks), &depth) < 0 ||
-        proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
-                              &depth) < 0) {
-        errno = ENAMETOOLONG;
+    if (path_rebuild_under(snap.proc_path, path, out, outsz) < 0)
         return -1;
-    }
-
     return 1;
 }
 
@@ -1414,24 +1451,12 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * relative path measured against one has to be rebuilt as a guest path and
      * re-offered to the intercepts. Without the /sys and /dev/bus arms a cwd
      * set by fchdir() onto a synthetic USB directory would resolve relative
-     * names straight against the scratch tree. The component walk below is
-     * base-agnostic.
+     * names straight against the scratch tree.
      */
     int rc = 0;
     if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
-        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8)) {
-        size_t marks[PROC_PATH_COMPONENTS_MAX];
-        size_t depth;
-        if (proc_seed_absolute_path(view.path, out, outsz, marks,
-                                    ARRAY_SIZE(marks), &depth) < 0 ||
-            proc_apply_components(path, out, outsz, marks, ARRAY_SIZE(marks),
-                                  &depth) < 0) {
-            errno = ENAMETOOLONG;
-            rc = -1;
-        } else {
-            rc = 1;
-        }
-    }
+        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8))
+        rc = path_rebuild_under(view.path, path, out, outsz) < 0 ? -1 : 1;
 
     proc_release_cwd_view(&view);
     return rc;
@@ -1462,6 +1487,9 @@ int resolve_proc_at_path(guest_fd_t dirfd,
  * into a synthetic subtree the host does not carry: the host openat fails
  * ENOENT even though the guest path is served by an intercept. Callers rebase
  * on that failure and re-offer the absolute path to the intercept gates.
+ *
+ * A name that lands under /dev/bus is returned as joined, unfolded, so the USB
+ * layer's fold sees a '..' after a usbfs node.
  *
  * Returns 1 with out filled, 0 when the descriptor's path cannot be mapped (not
  * an error: the caller keeps the host result).
@@ -1505,6 +1533,11 @@ int path_rebase_hostdirfd(int host_dirfd,
         proc_apply_components(rel, out, outsz, marks, ARRAY_SIZE(marks),
                               &depth) < 0)
         return 0;
+    if (path_prefix_match(out, "/dev/bus", 8)) {
+        int n = snprintf(out, outsz, "%s/%s", guest_dir, rel);
+        if (n < 0 || (size_t) n >= outsz)
+            return 0;
+    }
     return 1;
 }
 

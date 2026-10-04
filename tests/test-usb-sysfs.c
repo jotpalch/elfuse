@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Code under test: src/runtime/usb-sysfs.c, plus the sysfs statfs arms in
- * src/syscall/fs-stat.c.
+ * src/syscall/fs-stat.c and the /dev/bus joins and rewrite in
+ * src/syscall/path.c.
  *
  * Two halves. The first asserts what holds with no USB device attached at all:
  * SYSFS_MAGIC from statfs and fstatfs alike, the read-only open contract, and
@@ -1147,6 +1148,103 @@ static int check_devices(void)
     return ndev;
 }
 
+/* A '..' after a usbfs node is ENOTDIR however the name is reached: spelled in
+ * full, relative to a descriptor on the bus directory or on the host's /dev, or
+ * relative to a cwd there, which chdir and fchdir publish through different
+ * code.
+ */
+static void check_node_dotdot_relative(void)
+{
+    struct stat st;
+    int dfd = open("/dev/bus/usb/001", O_RDONLY | O_DIRECTORY);
+    TEST("a '..' after a usbfs node is ENOTDIR relative to a dirfd");
+    if (dfd < 0) {
+        FAIL("open /dev/bus/usb/001");
+        return;
+    }
+    EXPECT_ERRNO(fstatat(dfd, "001/..", &st, 0), ENOTDIR,
+                 "fstatat(/dev/bus/usb/001, \"001/..\")");
+
+    TEST("a '..' after a usbfs node is ENOTDIR relative to a chdir cwd");
+    if (chdir("/dev/bus/usb/001") != 0)
+        FAIL("chdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+
+    TEST("a '..' after a usbfs node is ENOTDIR relative to a fchdir cwd");
+    if (chdir("/") != 0 || fchdir(dfd) != 0)
+        FAIL("fchdir /dev/bus/usb/001");
+    else
+        EXPECT_ERRNO(stat("001/..", &st), ENOTDIR, "stat(\"001/..\")");
+    close(dfd);
+
+    TEST("a '..' after a node used as a directory is ENOTDIR");
+    EXPECT_ERRNO(stat("/dev/bus/usb/001/001/x/..", &st), ENOTDIR,
+                 "stat(\"/dev/bus/usb/001/001/x/..\")");
+
+    /* openat retries a name the host refuses from a host directory, here /dev,
+     * through the absolute path, which must not fold the node away.
+     */
+    TEST("a '..' after a usbfs node is ENOTDIR relative to a /dev dirfd");
+    int hfd = open("/dev", O_RDONLY | O_DIRECTORY);
+    if (hfd < 0) {
+        FAIL("open /dev");
+    } else {
+        EXPECT_ERRNO(openat(hfd, "bus/usb/001/001/..", O_RDONLY | O_DIRECTORY),
+                     ENOTDIR, "openat(/dev, \"bus/usb/001/001/..\")");
+        close(hfd);
+    }
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+}
+
+/* A '..' out of /dev/bus lands in /dev however the name is reached. */
+static void check_dotdot_leaves_bus(void)
+{
+    struct stat st;
+    char cwd[64];
+
+    TEST("/dev/bus/../null is /dev/null");
+    if (stat("/dev/bus/../null", &st) == 0 && S_ISCHR(st.st_mode))
+        PASS();
+    else
+        FAIL("stat(\"/dev/bus/../null\")");
+
+    TEST("/dev/bus/../bus/../null is /dev/null");
+    if (stat("/dev/bus/../bus/../null", &st) == 0 && S_ISCHR(st.st_mode))
+        PASS();
+    else
+        FAIL("stat(\"/dev/bus/../bus/../null\")");
+
+    TEST("a '..' out through a bus no device has is ENOENT");
+    EXPECT_ERRNO(stat("/dev/bus/usb/099/../../../null", &st), ENOENT,
+                 "stat(\"/dev/bus/usb/099/../../../null\")");
+
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    TEST("../null relative to a /dev/bus dirfd");
+    if (dfd < 0) {
+        FAIL("open /dev/bus");
+        return;
+    }
+    if (fstatat(dfd, "../null", &st, 0) == 0 && S_ISCHR(st.st_mode))
+        PASS();
+    else
+        FAIL("fstatat(/dev/bus, \"../null\")");
+    close(dfd);
+
+    TEST("chdir .. from /dev/bus reaches /dev");
+    if (chdir("/dev/bus") != 0 || chdir("..") != 0)
+        FAIL("chdir /dev/bus, then ..");
+    else if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/dev"))
+        FAIL("getcwd after chdir ..");
+    else if (stat("null", &st) != 0 || !S_ISCHR(st.st_mode))
+        FAIL("stat(\"null\") in /dev");
+    else
+        PASS();
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1154,6 +1252,8 @@ int main(void)
     check_tree_contract();
     check_slurp_reads_whole_files();
     int ndev = check_devices();
+    check_node_dotdot_relative();
+    check_dotdot_leaves_bus();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.

@@ -1677,15 +1677,20 @@ and then fails to serve is an answer, not a fall-through: taking the failure
 for one let `access(2)`, and then `statfs(2)`, answer from the backing while
 `open` and `stat` reported `ENOENT` for the same path.
 
-`.` and `..` are folded lexically before ownership is decided, on both halves.
-The fold is the ours/not-ours gate and nothing else -- the served path is built
-by `usb_sys_resolve_suffix`, which resolves symlinks and applies each `..` to
-what the previous component resolved to, the way the kernel does, so
-`<dev>/subsystem/..` names `/sys/bus`. Deciding ownership on the guest's
-spelling instead splits the two halves apart in both directions:
+`.` and `..` are folded before ownership is decided, on both halves. On `/sys`
+the fold is lexical and is the ours/not-ours gate and nothing else: the served
+path is built by `usb_sys_resolve_suffix`, which resolves symlinks and applies
+each `..` to what the previous component resolved to, the way the kernel does,
+so `<dev>/subsystem/..` names `/sys/bus`. On `/dev/bus` a `..` after a usbfs
+node is not applied, since the kernel applies `..` only to a directory, and the
+name answers `ENOTDIR` once the node exists. Deciding ownership on the unfolded
+spelling splits the two halves apart in both directions:
 `/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
 and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
-A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
+A suffix that folds away above its own root leaves as `USB_PATH_NONE`. A
+`/dev/bus` name that leaves that way over the layer's own directories is first
+rewritten in the path layer to the name it lands on, since a backing without
+`/dev/bus` cannot walk the `..`.
 
 ### Filesystem Identity Of A Descriptor
 
