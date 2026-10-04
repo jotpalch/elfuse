@@ -32,11 +32,11 @@
  * against that cwd still reaches the synthetic attributes.
  *
  * F3: the same ownership question for the alias names in /dev. The lane's
- * sysroot carries a regular file at /dev/ttyACM7 and /dev/ttyUSB9, alias-shaped
- * names with no device behind them, and every entry point has to reach them.
- * Listing and lookup are asserted together, absolutely, through a dirfd and
- * through a cwd, and a '..' after the sysroot's /dev/sub lands on the served
- * /dev.
+ * sysroot carries a regular file at /dev/ttyACM7 and /dev/ttyUSB9 and a foreign
+ * link in /dev/serial/by-id, alias-shaped names with no device behind them, and
+ * every entry point has to reach them. Listing and lookup are asserted
+ * together, absolutely, through a dirfd and through a cwd, and a '..' after the
+ * sysroot's /dev/sub lands on the served /dev.
  */
 
 #include <dirent.h>
@@ -44,10 +44,12 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -83,6 +85,53 @@ static bool dir_has_entry(const char *dir, const char *name)
         }
     }
     closedir(d);
+    return found;
+}
+
+/* Read one attribute of the USB device an alias hangs off. The device link
+ * lands on the interface dir for ttyACM and one level deeper for ttyUSB, so
+ * both spellings are tried; the walk itself is the thing under test in the /sys
+ * assertions above.
+ */
+static ssize_t alias_dev_attr(const char *alias,
+                              const char *attr,
+                              char *buf,
+                              size_t bufsz)
+{
+    char p[512];
+    snprintf(p, sizeof(p), "/sys/class/tty/%s/device/../%s", alias, attr);
+    ssize_t n = read_file(p, buf, bufsz);
+    if (n >= 0)
+        return n;
+    snprintf(p, sizeof(p), "/sys/class/tty/%s/device/../../%s", alias, attr);
+    return read_file(p, buf, bufsz);
+}
+
+/* Whether a by-id leaf names @alias; @leaf receives it. */
+static bool byid_link_for(const char *alias, char *leaf, size_t leafsz)
+{
+    DIR *dp = opendir("/dev/serial/by-id");
+    if (!dp)
+        return false;
+    char want[64];
+    snprintf(want, sizeof(want), "../../%s", alias);
+    bool found = false;
+    struct dirent *e;
+    while (!found && (e = readdir(dp))) {
+        if (strncmp(e->d_name, "usb-", 4))
+            continue;
+        char full[512], tgt[128];
+        snprintf(full, sizeof(full), "/dev/serial/by-id/%s", e->d_name);
+        ssize_t n = readlink(full, tgt, sizeof(tgt) - 1);
+        if (n <= 0)
+            continue;
+        tgt[n] = '\0';
+        if (strcmp(tgt, want))
+            continue;
+        snprintf(leaf, leafsz, "%s", e->d_name);
+        found = true;
+    }
+    closedir(dp);
     return found;
 }
 
@@ -316,6 +365,20 @@ int main(void)
     EXPECT_ERRNO(open("/dev/ttyACM31", O_RDONLY), ENOENT,
                  "an unserved, unbacked alias name should be ENOENT");
 
+    TEST("a foreign by-id entry reaches the sysroot's own link");
+    {
+        char tgt[128];
+        ssize_t n = readlink("/dev/serial/by-id/usb-Planted_Link-if00", tgt,
+                             sizeof(tgt) - 1);
+        if (n <= 0) {
+            FAIL("readlink the sysroot's own by-id entry");
+        } else {
+            tgt[n] = '\0';
+            EXPECT_TRUE(strcmp(tgt, "../../ttyACM7") == 0,
+                        "wrong target for the sysroot's by-id entry");
+        }
+    }
+
     /* Every listed name resolves, and a relative spelling through a descriptor
      * or a cwd (chdir and fchdir both) reaches what the absolute one does.
      */
@@ -335,7 +398,7 @@ int main(void)
             while ((e = readdir(dp))) {
                 if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
                     continue;
-                if (strncmp(e->d_name, "tty", 3))
+                if (strncmp(e->d_name, "tty", 3) && strcmp(e->d_name, "serial"))
                     continue;
                 for (size_t i = 0; i < nwant; i++)
                     seen[i] |= !strcmp(e->d_name, want[i]);
@@ -419,6 +482,181 @@ int main(void)
                     "getcwd after chdir(/dev/sub/..)");
         if (chdir("/") != 0)
             FAIL("chdir back to /");
+    }
+
+    TEST("every name /dev/serial/by-id lists is reachable");
+    {
+        DIR *dp = opendir("/dev/serial/by-id");
+        char bad[256];
+        bool planted = false;
+        bad[0] = '\0';
+        if (!dp) {
+            FAIL("opendir /dev/serial/by-id");
+        } else {
+            struct dirent *e;
+            while ((e = readdir(dp))) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                    continue;
+                planted |= !strcmp(e->d_name, "usb-Planted_Link-if00");
+                char full[512], tgt[128];
+                snprintf(full, sizeof(full), "/dev/serial/by-id/%s", e->d_name);
+                struct stat st;
+                if (lstat(full, &st) != 0 ||
+                    readlink(full, tgt, sizeof(tgt) - 1) <= 0) {
+                    snprintf(bad, sizeof(bad), "%s listed but not resolvable",
+                             e->d_name);
+                    break;
+                }
+            }
+            closedir(dp);
+            if (!bad[0] && !planted)
+                snprintf(bad, sizeof(bad), "usb-Planted_Link-if00 not listed");
+            if (bad[0])
+                FAIL(bad);
+            else
+                PASS();
+        }
+    }
+
+    /* A by-id leaf is a symlink to lstat and readlink, the character device to
+     * stat and fstat, and ELOOP to O_NOFOLLOW, as on Linux.
+     */
+    {
+        DIR *dp = opendir("/sys/class/tty");
+        int seen = 0;
+        bool longdev = false;
+        struct dirent *e;
+        while (dp && (e = readdir(dp))) {
+            if (strncmp(e->d_name, "ttyACM", 6) &&
+                strncmp(e->d_name, "ttyUSB", 6))
+                continue;
+
+            char leaf[256], link[512], node[128], why[512];
+            char man[256], prod[256];
+            ssize_t mn =
+                alias_dev_attr(e->d_name, "manufacturer", man, sizeof(man));
+            ssize_t pn =
+                alias_dev_attr(e->d_name, "product", prod, sizeof(prod));
+            bool have = byid_link_for(e->d_name, leaf, sizeof(leaf));
+
+            /* usb_id cuts the manufacturer and product strings to 63 bytes each
+             * and drops a serial number holding a comma (systemd
+             * src/udev/udev-builtin-usb_id.c), and 60-serial.rules appends
+             * -ifNN, so an over-long pair still gets a link. The byidlong
+             * device's serial is "A,1".
+             */
+            if (mn > 100 && pn > 100) {
+                longdev = true;
+                char want[200];
+                man[strcspn(man, "\n")] = '\0';
+                prod[strcspn(prod, "\n")] = '\0';
+                snprintf(want, sizeof(want), "usb-%.63s_%.63s-if00", man, prod);
+                TEST("a manufacturer string past 127 bytes reads whole");
+                EXPECT_TRUE(strlen(man) > 127, e->d_name);
+                TEST(
+                    "an over-long by-id leaf has its strings cut as udev cuts");
+                snprintf(why, sizeof(why), "%s: want %s, link %s", e->d_name,
+                         want, have ? leaf : "(none)");
+                EXPECT_TRUE(have && !strcmp(leaf, want), why);
+                continue;
+            }
+
+            /* A leaf past NAME_MAX gets no link, whatever APFS would hold: the
+             * byidlong device whose serial is 120 bytes. The listing drops such
+             * a name anyway, so the lookup is what is asked.
+             */
+            char ser[256];
+            if (alias_dev_attr(e->d_name, "serial", ser, sizeof(ser)) > 120) {
+                char lp[640];
+                struct stat lst;
+                man[strcspn(man, "\n")] = '\0';
+                prod[strcspn(prod, "\n")] = '\0';
+                ser[strcspn(ser, "\n")] = '\0';
+                snprintf(lp, sizeof(lp), "/dev/serial/by-id/usb-%s_%s_%s-if00",
+                         man, prod, ser);
+                TEST("a by-id leaf past 255 bytes gets no link");
+                EXPECT_TRUE(!have && lstat(lp, &lst) != 0, e->d_name);
+                continue;
+            }
+            if (!have) {
+                TEST("every alias has a by-id link");
+                snprintf(why, sizeof(why), "%s has none", e->d_name);
+                FAIL(why);
+                continue;
+            }
+            seen++;
+            snprintf(link, sizeof(link), "/dev/serial/by-id/%s", leaf);
+            snprintf(node, sizeof(node), "/dev/%s", e->d_name);
+
+            struct stat lst, bst, ast;
+            TEST("lstat of a by-id leaf reports the link");
+            EXPECT_TRUE(lstat(link, &lst) == 0 && S_ISLNK(lst.st_mode), leaf);
+
+            TEST("stat of a by-id leaf reports the alias character device");
+            int rb = stat(link, &bst), ra = stat(node, &ast);
+            snprintf(why, sizeof(why), "%s: stat %s", leaf,
+                     rb == 0 ? "ok" : strerror(errno));
+            EXPECT_TRUE(rb == 0 && ra == 0 && S_ISCHR(bst.st_mode) &&
+                            bst.st_rdev == ast.st_rdev &&
+                            bst.st_ino == ast.st_ino,
+                        why);
+
+            TEST("a by-id fd fstats as the alias node, not the host tty");
+            int fd = open(link, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+            if (fd < 0) {
+                snprintf(why, sizeof(why), "%s: %s", leaf, strerror(errno));
+                FAIL(why);
+            } else {
+                struct stat fst;
+                int rc = fstat(fd, &fst);
+                snprintf(why, sizeof(why),
+                         "%s: node rdev %u:%u, by-id fd rdev %u:%u", leaf,
+                         (unsigned) major(ast.st_rdev),
+                         (unsigned) minor(ast.st_rdev),
+                         (unsigned) major(fst.st_rdev),
+                         (unsigned) minor(fst.st_rdev));
+                EXPECT_TRUE(rc == 0 && S_ISCHR(fst.st_mode) &&
+                                fst.st_rdev == ast.st_rdev &&
+                                fst.st_ino == ast.st_ino,
+                            why);
+                close(fd);
+            }
+
+            TEST("O_NOFOLLOW on a by-id leaf is ELOOP");
+            int nf = open(link, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+            int nferr = errno;
+            snprintf(why, sizeof(why), "%s: %s", leaf,
+                     nf >= 0 ? "opened" : strerror(nferr));
+            EXPECT_TRUE(nf < 0 && nferr == ELOOP, why);
+            if (nf >= 0)
+                close(nf);
+
+            /* fs/namei.c do_open answers EEXIST and ENOTDIR before may_open
+             * answers ELOOP for the symlink.
+             */
+            TEST("O_DIRECTORY and O_CREAT|O_EXCL win over ELOOP on a leaf");
+            int dn = open(link, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+            int dnerr = errno;
+            int xn = open(link, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+            int xnerr = errno;
+            snprintf(why, sizeof(why), "%s: O_DIRECTORY %s, O_CREAT|O_EXCL %s",
+                     leaf, dn >= 0 ? "opened" : strerror(dnerr),
+                     xn >= 0 ? "opened" : strerror(xnerr));
+            EXPECT_TRUE(dn < 0 && dnerr == ENOTDIR && xn < 0 && xnerr == EEXIST,
+                        why);
+            if (dn >= 0)
+                close(dn);
+            if (xn >= 0)
+                close(xn);
+        }
+        if (dp)
+            closedir(dp);
+        printf("  by-id links examined: %d\n", seen);
+        const char *fixture = getenv("ELFUSE_USB_FIXTURE");
+        TEST("the by-id links examined include the fixture's");
+        EXPECT_TRUE(
+            seen > 0 && (!fixture || strcmp(fixture, "byidlong") || longdev),
+            "no by-id link examined, or no long-string device");
     }
 
     SUMMARY("test-usb-sysfs-sysroot");

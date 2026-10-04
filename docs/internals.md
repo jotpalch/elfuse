@@ -1653,10 +1653,10 @@ Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 
 The layer synthesizes `/sys/bus/usb`, `/sys/class/tty`, `/sys/bus/usb-serial`
 and `/dev/bus/usb` on top of a `/sys` and a `/dev` that a sysroot supplies, and
-adds the serial alias names `ttyACM<n>` and `ttyUSB<n>` to `/dev`. Which side
-answers a name is one decision, taken once in `classify_and_normalize`, and
-every entry point (`open`, `stat`, `lstat`, `readlink`, `access`, `getdents64`,
-`statfs`, `chdir`) answers from it.
+adds the serial alias names `ttyACM<n>` and `ttyUSB<n>` to `/dev` and the
+leaves of `/dev/serial/by-id`. Which side answers a name is one decision, taken
+once in `classify_and_normalize`, and every entry point (`open`, `stat`,
+`lstat`, `readlink`, `access`, `getdents64`, `statfs`, `chdir`) answers from it.
 An entry point that re-derives the decision is how four regressions arrived,
 each one a shadow: the layer claiming a name it does not serve and reporting
 `ENOENT` for a file the sysroot really has.
@@ -1675,14 +1675,17 @@ The classes and who answers them:
 | `USB_PATH_DEV_FOREIGN` | under `/dev/bus`, a bus we do not model | the backing |
 | `USB_PATH_TTY` | `/dev/ttyACM<n>`, `/dev/ttyUSB<n>` | the layer when the alias exists; otherwise the backing |
 | `USB_PATH_TTY_SUB` | an alias used as a directory | the layer (`ENOTDIR`) when the alias exists; otherwise the backing |
-| `USB_PATH_DEV_ROOT` | `/dev` | the layer, listing the union with the backing, while an alias exists; otherwise the backing |
+| `USB_PATH_BYID` | `/dev/serial/by-id/<leaf>` | the layer when the leaf is one of ours; otherwise the backing |
+| `USB_PATH_BYID_SUB` | a leaf used as a directory | the layer (`ENOTDIR`) when the leaf is one of ours; otherwise the backing |
+| `USB_PATH_DEV_ROOT`, `USB_PATH_SERIAL_DIR`, `USB_PATH_BYID_DIR` | `/dev`, `/dev/serial`, `/dev/serial/by-id` | the layer, listing the union with the backing, while an alias exists; otherwise the backing |
 | `USB_PATH_NONE` | anything else, and a name that folds above its root | the backing |
 
-Unlike `/dev/bus/usb`, `/dev` is the sysroot's directory, so an absence there
-is never authoritative: an alias-shaped name with no alias behind it, such as a
-rootfs image's own `/dev/ttyUSB0`, is the backing's. Nothing is written into
-the sysroot; the alias names live in a scratch directory and are listed as a
-union, the way `/dev/bus` is.
+Unlike `/dev/bus/usb`, `/dev`, `/dev/serial` and `/dev/serial/by-id` are the
+sysroot's directories, so an absence there is never authoritative: an
+alias-shaped name with no alias behind it, such as a rootfs image's own
+`/dev/ttyUSB0`, is the backing's. Nothing is written into the sysroot; the alias
+names live in a scratch directory and are listed as a union, the way `/dev/bus`
+is.
 
 Mutating entry points are not modeled for the alias names. `unlink`, `rename`
 and `chmod` reach the backing: they answer `ENOENT` where it lacks the name,
@@ -1699,20 +1702,20 @@ the fold is lexical and is the ours/not-ours gate and nothing else: the served
 path is built by `usb_sys_resolve_suffix`, which resolves symlinks and applies
 each `..` to what the previous component resolved to, the way the kernel does,
 so `<dev>/subsystem/..` names `/sys/bus`. On `/dev` the fold starts at `/dev`,
-so the alias names fold too. After an alias node, a usbfs node or a malformed
-usb name a `..` answers `ENOTDIR` or `ENOENT`, as the kernel does. After a name
-of the backing's it pops only what the backing has as a directory, and otherwise
-the whole path is the backing's, so `/dev/null/..` stays `ENOTDIR`. A bus
-directory is popped without asking whether the bus exists, since the model may
-not be built yet, so `/dev/bus/usb/009/../001/001` serves the node where the
-kernel answers `ENOENT`. Deciding ownership on the unfolded spelling splits the
-two halves apart in both directions: `/dev/bus/usb/../other/f` reads as a
-malformed device number and is claimed, and `/dev/bus/other/../usb/001/002`
-reads as a foreign bus and is disowned. A suffix that folds away above its own
-root leaves as `USB_PATH_NONE`. A `/dev` name whose `..` pop only the layer's
-own directories, or `/dev` itself, is first rewritten in the path layer to the
-name it lands on, since a backing without those directories cannot walk the
-`..`.
+so the alias names fold too. After an alias node, a by-id leaf, a usbfs node or
+a malformed usb name a `..` answers `ENOTDIR` or `ENOENT`, as the kernel does.
+After a name of the backing's it pops only what the backing has as a directory,
+and otherwise the whole path is the backing's, so `/dev/null/..` stays
+`ENOTDIR`. A bus directory is popped without asking whether the bus exists,
+since the model may not be built yet, so `/dev/bus/usb/009/../001/001` serves
+the node where the kernel answers `ENOENT`. Deciding ownership on the unfolded
+spelling splits the two halves apart in both directions:
+`/dev/bus/usb/../other/f` reads as a malformed device number and is claimed, and
+`/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned. A suffix
+that folds away above its own root leaves as `USB_PATH_NONE`. A `/dev` name
+whose `..` pop only the layer's own directories, or `/dev` itself, is first
+rewritten in the path layer to the name it lands on, since a backing without
+those directories cannot walk the `..`.
 
 ### Filesystem Identity Of A Descriptor
 
@@ -1729,7 +1732,11 @@ The rules:
   `/tmp` filesystem's magic, and the ones that fell through to a sysroot's own
   `/sys`, where it would leak the sysroot's.
 - `/dev/bus` reports devtmpfs, on both entry points, and so do the serial
-  alias nodes and `/dev` while it is served.
+  alias nodes and their directories while they are served.
+- A by-id descriptor is stamped with the alias node it resolves to, since the
+  stamp holds 63 bytes and a leaf can be longer. An `O_PATH|O_NOFOLLOW` open of
+  a leaf therefore `fstat`s as the character device where Linux reports the
+  link; the matrix lane carries it as an XFAIL.
 - `..` is folded and a relative name is resolved against the cwd before either
   entry point decides, so the two cannot be handed different spellings of one
   object.

@@ -156,8 +156,8 @@ static int write_linux_statx(guest_t *g,
 /* Whether a descriptor's identity comes from the stamp rather than from the
  * host object underneath it: O_PATH, /sys and /dev/bus do, /proc does not. See
  * docs/internals.md, "Filesystem Identity Of A Descriptor", for why. A serial
- * alias node and a served /dev do too: their host fds are on the macOS cu.*
- * node and on a scratch directory.
+ * alias node and a served /dev, /dev/serial or /dev/serial/by-id do too: their
+ * host fds are on the macOS cu.* node and on a scratch directory.
  */
 static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
 {

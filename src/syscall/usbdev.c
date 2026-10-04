@@ -548,7 +548,7 @@ typedef struct usbdev {
     int busnum, devnum;
     uint32_t location_id;
     unsigned vid, pid; /* modeled identity, re-checked at every lookup */
-    char serial[128];
+    char serial[USB_STRING_MAX];
     unsigned speed_code; /* raw registry 'Device Speed' */
     unsigned cfg_value;  /* active bConfigurationValue */
     uint8_t *blob;       /* usbfs descriptors blob (read() source) */
@@ -947,7 +947,7 @@ static bool usbdev_identity_matches(io_service_t svc,
      * the key made the first lookup unmatchable, so only the fallback ever did
      * anything. One lookup, one spelling.
      */
-    char serial[128] = "";
+    char serial[USB_STRING_MAX] = "";
     (void) usbdev_ioreg_str(svc, "USB Serial Number", serial, sizeof(serial));
     return strcmp(serial, want_serial) == 0;
 }

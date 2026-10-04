@@ -1317,8 +1317,8 @@ static void check_alias_node(const char *name, bool acm)
 
 /* /dev while an alias makes the layer serve it: one identity through stat and
  * through a descriptor, a '..' after a node that is ENOTDIR from a descriptor
- * and from a cwd there, and a cwd reached through /dev/bus/.. that getcwd names
- * /dev.
+ * and from a cwd there, a '..' out of /dev/serial/by-id that lands in /dev, and
+ * a cwd reached through /dev/bus/.. that getcwd names /dev.
  */
 static void check_served_dev(const char *alias)
 {
@@ -1360,6 +1360,11 @@ static void check_served_dev(const char *alias)
         EXPECT_TRUE(a < 0 && ae == ENOTDIR && n < 0 && ne == ENOTDIR,
                     "alias/.. or null/.. from /dev was not ENOTDIR");
     }
+
+    TEST("a '..' out of /dev/serial/by-id lands in /dev");
+    EXPECT_TRUE(
+        stat("/dev/serial/by-id/../../null", &ps) == 0 && S_ISCHR(ps.st_mode),
+        "stat(/dev/serial/by-id/../../null)");
 
     TEST("a cwd reached through /dev/bus/.. is /dev");
     EXPECT_TRUE(chdir("/dev/bus/..") == 0 && getcwd(cwd, sizeof(cwd)) &&
@@ -1533,6 +1538,38 @@ static void report_alias_divergences(const char *classdir, const char *alias)
             (unsigned long long) flat.st_ino);
 }
 
+/* A leaf past NAME_MAX gets no link: the byidlong device whose 120-byte serial
+ * makes its leaf 257 bytes of 173 characters, which APFS would store. Without a
+ * sysroot nothing else refuses the name, so the lookup reaches the layer.
+ */
+static void check_byid_name_max(void)
+{
+    DIR *dp = opendir("/sys/class/tty");
+    struct dirent *e;
+    bool found = false;
+    while (dp && (e = readdir(dp))) {
+        char dev[300], man[256], prod[256], ser[256], lp[900];
+        struct stat st;
+        snprintf(dev, sizeof(dev), "/sys/class/tty/%s/device/..", e->d_name);
+        if (e->d_name[0] == '.' || attr_str(dev, "serial", ser, sizeof(ser)) ||
+            strlen(ser) < 120 ||
+            attr_str(dev, "manufacturer", man, sizeof(man)) ||
+            attr_str(dev, "product", prod, sizeof(prod)))
+            continue;
+        found = true;
+        snprintf(lp, sizeof(lp), "/dev/serial/by-id/usb-%s_%s_%s-if00", man,
+                 prod, ser);
+        TEST("a by-id leaf past 255 bytes gets no link");
+        EXPECT_TRUE(lstat(lp, &st) != 0, e->d_name);
+    }
+    if (dp)
+        closedir(dp);
+    if (!found) {
+        TEST("the byidlong fixture has its 257-byte leaf device");
+        FAIL("no alias with a 120-byte serial");
+    }
+}
+
 /* The aliases /dev lists, which is the union listing under test as well. The
  * default fixture's two devices must be among them.
  *
@@ -1567,14 +1604,52 @@ static int check_tty_aliases(void)
     if (fixture && !strcmp(fixture, "1")) {
         TEST("/dev lists the fixture's ttyACM0 and ttyUSB0");
         EXPECT_TRUE(acm0 && usb0, "a fixture alias is missing from /dev");
-    }
-    if (fixture && !strcmp(fixture, "serial")) {
+
+        /* The CDC device's strings carry spaces, parentheses and a comma, so
+         * its leaf shows the whitespace and character rules udev applies.
+         */
+        static const char leaf[] =
+            "usb-Elfuse_Serial_Port__fixture__long_enough_to_overrun_it__FIX_"
+            "0001-if00";
+        char lp[160], tgt[64];
+        snprintf(lp, sizeof(lp), "/dev/serial/by-id/%s", leaf);
+        ssize_t tn = readlink(lp, tgt, sizeof(tgt) - 1);
+        if (tn >= 0)
+            tgt[tn] = '\0';
+        TEST("the CDC fixture's by-id leaf is the name udev builds");
+        EXPECT_TRUE(tn > 0 && !strcmp(tgt, "../../ttyACM0"), leaf);
+
+        TEST("a '..' after a by-id leaf is ENOTDIR from a by-id cwd");
+        char cwd[64];
         struct stat st;
+        char rel[sizeof(leaf) + 4];
+        snprintf(rel, sizeof(rel), "%s/..", leaf);
+        if (chdir("/dev/serial/by-id") != 0) {
+            FAIL("chdir /dev/serial/by-id");
+        } else {
+            EXPECT_TRUE(getcwd(cwd, sizeof(cwd)) &&
+                            !strcmp(cwd, "/dev/serial/by-id") &&
+                            stat(rel, &st) < 0 && errno == ENOTDIR,
+                        "getcwd, or stat of LEAF/.. from the by-id cwd");
+        }
+        if (chdir("/") != 0)
+            FAIL("chdir back to /");
+    }
+    if (fixture && !strcmp(fixture, "byidlong"))
+        check_byid_name_max();
+    if (fixture && !strcmp(fixture, "serial")) {
+        struct stat st, p0, p1;
         TEST("/dev lists the serial fixture's ttyACM1, ttyUSB1 and ttyUSB2");
         EXPECT_TRUE(stat("/dev/ttyACM1", &st) == 0 &&
                         stat("/dev/ttyUSB1", &st) == 0 &&
                         stat("/dev/ttyUSB2", &st) == 0,
                     "a serial-fixture alias is missing");
+        TEST("a two-port bridge links one by-id leaf per port");
+        EXPECT_TRUE(
+            lstat("/dev/serial/by-id/usb-0403_0101-if00-port0", &p0) == 0 &&
+                lstat("/dev/serial/by-id/usb-0403_0101-if00-port1", &p1) == 0 &&
+                S_ISLNK(p0.st_mode) && S_ISLNK(p1.st_mode),
+            "usb-0403_0101-if00-port0 and -port1");
     }
     return n;
 }

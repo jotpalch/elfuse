@@ -80,7 +80,8 @@ typedef struct {
     unsigned dev_class, dev_subclass, dev_protocol;
     unsigned num_configs, max_packet0, cfg_value, speed_code;
     unsigned i_manufacturer, i_product, i_serial;
-    char manufacturer[128], product[128], serial[128];
+    char manufacturer[USB_STRING_MAX], product[USB_STRING_MAX],
+        serial[USB_STRING_MAX];
     uint8_t *blob; /* device descriptor + raw config descriptors */
     size_t blob_len;
 } usb_dev_t;
@@ -112,10 +113,12 @@ static pid_t usb_owner_pid;
 
 /* Below the 256 minors cdc-acm carries; no host exposes that many callouts. */
 #define USB_TTY_MAX 64
+#define TTY_BYID_MAX 256 /* one name: NAME_MAX and the NUL */
 
 typedef struct {
-    char cu_name[64];    /* "cu.usbmodem1101" */
-    char host_node[136]; /* the node an open of the alias opens */
+    char cu_name[64];        /* "cu.usbmodem1101" */
+    char byid[TTY_BYID_MAX]; /* by-id leaf, "" when there is none */
+    char host_node[136];     /* the node an open of the alias opens */
     bool is_acm;
     int index;      /* minor within its class */
     int dev;        /* index into usb_devs[] */
@@ -355,6 +358,9 @@ typedef struct {
      */
     uint8_t iface_class[4];
 
+    /* String descriptors, NULL for none; the by-id leaf falls back to hex. */
+    const char *manufacturer, *product, *serial;
+
     /* The cu.* node an alias opens, NULL for none, and the number and class of
      * the interface it hangs off. callout2 is a second port on that interface.
      */
@@ -435,6 +441,13 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     d->cfg_value = 1;
     snprintf(d->devpath, sizeof(d->devpath), "%d", s->port);
     snprintf(d->name, sizeof(d->name), "%d-%d", s->busnum, s->port);
+    if (s->manufacturer)
+        str_copy_trunc(d->manufacturer, s->manufacturer,
+                       sizeof(d->manufacturer));
+    if (s->product)
+        str_copy_trunc(d->product, s->product, sizeof(d->product));
+    if (s->serial)
+        str_copy_trunc(d->serial, s->serial, sizeof(d->serial));
 
     unsigned neps = s->neps ? s->neps : 1;
     size_t if_total =
@@ -535,8 +548,13 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
  * interface comes before its control one, so only its Union descriptor names
  * the interface cdc-acm binds, and a bridge with two ports on one interface.
  *
+ * ELFUSE_USB_FIXTURE=byidlong: the default set plus /dev/bus/usb/001/002, whose
+ * manufacturer and product strings are longer than the 63 bytes of each that
+ * udev keeps in a by-id leaf, and whose serial number holds a comma, for which
+ * udev drops it, and /dev/bus/usb/001/004, whose leaf runs past NAME_MAX.
+ *
  * In the default set, bus 1 is a CDC-ACM composite whose callout hangs off the
- * data interface, and bus 2 is a vendor bridge.
+ * data interface, and bus 2 is a string-less vendor bridge.
  */
 static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
 {
@@ -566,6 +584,13 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
             .pid = 0x0002,
             .nifaces = 2,
             .iface_class = {0x02, 0x0a}, /* CDC control, CDC data */
+            .manufacturer = "Elfuse",
+
+            /* Long enough that the by-id path is wider than the 63-byte
+             * descriptor stamp, as the leaf of a device with strings is.
+             */
+            .product = "Serial Port (fixture, long enough to overrun it)",
+            .serial = "FIX 0001",
             .callout = "cu.usbmodemFIX1",
             .callout_ifnum = 1,
             .callout_ifclass = 0x0a, /* CDC data, where macOS hangs it */
@@ -590,6 +615,60 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
                                            .pid = 0x0002,
                                            .nifaces = 1,
                                            .ifnum_base = 200};
+    if (mode && !strcmp(mode, "byidlong") && n < cap) {
+        /* 200 bytes: past the 63 udev keeps, and served whole in sysfs. */
+        static const char longstr[] =
+            "LongVendorNameLongVendorNameLongVendorNameLongVendorNameLongVend"
+            "orNameLongVendorNameLongVendorNameLongVendorNameLongVendorNameLo"
+            "ngVendorNameLongVendorNameLongVendorNameLongVendorNameLongVendor"
+            "NameLong";
+        specs[n++] = (usb_fixture_spec_t) {
+            .busnum = 1,
+            .port = 2,
+            .devnum = 2,
+            .vid = 0x1d6b,
+            .pid = 0x0003,
+            .nifaces = 1,
+            .iface_class = {0x02},
+            .manufacturer = longstr,
+            .product = longstr,
+            .serial = "A,1",
+            .callout = "cu.usbmodemFIX3",
+            .callout_ifnum = 0,
+            .callout_ifclass = 0x02,
+        };
+
+        /* 21 three-byte characters each and a 120-byte serial: a 257-byte leaf
+         * of 173 characters, which APFS would store and Linux refuses.
+         */
+        static const char cjk[] =
+            "\xe6\x97\xa5\xe6\x97\xa5\xe6\x97\xa5"
+            "\xe6\x97\xa5\xe6\x97\xa5\xe6\x97\xa5"
+            "\xe6\x97\xa5\xe6\x97\xa5\xe6\x97\xa5"
+            "\xe6\x97\xa5\xe6\x97\xa5\xe6\x97\xa5"
+            "\xe6\x97\xa5\xe6\x97\xa5\xe6\x97\xa5"
+            "\xe6\x97\xa5\xe6\x97\xa5\xe6\x97\xa5"
+            "\xe6\x97\xa5\xe6\x97\xa5\xe6\x97\xa5";
+        static const char longserial[] =
+            "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS"
+            "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS";
+        if (n < cap)
+            specs[n++] = (usb_fixture_spec_t) {
+                .busnum = 1,
+                .port = 4,
+                .devnum = 4,
+                .vid = 0x1d6b,
+                .pid = 0x0004,
+                .nifaces = 1,
+                .iface_class = {0x02},
+                .manufacturer = cjk,
+                .product = cjk,
+                .serial = longserial,
+                .callout = "cu.usbmodemFIX5",
+                .callout_ifnum = 0,
+                .callout_ifclass = 0x02,
+            };
+    }
     if (mode && !strcmp(mode, "loopback") && n < cap)
         specs[n++] = (usb_fixture_spec_t) {
             .busnum = USB_FIXTURE_LOOPBACK_BUS,
@@ -945,6 +1024,151 @@ static unsigned tty_linux_ifnum(const usb_dev_t *d,
     return best >= 0 ? (unsigned) best : iokit_ifnum;
 }
 
+/* udev_replace_whitespace (systemd src/shared/udev-util.c): reads at most @len
+ * bytes of @str, drops leading and trailing whitespace and turns each inner run
+ * into one '_'. @to holds @len + 1 bytes.
+ */
+static void byid_replace_whitespace(const char *str, char *to, size_t len)
+{
+    size_t i = 0, j = 0;
+    bool space = false;
+    while (i < len && str[i] && strchr(" \t\n\r", str[i]))
+        i++;
+    for (; j < len && i < len && str[i]; i++) {
+        if (isspace((unsigned char) str[i])) {
+            space = true;
+            continue;
+        }
+        if (space) {
+            if (j + 1 >= len)
+                break;
+            to[j++] = '_';
+            space = false;
+        }
+        to[j++] = str[i];
+    }
+    to[j] = '\0';
+}
+
+/* The length of the valid UTF-8 sequence at @s as utf8_encoded_valid_unichar
+ * (systemd src/basic/utf8.c) measures it, or 0: the shortest encoding of a code
+ * point below 0x110000 that is not a surrogate, U+FDD0 to U+FDEF, or one of the
+ * U+xFFFE and U+xFFFF pair.
+ */
+static size_t byid_utf8_len(const unsigned char *s)
+{
+    size_t len = s[0] < 0x80             ? 1
+                 : (s[0] & 0xe0) == 0xc0 ? 2
+                 : (s[0] & 0xf0) == 0xe0 ? 3
+                 : (s[0] & 0xf8) == 0xf0 ? 4
+                 : (s[0] & 0xfc) == 0xf8 ? 5
+                 : (s[0] & 0xfe) == 0xfc ? 6
+                                         : 0;
+    if (len < 2)
+        return len;
+    uint32_t ch = s[0] & (0x7fu >> len);
+    for (size_t i = 1; i < len; i++) {
+        if ((s[i] & 0xc0) != 0x80)
+            return 0;
+        ch = ch << 6 | (s[i] & 0x3f);
+    }
+    size_t shortest = ch < 0x80        ? 1
+                      : ch < 0x800     ? 2
+                      : ch < 0x10000   ? 3
+                      : ch < 0x200000  ? 4
+                      : ch < 0x4000000 ? 5
+                                       : 6;
+    if (shortest != len || ch >= 0x110000 || (ch & 0xfffff800) == 0xd800 ||
+        (ch >= 0xfdd0 && ch <= 0xfdef) || (ch & 0xfffe) == 0xfffe)
+        return 0;
+    return len;
+}
+
+/* udev_replace_chars (src/shared/udev-util.c) with nothing extra allowed: ASCII
+ * letters and digits, "#+-.:=@_", a "\x" escape and a valid multi-byte UTF-8
+ * sequence stay, and any other byte becomes '_'.
+ */
+static void byid_replace_chars(char *s)
+{
+    for (size_t i = 0; s[i];) {
+        unsigned char c = (unsigned char) s[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || strchr("#+-.:=@_", c)) {
+            i++;
+            continue;
+        }
+        if (c == '\\' && s[i + 1] == 'x') {
+            i += 2;
+            continue;
+        }
+        size_t n = byid_utf8_len((const unsigned char *) s + i);
+        if (n > 1) {
+            i += n;
+            continue;
+        }
+        s[i++] = '_';
+    }
+}
+
+/* by-id leaf, the name 60-serial.rules builds:
+ *
+ *   usb-$ID_SERIAL-if$ID_USB_INTERFACE_NUM[-port$attr{port_number}]
+ *
+ * ID_SERIAL is usb_id's vendor_model[_serial] (src/udev/udev-builtin-usb_id.c):
+ * the manufacturer and product strings, or the hex idVendor and idProduct for
+ * an absent one, each cut to 63 bytes before its characters are replaced, and
+ * the serial number, dropped whole when a byte of it is below 0x20, above 0x7f
+ * or a comma; the joined name is cut to 255 bytes. @buf is left empty, so no
+ * link is made, for a leaf past @bufsz.
+ */
+static void tty_byid_leaf(const usb_dev_t *d,
+                          const usb_tty_t *t,
+                          char *buf,
+                          size_t bufsz)
+{
+    char vendor[64], model[64], serial[512], id[256], hex[8];
+
+    snprintf(hex, sizeof(hex), "%04x", d->vid & 0xffff);
+    byid_replace_whitespace(d->manufacturer[0] ? d->manufacturer : hex, vendor,
+                            sizeof(vendor) - 1);
+    byid_replace_chars(vendor);
+    snprintf(hex, sizeof(hex), "%04x", d->pid & 0xffff);
+    byid_replace_whitespace(d->product[0] ? d->product : hex, model,
+                            sizeof(model) - 1);
+    byid_replace_chars(model);
+
+    /* usb_id reads the attribute with trailing newlines dropped
+     * (sd_device_get_sysattr_value) before it checks the bytes.
+     */
+    size_t slen = strlen(d->serial);
+    while (slen && (d->serial[slen - 1] == '\n' || d->serial[slen - 1] == '\r'))
+        slen--;
+    bool keep = true;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char) d->serial[i];
+        if (c < 0x20 || c > 0x7f || c == ',')
+            keep = false;
+    }
+    serial[0] = '\0';
+    if (keep) {
+        byid_replace_whitespace(
+            d->serial, serial,
+            slen < sizeof(serial) - 1 ? slen : sizeof(serial) - 1);
+        byid_replace_chars(serial);
+    }
+    if (serial[0])
+        snprintf(id, sizeof(id), "%s_%s_%s", vendor, model, serial);
+    else
+        snprintf(id, sizeof(id), "%s_%s", vendor, model);
+
+    int n = t->is_acm
+                ? snprintf(buf, bufsz, "usb-%s-if%02x", id, t->ifnum & 0xff)
+                : snprintf(buf, bufsz, "usb-%s-if%02x-port%u", id,
+                           t->ifnum & 0xff, t->port);
+    if (n < 0 || (size_t) n >= bufsz)
+        buf[0] = '\0';
+}
+
 static int find_dev_by_location(uint32_t loc)
 {
     for (int i = 0; i < usb_ndevs; i++)
@@ -1087,6 +1311,7 @@ static void tty_model_build(void)
             if (!usb_ttys[j].is_acm && usb_ttys[j].dev == t->dev &&
                 usb_ttys[j].ifnum == t->ifnum)
                 t->port++;
+        tty_byid_leaf(&usb_devs[t->dev], t, t->byid, sizeof(t->byid));
     }
 }
 
@@ -1557,17 +1782,39 @@ static int tty_alias_parse(const char *name, bool *acm_out)
     return n;
 }
 
-/* The alias names of /dev in a scratch directory, an empty placeholder each.
- * /dev lists the union of these and the backing's, as /dev/bus does, so nothing
- * is written into the sysroot. The intercepts answer before a placeholder is
- * reached.
+/* The alias names of /dev in a scratch directory: an empty placeholder per
+ * alias and the by-id links. /dev, /dev/serial and /dev/serial/by-id list the
+ * union of these and the backing's, as /dev/bus does, so nothing is written
+ * into the sysroot. The intercepts answer before a placeholder is reached.
  */
 static void emit_tty_dev_entries(void)
 {
+    char sub[128];
+    snprintf(sub, sizeof(sub), "%s/serial", usb_tty_dir);
+    bool byid_dir = mkdir(sub, 0755) == 0;
+    snprintf(sub, sizeof(sub), "%s/serial/by-id", usb_tty_dir);
+    byid_dir = byid_dir && mkdir(sub, 0755) == 0;
+
     for (int i = 0; i < usb_nttys; i++) {
+        usb_tty_t *t = &usb_ttys[i];
         char alias[32];
-        tty_alias_name(&usb_ttys[i], alias, sizeof(alias));
+        tty_alias_name(t, alias, sizeof(alias));
         usb_write_file(usb_tty_dir, alias, "", 0);
+        if (!t->byid[0])
+            continue;
+        char target[64], path[400];
+        snprintf(target, sizeof(target), "../../%s", alias);
+
+        /* A name the volume refuses (EILSEQ for a code point APFS rejects, or
+         * EEXIST for a leaf already made, as two identical adapters with no
+         * serial build, or one differing only by case) gets no leaf, so lookups
+         * never answer for a name the listing lacks.
+         */
+        if (!byid_dir ||
+            snprintf(path, sizeof(path), "%s/%s", sub, t->byid) >=
+                (int) sizeof(path) ||
+            symlink(target, path) != 0)
+            t->byid[0] = '\0';
     }
 }
 
@@ -1733,6 +1980,8 @@ fail:;
 typedef enum {
     USB_PATH_NONE,
     USB_PATH_DEV_ROOT,     /* /dev itself */
+    USB_PATH_SERIAL_DIR,   /* /dev/serial */
+    USB_PATH_BYID_DIR,     /* /dev/serial/by-id */
     USB_PATH_DEV_BUS,      /* /dev/bus            */
     USB_PATH_DEV_USB,      /* /dev/bus/usb        */
     USB_PATH_DEV_BUSNUM,   /* /dev/bus/usb/BBB    */
@@ -1742,6 +1991,8 @@ typedef enum {
     USB_PATH_DEV_FOREIGN,  /* under /dev/bus but on no bus we model */
     USB_PATH_TTY,          /* /dev/ttyACM<n> or /dev/ttyUSB<n> */
     USB_PATH_TTY_SUB,      /* the alias used as a directory: ttyACM0/ or /x */
+    USB_PATH_BYID,         /* /dev/serial/by-id/<leaf> */
+    USB_PATH_BYID_SUB,     /* the leaf used as a directory: <leaf>/x */
     USB_PATH_SYS,          /* /sys[/suffix] (whole sysfs view) */
 } usb_path_kind_t;
 
@@ -1802,6 +2053,25 @@ static usb_path_kind_t classify_path(const char *path,
          * USB_PATH_DEV_NODE_SUB.
          */
         return q[nlen] ? USB_PATH_TTY_SUB : USB_PATH_TTY;
+    }
+    if (path_prefix_match(path, "/dev/serial", 11)) {
+        /* The two directories and the by-id leaves; any other name under
+         * /dev/serial is the backing's.
+         */
+        const char *q = skip_slashes(path + 11);
+        if (!*q || !strcmp(q, "."))
+            return USB_PATH_SERIAL_DIR;
+        if (strncmp(q, "by-id", 5) != 0 || (q[5] != '\0' && q[5] != '/'))
+            return USB_PATH_NONE;
+        q = skip_slashes(q + 5);
+        if (!*q || !strcmp(q, "."))
+            return USB_PATH_BYID_DIR;
+        *sys_suffix_out = q;
+
+        /* A leaf resolves to its alias node, so anything after it uses a
+         * character device as a directory, as USB_PATH_TTY_SUB does.
+         */
+        return strchr(q, '/') ? USB_PATH_BYID_SUB : USB_PATH_BYID;
     }
     if (!path_prefix_match(path, "/dev/bus", 8))
         return USB_PATH_NONE;
@@ -1892,6 +2162,14 @@ static usb_tty_t *find_tty(bool acm, int index)
     return NULL;
 }
 
+static usb_tty_t *find_tty_byid(const char *leaf)
+{
+    for (int i = 0; i < usb_nttys; i++)
+        if (usb_ttys[i].byid[0] && strcmp(usb_ttys[i].byid, leaf) == 0)
+            return &usb_ttys[i];
+    return NULL;
+}
+
 /* Open the cu.* node behind one alias, keeping the access mode and descriptor
  * flags and dropping creation, as procemu.c does for /dev/null. A callout never
  * waits for carrier, so a blocking open cannot hang.
@@ -1931,13 +2209,16 @@ typedef enum {
 } usb_dotdot_t;
 
 /* What a '..' does after the /dev-relative name @folded. After an alias node, a
- * usbfs node or a malformed usb name the fold stops and keeps the rest for
- * classify_path, which answers ENOTDIR or ENOENT as Linux does. A name of the
- * backing's is popped when the backing has it as a directory, and otherwise the
- * backing walks the whole path as the guest wrote it. A bus directory is popped
- * without asking whether the bus exists, since the model may not be built yet,
- * so /dev/bus/usb/009/../001/001 serves the node where Linux answers ENOENT.
+ * by-id leaf, a usbfs node or a malformed usb name the fold stops and keeps the
+ * rest for classify_path, which answers ENOTDIR or ENOENT as Linux does. A name
+ * of the backing's is popped when the backing has it as a directory, and
+ * otherwise the backing walks the whole path as the guest wrote it. A bus
+ * directory is popped without asking whether the bus exists, since the model
+ * may not be built yet, so /dev/bus/usb/009/../001/001 serves the node where
+ * Linux answers ENOENT.
  */
+static bool usb_dev_served(void);
+
 static usb_dotdot_t usb_dev_dotdot(const char *folded)
 {
     char path[LINUX_PATH_MAX];
@@ -1952,10 +2233,18 @@ static usb_dotdot_t usb_dev_dotdot(const char *folded)
         return usb_backing_is_dir(path) ? USB_DOTDOT_POP : USB_DOTDOT_DISOWN;
     case USB_PATH_TTY:
     case USB_PATH_TTY_SUB:
+    case USB_PATH_BYID:
+    case USB_PATH_BYID_SUB:
     case USB_PATH_DEV_NODE:
     case USB_PATH_DEV_NODE_SUB:
     case USB_PATH_DEV_ABSENT:
         return USB_DOTDOT_STOP;
+    case USB_PATH_SERIAL_DIR:
+    case USB_PATH_BYID_DIR:
+        /* The layer's only while an alias exists, the backing's otherwise. */
+        if (usb_dev_served())
+            return USB_DOTDOT_POP;
+        return usb_backing_is_dir(path) ? USB_DOTDOT_POP : USB_DOTDOT_DISOWN;
     default:
         return USB_DOTDOT_POP;
     }
@@ -1974,7 +2263,9 @@ static bool usb_dev_names_dir(const char *folded)
         return false;
     usb_path_kind_t kind = classify_path(path, &bus, &dev, &sfx);
     return kind == USB_PATH_DEV_BUS || kind == USB_PATH_DEV_USB ||
-           (kind == USB_PATH_DEV_BUSNUM && bus_exists(bus));
+           (kind == USB_PATH_DEV_BUSNUM && bus_exists(bus)) ||
+           ((kind == USB_PATH_SERIAL_DIR || kind == USB_PATH_BYID_DIR) &&
+            usb_nttys > 0);
 }
 
 /* Fold '.' and '..' in a /sys- or, with @dev, a /dev-relative suffix.
@@ -2119,13 +2410,25 @@ static void usb_canon_path(usb_path_kind_t kind,
         snprintf(out, outsz, "/dev/bus/usb/%03d/%03d", bus, dev);
         break;
 
-    /* For an alias, bus and dev carry (is_acm, index). */
+    /* For an alias, bus and dev carry (is_acm, index); a by-id leaf comes in as
+     * the suffix.
+     */
     case USB_PATH_TTY:
     case USB_PATH_TTY_SUB:
         snprintf(out, outsz, "/dev/tty%s%d", bus ? "ACM" : "USB", dev);
         break;
+    case USB_PATH_BYID:
+    case USB_PATH_BYID_SUB:
+        snprintf(out, outsz, "/dev/serial/by-id/%s", sfx);
+        break;
     case USB_PATH_DEV_ROOT:
         str_copy_trunc(out, "/dev", outsz);
+        break;
+    case USB_PATH_SERIAL_DIR:
+        str_copy_trunc(out, "/dev/serial", outsz);
+        break;
+    case USB_PATH_BYID_DIR:
+        str_copy_trunc(out, "/dev/serial/by-id", outsz);
         break;
     case USB_PATH_DEV_ABSENT:
     case USB_PATH_DEV_FOREIGN:
@@ -2257,10 +2560,12 @@ static int usb_blob_fd(const usb_dev_t *d)
  * usb_lock is taken. Both halves fold; see the /dev/bus arm below and
  * usb_suffix_normalize for what the fold is and is not.
  *
- * *sfx_out receives the /sys suffix as the guest spelled it -- unfolded,
- * because usb_sys_resolve_suffix has to see the '..' in their original
- * positions to order them against the symlinks they follow. `norm` holds the
- * folded spelling, which decides only whether the name is ours.
+ * *sfx_out receives the /sys suffix as the guest spelled it, unfolded, because
+ * usb_sys_resolve_suffix has to see the '..' in their original positions to
+ * order them against the symlinks they follow; for a by-id name it receives the
+ * leaf, folded, inside norm. norm holds the folded spelling: on /sys it decides
+ * only whether the name is ours, and on /dev it is the name classify_path
+ * reads.
  *
  * Every name whose fold settles ownership is settled here, so that no entry
  * point re-derives it: a /sys name that folds above /sys, a /dev name that
@@ -2290,14 +2595,14 @@ static usb_path_kind_t classify_and_normalize(const char *path,
     /* Fold the /dev suffix before classify_path reads it, so both halves of the
      * layer reach ownership the same way: /dev/bus/usb/../other/f is the
      * backing's file, /dev/bus/other/../usb/001/001 is the synthetic node
-     * (matrix columns dev-fold-out and dev-fold-in), and /dev/bus/../ttyACM0 is
-     * the alias node. The fold starts at /dev because the aliases sit directly
-     * under it.
+     * (matrix columns dev-fold-out and dev-fold-in), and
+     * /dev/serial/by-id/../../ttyACM0 is the alias node. The fold starts at
+     * /dev because the aliases sit directly under it.
      *
-     * The result is written into `norm`, which the /sys arm below would use for
-     * its own folded suffix; the two never both run, and classify_path's
-     * sys_suffix_out is only set on the /sys arm, so it keeps pointing into
-     * live storage either way.
+     * The result is written into norm, which the /sys arm below would use for
+     * its own folded suffix; the two never both run. classify_path's
+     * sys_suffix_out points into norm for a by-id leaf and into the guest's
+     * spelling for /sys, live storage either way.
      *
      * A suffix that folds away above /dev, or past a name usb_dev_dotdot leaves
      * to the backing, leaves as USB_PATH_NONE, and the caller reports
@@ -2329,6 +2634,11 @@ static usb_path_kind_t classify_and_normalize(const char *path,
     usb_path_kind_t kind = classify_path(path, bus_out, dev_out, sfx_out);
     if (kind == USB_PATH_DEV_FOREIGN)
         return USB_PATH_NONE; /* another bus's /dev/bus subtree; not ours */
+    if (kind == USB_PATH_BYID_SUB) {
+        /* The leaf is looked up alone; *sfx_out points into norm. */
+        char *leaf = norm + (*sfx_out - norm);
+        leaf[strcspn(leaf, "/")] = '\0';
+    }
     if (kind != USB_PATH_SYS)
         return kind;
     int rc = usb_suffix_normalize(*sfx_out, false, norm, normsz, NULL);
@@ -2601,7 +2911,9 @@ static int usb_not_intercepted(int cerr)
 static bool usb_kind_on_sysroot(usb_path_kind_t kind)
 {
     return kind == USB_PATH_TTY || kind == USB_PATH_TTY_SUB ||
-           kind == USB_PATH_DEV_ROOT;
+           kind == USB_PATH_DEV_ROOT || kind == USB_PATH_SERIAL_DIR ||
+           kind == USB_PATH_BYID_DIR || kind == USB_PATH_BYID ||
+           kind == USB_PATH_BYID_SUB;
 }
 
 /* Whether the layer serves /dev, which it does while an alias exists. Takes
@@ -2639,8 +2951,11 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
 
     switch (kind) {
     case USB_PATH_TTY:
-    case USB_PATH_TTY_SUB: {
-        usb_tty_t *t = find_tty(bus != 0, dev);
+    case USB_PATH_TTY_SUB:
+    case USB_PATH_BYID:
+    case USB_PATH_BYID_SUB: {
+        bool byid = kind == USB_PATH_BYID || kind == USB_PATH_BYID_SUB;
+        usb_tty_t *t = byid ? find_tty_byid(sfx) : find_tty(bus != 0, dev);
 
         /* An alias-shaped name with no alias behind it is the backing's: /dev
          * belongs to the sysroot, which may carry its own /dev/ttyUSB0. See
@@ -2650,20 +2965,30 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
             disown = true;
             goto out;
         }
-        if (kind == USB_PATH_TTY_SUB) {
+        if (kind == USB_PATH_TTY_SUB || kind == USB_PATH_BYID_SUB) {
             err = ENOTDIR;
             goto out;
         }
 
-        /* O_CREAT|O_EXCL is EEXIST, the way Linux answers for a node that
-         * already exists.
+        /* In fs/namei.c do_open's order: O_CREAT|O_EXCL is EEXIST on a name
+         * that exists, O_DIRECTORY is ENOTDIR, and only then is the by-id
+         * symlink ELOOP under O_NOFOLLOW. An O_PATH open has O_CREAT and O_EXCL
+         * masked off (fs/open.c build_open_how) and opens the link itself
+         * (do_o_path).
          */
-        if ((linux_flags & LINUX_O_CREAT) && (linux_flags & LINUX_O_EXCL)) {
+        bool path_only = (linux_flags & LINUX_O_PATH) != 0;
+        if (!path_only && (linux_flags & LINUX_O_CREAT) &&
+            (linux_flags & LINUX_O_EXCL)) {
             err = EEXIST;
             goto out;
         }
         if (linux_flags & LINUX_O_DIRECTORY) {
             err = ENOTDIR;
+            goto out;
+        }
+        if (kind == USB_PATH_BYID && (linux_flags & LINUX_O_NOFOLLOW) &&
+            !path_only) {
+            err = ELOOP;
             goto out;
         }
         if (linux_flags & LINUX_O_PATH) {
@@ -2772,14 +3097,22 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
 
     /* Served only while an alias exists; with none, /dev is the backing's. */
     case USB_PATH_DEV_ROOT:
+    case USB_PATH_SERIAL_DIR:
+    case USB_PATH_BYID_DIR: {
         if (usb_nttys == 0) {
             disown = true;
             goto out;
         }
-        rc = proc_open_dir_fd(usb_tty_dir, linux_flags);
+        char host_path[160];
+        snprintf(host_path, sizeof(host_path), "%s%s", usb_tty_dir,
+                 kind == USB_PATH_DEV_ROOT     ? ""
+                 : kind == USB_PATH_SERIAL_DIR ? "/serial"
+                                               : "/serial/by-id");
+        rc = proc_open_dir_fd(host_path, linux_flags);
         if (rc < 0)
             err = errno;
         goto out;
+    }
     case USB_PATH_DEV_USB:
     case USB_PATH_DEV_BUSNUM: {
         char host_path[256];
@@ -2879,17 +3212,42 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st, bool follow)
 
     switch (kind) {
     case USB_PATH_TTY:
-    case USB_PATH_TTY_SUB: {
-        usb_tty_t *t = find_tty(bus != 0, dev);
+    case USB_PATH_TTY_SUB:
+    case USB_PATH_BYID_SUB: {
+        usb_tty_t *t = kind == USB_PATH_BYID_SUB ? find_tty_byid(sfx)
+                                                 : find_tty(bus != 0, dev);
         if (!t) {
             disown = true; /* the sysroot's own file, if it has one */
             goto out;
         }
-        if (kind == USB_PATH_TTY_SUB) {
+        if (kind != USB_PATH_TTY) {
             err = ENOTDIR;
             goto out;
         }
         fill_synth_tty_stat(st, canon, t);
+        rc = 0;
+        goto out;
+    }
+    case USB_PATH_BYID: {
+        /* lstat reports the link and stat the character device it names. */
+        usb_tty_t *t = find_tty_byid(sfx);
+        if (!t) {
+            disown = true;
+            goto out;
+        }
+        char alias[32];
+        tty_alias_name(t, alias, sizeof(alias));
+        if (follow) {
+            /* The node's identity, inode included: they are one object. */
+            char node[64];
+            snprintf(node, sizeof(node), "/dev/%s", alias);
+            fill_synth_tty_stat(st, node, t);
+            rc = 0;
+            goto out;
+        }
+        fill_synth_file(st, canon);
+        st->st_mode = S_IFLNK | 0777;
+        st->st_size = (off_t) (strlen(alias) + 6); /* "../../" */
         rc = 0;
         goto out;
     }
@@ -2949,6 +3307,8 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st, bool follow)
         rc = 0;
         goto out;
     case USB_PATH_DEV_ROOT:
+    case USB_PATH_SERIAL_DIR:
+    case USB_PATH_BYID_DIR:
         if (usb_nttys == 0) {
             disown = true;
             goto out;
@@ -3004,11 +3364,46 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     if (kind == USB_PATH_NONE)
         return usb_not_intercepted(cerr);
 
-    if (kind == USB_PATH_DEV_ROOT) {
+    if (kind == USB_PATH_DEV_ROOT || kind == USB_PATH_SERIAL_DIR ||
+        kind == USB_PATH_BYID_DIR) {
         if (!usb_dev_served())
             return PROC_NOT_INTERCEPTED;
         errno = EINVAL; /* a directory */
         return -1;
+    }
+
+    if (kind == USB_PATH_BYID) {
+        /* From the model, which is what an open of the leaf follows. */
+        pthread_mutex_lock(&usb_lock);
+        int rc = -1;
+        int err = 0;
+        bool disown = false;
+        char target[64];
+        if (ensure_usb_tree() < 0) {
+            disown = true; /* the backing answers, as for open and stat */
+        } else {
+            usb_tty_t *t = find_tty_byid(sfx);
+            char alias[32];
+            if (!t) {
+                disown = true;
+            } else {
+                tty_alias_name(t, alias, sizeof(alias));
+                int n = snprintf(target, sizeof(target), "../../%s", alias);
+                if (n < 0 || (size_t) n >= sizeof(target)) {
+                    err = ENAMETOOLONG;
+                } else {
+                    size_t copy = (size_t) n < bufsiz ? (size_t) n : bufsiz;
+                    memcpy(buf, target, copy);
+                    rc = (int) copy;
+                }
+            }
+        }
+        pthread_mutex_unlock(&usb_lock);
+        if (disown)
+            return PROC_NOT_INTERCEPTED; /* the sysroot's own by-id entry */
+        if (rc < 0)
+            errno = err ? err : EIO;
+        return rc;
     }
 
     if (kind == USB_PATH_SYS) {
@@ -3330,8 +3725,9 @@ bool usb_sysfs_dir_unions_backing(const char *guest_path)
     if (kind == USB_PATH_DEV_BUS)
         return true;
 
-    /* Unioned exactly when the open intercept serves it. */
-    if (kind == USB_PATH_DEV_ROOT)
+    /* Unioned exactly when the open intercept serves them. */
+    if (kind == USB_PATH_DEV_ROOT || kind == USB_PATH_SERIAL_DIR ||
+        kind == USB_PATH_BYID_DIR)
         return usb_dev_served();
     if (kind != USB_PATH_SYS)
         return false;
@@ -3423,13 +3819,14 @@ bool usb_tty_alias_node(const char *path, char *out, size_t outsz)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind != USB_PATH_TTY)
+    if (kind != USB_PATH_TTY && kind != USB_PATH_BYID)
         return false;
 
     pthread_mutex_lock(&usb_lock);
     bool ok = false;
     if (ensure_usb_tree() == 0) {
-        usb_tty_t *t = find_tty(bus != 0, dev);
+        usb_tty_t *t = kind == USB_PATH_BYID ? find_tty_byid(sfx)
+                                             : find_tty(bus != 0, dev);
         if (t) {
             char alias[32], node[64];
             tty_alias_name(t, alias, sizeof(alias));
@@ -3448,7 +3845,8 @@ bool usb_tty_alias_dir(const char *path, char *out, size_t outsz)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind != USB_PATH_DEV_ROOT)
+    if (kind != USB_PATH_DEV_ROOT && kind != USB_PATH_SERIAL_DIR &&
+        kind != USB_PATH_BYID_DIR)
         return false;
 
     if (!usb_dev_served())
@@ -3460,7 +3858,8 @@ bool usb_tty_alias_dir(const char *path, char *out, size_t outsz)
 bool usb_tty_alias_path(const char *path)
 {
     bool acm;
-    if (!strcmp(path, "/dev"))
+    if (!strcmp(path, "/dev") || !strcmp(path, "/dev/serial") ||
+        !strcmp(path, "/dev/serial/by-id"))
         return true;
     return !strncmp(path, "/dev/tty", 8) &&
            tty_alias_parse(path + 5, &acm) >= 0;

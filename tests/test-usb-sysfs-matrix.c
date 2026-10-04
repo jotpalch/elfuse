@@ -26,13 +26,14 @@
  * EXPECTED VALUES ARE MEASURED, NOT ASSUMED. Every cell below was recorded by
  * running this same binary natively on Linux (docker gcc:14, aarch64, kernel
  * 7.0) with MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev
- * carrying a mknod'd usb node next to a foreign bus directory, an alias node
- * and an alias-shaped regular file. Re-record with:
+ * carrying a mknod'd usb node next to a foreign bus directory, an alias node,
+ * an alias-shaped regular file and a by-id link onto the alias. Re-record with:
  *
  *   docker run --rm -v "$PWD:/w" -w /w gcc:14 sh -c \
- *     'mkdir -p /dev/bus/usb/001 /dev/bus/other && \
+ *     'mkdir -p /dev/bus/usb/001 /dev/bus/other /dev/serial/by-id && \
  *      : > /dev/bus/other/f && mknod /dev/bus/usb/001/001 c 189 0 && \
  *      mknod /dev/ttyACM0 c 166 0 && printf planted > /dev/ttyACM7 && \
+ *      ln -sf ../../ttyACM0 /dev/serial/by-id/usb-Rec_Device_0001-if00 && \
  *      gcc -D MATRIX_STANDALONE -o /tmp/m tests/test-usb-sysfs-matrix.c && \
  *      MATRIX_RECORD=1 /tmp/m'
  *
@@ -110,8 +111,10 @@ enum {
     COL_DEV_DOTDOT,   /* /dev/null followed by '..' */
     COL_FOLD_FILE,    /* a '..' after the backing's file, back into usb */
     COL_FOLD_ABSENT,  /* a '..' after a malformed usb name, back into usb */
-    COL_SYS_FOLD_IN2, /* COL_SYS_FOLD_IN through a name the scratch tree lacks
-                       */
+    COL_SYS_FOLD_IN2, /* COL_SYS_FOLD_IN via a name only the backing has */
+    COL_BYID,         /* a /dev/serial/by-id leaf, discovered */
+    COL_TTY_FOLD,     /* the alias node spelled through a '..' */
+    COL_BYID_DOTDOT,  /* a by-id leaf followed by '..', discovered */
     COL_COUNT,
 };
 
@@ -123,13 +126,14 @@ static const char *col_name[COL_COUNT] = {
     "node-dotdot", "dev-climb",     "dev-climb-f",     "tty-alias",
     "tty-planted", "tty-absent",    "tty-dot-node",    "tty-dotdot",
     "dev-dotdot",  "dev-fold-file", "dev-fold-absent", "sys-fold-in2",
+    "byid-link",   "tty-fold",      "byid-dotdot",
 };
 
 /* COL_TTY_DOT_NODE is the alias node with a trailing "." component: a character
  * device used as a directory, which every entry point, chdir among them,
- * answers ENOTDIR for. COL_TTY_DOTDOT puts a '..' there instead, which a
- * lexical fold would turn into /dev, and COL_DEV_DOTDOT does the same to a node
- * this layer does not serve.
+ * answers ENOTDIR for. COL_TTY_DOTDOT and COL_BYID_DOTDOT put a '..' there
+ * instead, which a lexical fold would turn into /dev or /dev/serial/by-id, and
+ * COL_DEV_DOTDOT does the same to a node this layer does not serve.
  */
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
@@ -163,6 +167,14 @@ static char subsys_out_path[512];
  * recording host and the guest fixture, so it is discovered too.
  */
 static char long_path[512];
+
+/* COL_BYID is discovered because the recording host's leaf, planted by hand,
+ * and the fixture's, built from its strings, are different names for the same
+ * object: the symlink in /dev/serial/by-id pointing at COL_TTY's node, which
+ * the fixture's other leaves do not.
+ */
+static char byid_path[512];
+static char byid_dotdot_path[520];
 
 static const char *col_path(int c)
 {
@@ -211,10 +223,16 @@ static const char *col_path(int c)
         return "/dev/ttyACM7";
     case COL_TTY_ABSENT:
         return "/dev/ttyACM31";
+    case COL_BYID:
+        return byid_path;
+    case COL_TTY_FOLD:
+        return "/dev/serial/by-id/../../ttyACM0";
     case COL_TTY_DOT_NODE:
         return "/dev/ttyACM0/.";
     case COL_TTY_DOTDOT:
         return "/dev/ttyACM0/..";
+    case COL_BYID_DOTDOT:
+        return byid_dotdot_path;
     case COL_DEV_DOTDOT:
         return "/dev/null/..";
     case COL_FOLD_FILE:
@@ -264,7 +282,8 @@ static const char *col_path(int c)
 
 /* The /dev half of the ownership question for the alias names. COL_TTY is a
  * node this layer serves; COL_TTY_BACK is alias-shaped and only the backing has
- * it, so it must fall through; COL_TTY_ABSENT is on neither side.
+ * it, so it must fall through; COL_TTY_ABSENT is on neither side; COL_BYID is
+ * the by-id link onto COL_TTY; COL_TTY_FOLD reaches COL_TTY through a '..'.
  */
 
 /* COL_NODE_DOTDOT puts a '..' after COL_NODE's character device, which Linux
@@ -321,6 +340,32 @@ static void discover_long(void)
         break;
     }
     closedir(d);
+}
+
+static void discover_byid(void)
+{
+    strcpy(byid_path, "/dev/serial/by-id/@none@");
+    strcpy(byid_dotdot_path, "/dev/serial/by-id/@none@/..");
+    DIR *d = opendir("/dev/serial/by-id");
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        char cand[512], tgt[128];
+        snprintf(cand, sizeof(cand), "/dev/serial/by-id/%s", e->d_name);
+        ssize_t n = readlink(cand, tgt, sizeof(tgt) - 1);
+        if (n <= 0)
+            continue;
+        tgt[n] = '\0';
+        if (strcmp(tgt, "../../ttyACM0"))
+            continue;
+        strcpy(byid_path, cand);
+        break;
+    }
+    closedir(d);
+    snprintf(byid_dotdot_path, sizeof(byid_dotdot_path), "%s/..", byid_path);
 }
 
 static void discover_subsys(void)
@@ -785,6 +830,7 @@ int main(void)
 {
     discover_subsys();
     discover_long();
+    discover_byid();
 
     if (getenv("MATRIX_RECORD")) {
         record();

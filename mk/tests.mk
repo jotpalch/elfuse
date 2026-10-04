@@ -1711,18 +1711,20 @@ test-path-fold: $(ELFUSE_BIN) $(TEST_DIR)/test-path-fold
 # behind it still opens, reads and stats like one -- which is what keeps this
 # lane's device half running on a machine with no USB device attached. The
 # second run adds the serial fixture: a CDC device bound through its Union
-# descriptor and a two-port bridge.
+# descriptor and a two-port bridge; the third, the byidlong one.
 test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 	ELFUSE_USB_FIXTURE=serial $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
+	ELFUSE_USB_FIXTURE=byidlong $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 
 ## The /sys ours/not-ours split and the fchdir/cwd containment need a populated
 ## /sys behind the synthetic USB view, so this lane stages a sysroot skeleton
 ## (a net address, a THP knob, a node list) and runs the guest against it with
 ## the deterministic USB fixture so the /sys/bus/usb assertions have devices.
 ## The /dev half needs names only the sysroot has: two alias-shaped regular
-## files and a directory, /dev/sub, to take a '..' after. /sys/class/tty carries
-## a tty of the sysroot's own next to the aliases.
+## files, a directory, /dev/sub, to take a '..' after, and a by-id link that is
+## none of ours. /sys/class/tty carries a tty of the sysroot's own next to the
+## aliases.
 test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
@@ -1739,7 +1741,11 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	printf '4:64\n' > "$$sysroot/sys/class/tty/ttyS0/dev"; \
 	printf 'planted-acm7\n' > "$$sysroot/dev/ttyACM7"; \
 	printf 'planted-usb9\n' > "$$sysroot/dev/ttyUSB9"; \
+	mkdir -p "$$sysroot/dev/serial/by-id"; \
+	ln -s ../../ttyACM7 "$$sysroot/dev/serial/by-id/usb-Planted_Link-if00"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-sysroot; \
+	ELFUSE_USB_FIXTURE=byidlong $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot
 
 ## Every entry point that can name something under /sys or /dev/bus, against

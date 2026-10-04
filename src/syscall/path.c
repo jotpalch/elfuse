@@ -1378,11 +1378,11 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
 }
 
 /* Rebuild @path against the guest directory @base as an absolute guest path.
- * Under /dev/bus and on a served /dev the name is joined as written: the USB
- * layer folds it and stops at a '..' after a node, which a lexical fold here
- * would pop. Under /sys it is joined as written too, since the link walk
- * applies a '..' to what a link resolved to. Elsewhere the components are
- * folded.
+ * Under /dev/bus and on a served /dev or /dev/serial the name is joined as
+ * written: the USB layer folds it and stops at a '..' after a node or a by-id
+ * leaf, which a lexical fold here would pop. Under /sys it is joined as written
+ * too, since the link walk applies a '..' to what a link resolved to. Elsewhere
+ * the components are folded.
  *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */
@@ -1392,7 +1392,8 @@ static int path_rebuild_under(const char *base,
                               size_t outsz)
 {
     if (path_prefix_match(base, "/dev/bus", 8) || !strcmp(base, "/dev") ||
-        path_prefix_match(base, "/sys", 4)) {
+        path_prefix_match(base, "/sys", 4) ||
+        path_prefix_match(base, "/dev/serial", 11)) {
         int n = snprintf(out, outsz, "%s/%s", base, path);
         if (n < 0 || (size_t) n >= outsz) {
             errno = ENAMETOOLONG;
@@ -1474,11 +1475,11 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * relative path measured against one has to be rebuilt as a guest path and
      * re-offered to the intercepts. Without the /sys and /dev/bus arms a cwd
      * set by fchdir() onto a synthetic USB directory would resolve relative
-     * names straight against the scratch tree. /dev joins them while an alias
-     * exists; the canonical name the layer hands back is unused, since base is
-     * already the guest's own.
+     * names straight against the scratch tree. The alias directories join them
+     * while an alias exists; the canonical name the layer hands back is unused,
+     * since base is already the guest's own.
      */
-    char alias_dir[sizeof("/dev")];
+    char alias_dir[sizeof("/dev/serial/by-id")];
     if (!strncmp(base, "/proc", 5) || !strncmp(base, "/dev/pts", 8) ||
         !strncmp(base, "/sys", 4) || !strncmp(base, "/dev/bus", 8) ||
         usb_tty_alias_dir(base, alias_dir, sizeof(alias_dir)))

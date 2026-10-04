@@ -123,8 +123,13 @@ int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz);
  * bConfigurationValue, minor the usbfs char-dev minor. vid/pid/serial carry the
  * modeled identity so the fd constructor can verify the service it looked up by
  * location is still the device this bus/dev number was modeled from (locationID
- * names the port, not the device).
+ * names the port, not the device). A USB string descriptor holds 126 UTF-16
+ * units, which Linux keeps as UTF-8 in MAX_USB_STRING_SIZE bytes
+ * (drivers/usb/core/message.c). Every copy of a device string is this size, so
+ * two reads of one string agree.
  */
+#define USB_STRING_MAX (127 * 3 + 1)
+
 typedef struct {
     uint32_t location_id;
     unsigned speed_code;
@@ -132,7 +137,7 @@ typedef struct {
     int minor;
     size_t blob_len;
     unsigned vid, pid;
-    char serial[128]; /* "" when the device reports none */
+    char serial[USB_STRING_MAX]; /* "" when the device reports none */
 } usb_sysfs_devinfo_t;
 
 /* Fill *out for the device at busnum/devnum.
@@ -148,22 +153,24 @@ int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out);
  */
 int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st);
 
-/* Whether @path is exactly "/dev/ttyACM<n>", "/dev/ttyUSB<n>" or "/dev". String
- * work only; for a descriptor stamp, which is canonical and is only ever set on
- * these names while the layer serves them.
+/* Whether @path is exactly "/dev/ttyACM<n>", "/dev/ttyUSB<n>" or one of /dev,
+ * /dev/serial and /dev/serial/by-id. String work only; for a descriptor stamp,
+ * which is canonical and is only ever set on these names while the layer serves
+ * them. A by-id leaf is stamped as its node, so it never appears here.
  */
 bool usb_tty_alias_path(const char *path);
 
-/* Whether @path, in any spelling this layer folds, names /dev while this layer
- * serves it, which is while an alias exists; @out receives the canonical
- * spelling. Takes usb_lock, and sysroot_lock before it, not nested, when the
- * fold asks the backing about a name.
+/* Whether @path, in any spelling this layer folds, names /dev, /dev/serial or
+ * /dev/serial/by-id while this layer serves them, which is while an alias
+ * exists; @out receives the canonical spelling. Takes usb_lock, and
+ * sysroot_lock before it, not nested, when the fold asks the backing about a
+ * name.
  */
 bool usb_tty_alias_dir(const char *path, char *out, size_t outsz);
 
-/* The alias node a name resolves to, or false when no such alias exists. Takes
- * usb_lock and looks the device up, and sysroot_lock before it, not nested,
- * when the fold asks the backing about a name.
+/* The alias node a name resolves to, by-id leaves included, or false when no
+ * such alias exists. Takes usb_lock and looks the device up, and sysroot_lock
+ * before it, not nested, when the fold asks the backing about a name.
  */
 bool usb_tty_alias_node(const char *path, char *out, size_t outsz);
 

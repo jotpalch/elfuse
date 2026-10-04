@@ -217,8 +217,9 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
 
     /* A serial alias fd is a host fd on the macOS cu.* node, so fstat answers
      * from the stamp to report the Linux 166:n or 188:n identity. Every
-     * spelling of the node is stamped as the canonical one, so this comes
-     * before the /dev/bus arm, which stamps a spelling as written.
+     * spelling of the node, the by-id leaf included, is stamped as the
+     * canonical node, which also fits the stamp where a by-id path need not, so
+     * this comes before the /dev/bus arm, which stamps a spelling as written.
      */
     char alias_node[64];
     if (usb_tty_alias_node(path, alias_node, sizeof(alias_node))) {
@@ -226,10 +227,11 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
         return true;
     }
 
-    /* While an alias exists, /dev is served from a scratch directory, so a
-     * descriptor on it carries its guest name for the /dev/pts reason above.
+    /* While an alias exists, /dev, /dev/serial and /dev/serial/by-id are served
+     * from a scratch directory, so a descriptor on one carries its guest name
+     * for the /dev/pts reason above.
      */
-    char alias_dir[sizeof("/dev")];
+    char alias_dir[sizeof("/dev/serial/by-id")];
     if (usb_tty_alias_dir(path, alias_dir, sizeof(alias_dir))) {
         str_copy_trunc(out, alias_dir, out_size);
         return true;
@@ -2797,7 +2799,7 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
             proc_intercept_open(g, tx.intercept_path, LINUX_O_DIRECTORY, 0);
         if (host_fd >= 0) {
             char virt_buf[LINUX_PATH_MAX];
-            char alias_dir[sizeof("/dev")];
+            char alias_dir[sizeof("/dev/serial/by-id")];
             const char *virt_path = tx.intercept_path;
             if (usb_sysfs_guest_path_for_fd(host_fd, virt_buf,
                                             sizeof(virt_buf)) > 0)
@@ -2861,10 +2863,10 @@ int64_t sys_fchdir(int fd)
      * writing into a read-only view and reporting the wrong statfs magic.
      * Publishing the stamped guest spelling instead keeps the cwd on the
      * intercepts, exactly as chdir() does for these paths.
-     * resolve_proc_cwd_path knows the same prefixes, and /dev, which is
-     * scratch-backed while an alias exists.
+     * resolve_proc_cwd_path knows the same prefixes, and the alias directories,
+     * which are scratch-backed while an alias exists.
      */
-    char alias_dir[sizeof("/dev")];
+    char alias_dir[sizeof("/dev/serial/by-id")];
     if (!proc_virtual && fd_table[fd].proc_path[0] &&
         (path_prefix_match(fd_table[fd].proc_path, "/sys", 4) ||
          path_prefix_match(fd_table[fd].proc_path, "/dev/bus", 8) ||
