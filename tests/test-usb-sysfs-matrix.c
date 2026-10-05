@@ -9,27 +9,29 @@
  * src/syscall/fs.c, the access arm of sys_faccessat, and the fd-side sysfs
  * identity in sys_fstatfs (src/syscall/fs-stat.c).
  *
- * The layer synthesizes exactly one subtree on each side, /sys/bus/usb and
- * /dev/bus/usb, on top of a backing /sys and /dev/bus that a sysroot supplies.
- * Its contract is not per-syscall: a name is this layer's or it is not, and
- * every entry point has to answer from that one decision. Four regressions all
- * came from an entry point re-deriving it -- lstat/open(O_NOFOLLOW)/readlink
- * shadowed the backing because their resolve succeeded where stat's failed,
- * getdents64 replaced the backing listing instead of extending it, /dev/bus had
- * no fall-through arm at all while access(2) fell through anyway, and fstatfs
- * never saw the sysfs identity statfs was handing out. Pinning them one
- * assertion at a time is what let them appear, so this is a matrix instead:
- * every entry point against every path class, so a fix that unifies one pair
- * and splits another cannot pass.
+ * The layer owns one subtree on each side, /sys/bus/usb and /dev/bus/usb, on
+ * top of a backing /sys and /dev/bus that a sysroot supplies, and adds the
+ * serial alias names to /dev while one exists. Its contract is not per-syscall:
+ * a name is this layer's or it is not, and every entry point has to answer from
+ * that one decision. Four regressions all came from an entry point re-deriving
+ * it: lstat/open(O_NOFOLLOW)/readlink shadowed the backing because their
+ * resolve succeeded where stat's failed, getdents64 replaced the backing
+ * listing instead of extending it, /dev/bus had no fall-through arm at all
+ * while access(2) fell through anyway, and fstatfs never saw the sysfs identity
+ * statfs was handing out. Pinning them one assertion at a time is what let them
+ * appear, so this is a matrix instead: every entry point against every path
+ * class, so a fix that unifies one pair and splits another cannot pass.
  *
  * EXPECTED VALUES ARE MEASURED, NOT ASSUMED. Every cell below was recorded by
  * running this same binary natively on Linux (docker gcc:14, aarch64, kernel
- * 7.0) with MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev/bus
- * carrying a mknod'd usb node next to a foreign bus directory. Re-record with:
+ * 7.0) with MATRIX_RECORD=1, over a /sys that is a real sysfs and a /dev
+ * carrying a mknod'd usb node next to a foreign bus directory, an alias node
+ * and an alias-shaped regular file. Re-record with:
  *
  *   docker run --rm -v "$PWD:/w" -w /w gcc:14 sh -c \
- *     'mkdir -p /dev/bus/usb/001 /dev/bus/other && : > /dev/bus/other/f && \
- *      mknod /dev/bus/usb/001/001 c 189 0 && \
+ *     'mkdir -p /dev/bus/usb/001 /dev/bus/other && \
+ *      : > /dev/bus/other/f && mknod /dev/bus/usb/001/001 c 189 0 && \
+ *      mknod /dev/ttyACM0 c 166 0 && printf planted > /dev/ttyACM7 && \
  *      gcc -D MATRIX_STANDALONE -o /tmp/m tests/test-usb-sysfs-matrix.c && \
  *      MATRIX_RECORD=1 /tmp/m'
  *
@@ -76,7 +78,7 @@ int passes = 0, fails = 0;
 #endif
 
 #define SYSFS_MAGIC 0x62656572
-#define CELL_MAX 24
+#define CELL_MAX 40
 
 /* path classes (columns) */
 enum {
@@ -95,19 +97,37 @@ enum {
     COL_SUBSYS_OUT, /* a walk through the subsystem link and back out of usb */
     COL_FOLD_OUT, /* a '..' out of /dev/bus/usb onto a name the backing owns */
     COL_FOLD_IN,  /* a '..' out of a foreign bus and back into /dev/bus/usb */
-    COL_SYS_FOLD_IN, /* a '..' out of a backing /sys name and back into ours */
-    COL_NODE_DOTDOT, /* the usb node followed by '..' */
-    COL_CLIMB,       /* a '..' out of /dev/bus over its own directories */
-    COL_CLIMB_FILE,  /* a '..' out of /dev/bus after the backing's file */
+    COL_SYS_FOLD_IN,  /* a '..' out of a backing /sys name and back into ours */
+    COL_NODE_DOTDOT,  /* the usb node followed by '..' */
+    COL_CLIMB,        /* a '..' out of /dev/bus over its own directories */
+    COL_CLIMB_FILE,   /* a '..' out of /dev/bus after the backing's file */
+    COL_TTY,          /* a live ttyACM alias node */
+    COL_TTY_BACK,     /* an alias-shaped name only the backing has */
+    COL_TTY_ABSENT,   /* an alias-shaped name absent on both sides */
+    COL_TTY_DOT_NODE, /* an alias node with a trailing "." component */
+    COL_TTY_DOTDOT,   /* an alias node followed by '..' */
+    COL_DEV_DOTDOT,   /* /dev/null followed by '..' */
+    COL_FOLD_FILE,    /* a '..' after the backing's file, back into usb */
+    COL_FOLD_ABSENT,  /* a '..' after a malformed usb name, back into usb */
     COL_COUNT,
 };
 
 static const char *col_name[COL_COUNT] = {
-    "synth-dir",   "back-sys",    "back-dev",   "subsys",       "escape",
-    "escape-syn",  "usb-node",    "absent",     "long-sys",     "sys-root",
-    "dev-bus",     "shadow",      "subsys-out", "dev-fold-out", "dev-fold-in",
-    "sys-fold-in", "node-dotdot", "dev-climb",  "dev-climb-f",
+    "synth-dir",   "back-sys",      "back-dev",        "subsys",
+    "escape",      "escape-syn",    "usb-node",        "absent",
+    "long-sys",    "sys-root",      "dev-bus",         "shadow",
+    "subsys-out",  "dev-fold-out",  "dev-fold-in",     "sys-fold-in",
+    "node-dotdot", "dev-climb",     "dev-climb-f",     "tty-alias",
+    "tty-planted", "tty-absent",    "tty-dot-node",    "tty-dotdot",
+    "dev-dotdot",  "dev-fold-file", "dev-fold-absent",
 };
+
+/* COL_TTY_DOT_NODE is the alias node with a trailing "." component: a character
+ * device used as a directory, which every entry point, chdir among them,
+ * answers ENOTDIR for. COL_TTY_DOTDOT puts a '..' there instead, which a
+ * lexical fold would turn into /dev, and COL_DEV_DOTDOT does the same to a node
+ * this layer does not serve.
+ */
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
  * bus carries whatever devices it has, and the guest's carries the fixture's.
@@ -180,6 +200,22 @@ static const char *col_path(int c)
         return "/dev/bus/usb/001/../../..";
     case COL_CLIMB_FILE:
         return "/dev/bus/other/f/../../../null";
+    case COL_TTY:
+        return "/dev/ttyACM0";
+    case COL_TTY_BACK:
+        return "/dev/ttyACM7";
+    case COL_TTY_ABSENT:
+        return "/dev/ttyACM31";
+    case COL_TTY_DOT_NODE:
+        return "/dev/ttyACM0/.";
+    case COL_TTY_DOTDOT:
+        return "/dev/ttyACM0/..";
+    case COL_DEV_DOTDOT:
+        return "/dev/null/..";
+    case COL_FOLD_FILE:
+        return "/dev/bus/other/f/../../usb/001/001";
+    case COL_FOLD_ABSENT:
+        return "/dev/bus/usb/xyz/../001/001";
     default:
         return "/dev/bus";
     }
@@ -223,6 +259,11 @@ static const char *col_path(int c)
  * why a fold cannot fix this half the way it fixes the /dev one.
  */
 
+/* The /dev half of the ownership question for the alias names. COL_TTY is a
+ * node this layer serves; COL_TTY_BACK is alias-shaped and only the backing has
+ * it, so it must fall through; COL_TTY_ABSENT is on neither side.
+ */
+
 /* COL_NODE_DOTDOT puts a '..' after COL_NODE's character device, which Linux
  * answers ENOTDIR for and a lexical fold would turn into the bus directory.
  */
@@ -231,6 +272,12 @@ static const char *col_path(int c)
  * /dev; its dirfd rows take the last '..' from a descriptor on /dev/bus.
  * COL_CLIMB_FILE leaves after COL_BACK_DEV's regular file, which Linux answers
  * ENOTDIR for, so placing the name by its fold alone cannot pass.
+ */
+
+/* COL_FOLD_FILE and COL_FOLD_ABSENT are COL_FOLD_IN with the '..' after a name
+ * that is not a directory: COL_BACK_DEV's file, which Linux answers ENOTDIR
+ * for, and a usb name no device can have, ENOENT. Popping either reaches
+ * COL_NODE.
  */
 
 /* Names that must be listed by the union directories, one comma-free name per
@@ -341,18 +388,29 @@ static void enc_fs(char *out, int rc, const struct statfs *sf)
  * *at() rows: they must reach the same answer through a relative walk that the
  * absolute spelling reaches directly.
  */
-static int parent_fd(const char *path, char *base, size_t basesz)
+static bool parent_name(const char *path,
+                        char *dir,
+                        size_t dirsz,
+                        char *base,
+                        size_t basesz)
 {
     const char *slash = strrchr(path, '/');
     if (!slash || slash == path)
-        return -1;
-    char dir[512];
+        return false;
     size_t n = (size_t) (slash - path);
-    if (n >= sizeof(dir) || strlen(slash + 1) >= basesz)
-        return -1;
+    if (n >= dirsz || strlen(slash + 1) >= basesz)
+        return false;
     memcpy(dir, path, n);
     dir[n] = '\0';
     snprintf(base, basesz, "%s", slash + 1);
+    return true;
+}
+
+static int parent_fd(const char *path, char *base, size_t basesz)
+{
+    char dir[512];
+    if (!parent_name(path, dir, sizeof(dir), base, basesz))
+        return -1;
     return open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 }
 
@@ -569,6 +627,49 @@ static void r_fchdir(const char *p, char *out)
         snprintf(out, CELL_MAX, "stuck");
 }
 
+/* The two *at rows asked of a cwd on the parent instead of a descriptor. A
+ * relative lookup tests the cwd separately from a descriptor's stamp, and chdir
+ * and fchdir publish the cwd through different code. "skip" is a parent this
+ * host cannot chdir onto.
+ */
+static void r_cwd_stat(const char *p, char *out)
+{
+    char dir[512], base[256];
+    if (!parent_name(p, dir, sizeof(dir), base, sizeof(base)) ||
+        chdir(dir) != 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    struct stat st;
+    enc_stat(out, stat(base, &st), &st);
+    if (chdir("/") != 0)
+        snprintf(out, CELL_MAX, "stuck");
+}
+
+static void r_fcwd_stat(const char *p, char *out)
+{
+    char dir[512], base[256];
+    if (!parent_name(p, dir, sizeof(dir), base, sizeof(base))) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    int rc = fchdir(dfd);
+    close(dfd);
+    if (rc != 0) {
+        snprintf(out, CELL_MAX, "skip");
+        return;
+    }
+    struct stat st;
+    enc_stat(out, stat(base, &st), &st);
+    if (chdir("/") != 0)
+        snprintf(out, CELL_MAX, "stuck");
+}
+
 static void r_epoll_ctl(const char *p, char *out)
 {
     int ep = epoll_create1(0);
@@ -619,6 +720,8 @@ static const struct {
     {"fstat_type", r_fstat_type},
     {"chdir", r_chdir},
     {"fchdir", r_fchdir},
+    {"cwd_stat", r_cwd_stat},
+    {"fcwd_stat", r_fcwd_stat},
     {"epoll_ctl", r_epoll_ctl},
     {"union_listing", r_union},
 };

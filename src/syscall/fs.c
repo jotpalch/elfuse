@@ -187,8 +187,8 @@ bool proc_path_is_symlink(const char *path)
 
 /* Resolve the proc_path the fd table should record for an intercepted path.
  * Returns true and fills *out when a mapping exists; false otherwise so the
- * caller can skip the install entirely. Pure string work; safe to call before
- * any lock acquisition.
+ * caller can skip the install entirely. For an alias name or /dev it consults
+ * the USB model under usb_lock, so call it with no fd-table lock held.
  */
 static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
 {
@@ -212,6 +212,26 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
      */
     if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/")) {
         str_copy_trunc(out, "/dev/pts", out_size);
+        return true;
+    }
+
+    /* A serial alias fd is a host fd on the macOS cu.* node, so fstat answers
+     * from the stamp to report the Linux 166:n or 188:n identity. Every
+     * spelling of the node is stamped as the canonical one, so this comes
+     * before the /dev/bus arm, which stamps a spelling as written.
+     */
+    char alias_node[64];
+    if (usb_tty_alias_node(path, alias_node, sizeof(alias_node))) {
+        str_copy_trunc(out, alias_node, out_size);
+        return true;
+    }
+
+    /* While an alias exists, /dev is served from a scratch directory, so a
+     * descriptor on it carries its guest name for the /dev/pts reason above.
+     */
+    char alias_dir[sizeof("/dev")];
+    if (usb_tty_alias_dir(path, alias_dir, sizeof(alias_dir))) {
+        str_copy_trunc(out, alias_dir, out_size);
         return true;
     }
 
@@ -686,8 +706,9 @@ static int fd_alloc_opened_host(int host_fd,
         return -1;
     }
 
-    /* Resolve the virtual-path stamp before taking fd_lock; the helper is pure
-     * string work and must not run inside the critical section.
+    /* Resolve the virtual-path stamp before taking fd_lock: for an alias name
+     * or /dev the helper consults the USB model under usb_lock, and none of
+     * that belongs inside the critical section.
      */
     char proc_path_buf[FD_VIRTUAL_PATH_MAX];
     bool have_proc_path = resolve_virtual_path(virtual_path, proc_path_buf,
@@ -918,7 +939,7 @@ int64_t sys_openat_path(guest_t *g,
                 return linux_errno();
             }
             int min_guest_fd =
-                (!strncmp(tx.intercept_path, "/dev/", 5)) ? -1 : 128;
+                path_prefix_match(tx.intercept_path, "/dev", 4) ? -1 : 128;
 
             /* An fd magic link (/dev/stdin, /dev/fd/N, /proc/self/fd/N) is
              * served by dup'ing a descriptor this process already holds, so the
@@ -2776,10 +2797,14 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
             proc_intercept_open(g, tx.intercept_path, LINUX_O_DIRECTORY, 0);
         if (host_fd >= 0) {
             char virt_buf[LINUX_PATH_MAX];
+            char alias_dir[sizeof("/dev")];
             const char *virt_path = tx.intercept_path;
             if (usb_sysfs_guest_path_for_fd(host_fd, virt_buf,
                                             sizeof(virt_buf)) > 0)
                 virt_path = virt_buf;
+            else if (usb_tty_alias_dir(tx.intercept_path, alias_dir,
+                                       sizeof(alias_dir)))
+                virt_path = alias_dir; /* /dev/sub/.. is published as /dev */
             int chdir_rc = fchdir(host_fd);
             int saved_errno = errno;
             close_keep_errno(host_fd);
@@ -2836,11 +2861,15 @@ int64_t sys_fchdir(int fd)
      * writing into a read-only view and reporting the wrong statfs magic.
      * Publishing the stamped guest spelling instead keeps the cwd on the
      * intercepts, exactly as chdir() does for these paths.
-     * resolve_proc_cwd_path knows the same two prefixes.
+     * resolve_proc_cwd_path knows the same prefixes, and /dev, which is
+     * scratch-backed while an alias exists.
      */
+    char alias_dir[sizeof("/dev")];
     if (!proc_virtual && fd_table[fd].proc_path[0] &&
         (path_prefix_match(fd_table[fd].proc_path, "/sys", 4) ||
-         path_prefix_match(fd_table[fd].proc_path, "/dev/bus", 8)))
+         path_prefix_match(fd_table[fd].proc_path, "/dev/bus", 8) ||
+         usb_tty_alias_dir(fd_table[fd].proc_path, alias_dir,
+                           sizeof(alias_dir))))
         proc_virtual = fd_table[fd].proc_path;
     if (fchdir(host_ref.fd) < 0) {
         host_fd_ref_close(&host_ref);

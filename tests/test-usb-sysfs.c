@@ -1148,6 +1148,260 @@ static int check_devices(void)
     return ndev;
 }
 
+/* Every alias, from each end: access against open on write permission, fstat
+ * against stat, a trailing slash against ENOTDIR, and O_CREAT|O_EXCL against
+ * EEXIST.
+ */
+static void check_alias_node(const char *name, bool acm)
+{
+    char node[128], why[256];
+    snprintf(node, sizeof(node), "/dev/%s", name);
+
+    struct stat nst;
+    if (stat(node, &nst) != 0) {
+        TEST("a listed alias node stats");
+        printf("      %s: %s\n", node, strerror(errno));
+        FAIL("stat the node");
+        return;
+    }
+
+    TEST("the tty alias carries the major Linux gives its kind");
+    snprintf(why, sizeof(why), "%s has major %u", name,
+             (unsigned) major(nst.st_rdev));
+    EXPECT_VALUE((unsigned) major(nst.st_rdev) == (acm ? 166u : 188u), why);
+
+    TEST("the tty alias minor is the index in its name");
+    snprintf(why, sizeof(why), "%s has minor %u", name,
+             (unsigned) minor(nst.st_rdev));
+    EXPECT_VALUE(
+        (unsigned long) minor(nst.st_rdev) == strtoul(name + 6, NULL, 10), why);
+
+    /* The guest's uid need not be the host uid the node reports, so a mode
+     * denying "other" would refuse here what the open below serves.
+     */
+    TEST("access() and open() both allow writing the alias node");
+    int acc = access(node, R_OK | W_OK);
+    int aerr = errno;
+    int wfd = open(node, O_RDWR | O_NONBLOCK | O_NOCTTY);
+    int werr = errno;
+    snprintf(why, sizeof(why), "%s: access(R|W)=%s, open(O_RDWR)=%s", name,
+             acc == 0 ? "ok" : strerror(aerr),
+             wfd >= 0 ? "ok" : strerror(werr));
+    EXPECT_VALUE(acc == 0 && wfd >= 0, why);
+    if (wfd >= 0)
+        close(wfd);
+
+    TEST("the alias reports devtmpfs through statfs and fstatfs");
+    {
+        struct statfs sfs, ffs;
+        int sfd = open(node, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+        bool ok = statfs(node, &sfs) == 0 && sfd >= 0 &&
+                  fstatfs(sfd, &ffs) == 0 && sfs.f_type == 0x01021994 &&
+                  ffs.f_type == 0x01021994;
+        if (sfd >= 0)
+            close(sfd);
+        EXPECT_TRUE(ok, node);
+    }
+
+    /* The host fd is on the cu.* node; fstat has to report the Linux node. */
+    TEST("the alias fd fstats as the node stat described");
+    int fd = open(node, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+    if (fd < 0) {
+        printf("      %s: %s\n", node, strerror(errno));
+        FAIL("open the alias node");
+    } else {
+        struct stat fst;
+        int rc = fstat(fd, &fst);
+        snprintf(why, sizeof(why),
+                 "%s: stat rdev %u:%u ino %llu, fstat rdev %u:%u ino %llu",
+                 name, (unsigned) major(nst.st_rdev),
+                 (unsigned) minor(nst.st_rdev), (unsigned long long) nst.st_ino,
+                 (unsigned) major(fst.st_rdev), (unsigned) minor(fst.st_rdev),
+                 (unsigned long long) fst.st_ino);
+        EXPECT_VALUE(rc == 0 && S_ISCHR(fst.st_mode) &&
+                         fst.st_rdev == nst.st_rdev &&
+                         fst.st_ino == nst.st_ino && fst.st_dev == nst.st_dev,
+                     why);
+        close(fd);
+    }
+
+    /* The node through a cwd of /dev, set by chdir and by fchdir, which publish
+     * the cwd through different code. This lane has no sysroot; the matrix
+     * lane's cwd rows run with one.
+     */
+    TEST("a cwd-relative name reaches the node the absolute spelling reaches");
+    {
+        int dfd = open("/dev", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        struct stat cst, fst2;
+        int crc = chdir("/dev") == 0 ? stat(name, &cst) : -1;
+        int cerr = errno;
+        int frc = -1, ferr = 0;
+        if (dfd >= 0 && chdir("/") == 0 && fchdir(dfd) == 0) {
+            frc = stat(name, &fst2);
+            ferr = errno;
+        }
+        if (dfd >= 0)
+            close(dfd);
+        if (chdir("/") != 0)
+            FAIL("chdir back to /");
+        else {
+            snprintf(why, sizeof(why),
+                     "%s: chdir+stat=%s, fchdir+stat=%s, absolute rdev %u:%u",
+                     name, crc == 0 ? "ok" : strerror(cerr),
+                     frc == 0 ? "ok" : strerror(ferr),
+                     (unsigned) major(nst.st_rdev),
+                     (unsigned) minor(nst.st_rdev));
+            EXPECT_VALUE(
+                crc == 0 && frc == 0 && S_ISCHR(cst.st_mode) &&
+                    S_ISCHR(fst2.st_mode) && cst.st_rdev == nst.st_rdev &&
+                    fst2.st_rdev == nst.st_rdev && cst.st_ino == nst.st_ino &&
+                    fst2.st_ino == nst.st_ino,
+                why);
+        }
+    }
+
+    /* A device node takes the lowest free fd, which busybox sh relies on when
+     * it closes 0 and opens a node as stdin; a synthetic /proc file starts at
+     * 128. Asserted for every spelling of the node.
+     */
+    TEST("every spelling of the alias node takes the lowest free fd");
+    static const char *const forms[] = {"/dev/%s", "//dev/%s", "/.//dev/%s",
+                                        "/dev/./%s"};
+    int got[4];
+    bool lowest = true;
+    for (unsigned i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        char spelled[136];
+        snprintf(spelled, sizeof(spelled), forms[i], name);
+        int keep = dup(STDIN_FILENO);
+        close(STDIN_FILENO);
+        got[i] = open(spelled, O_RDWR | O_NONBLOCK | O_NOCTTY);
+        if (got[i] != STDIN_FILENO)
+            lowest = false;
+        if (got[i] >= 0)
+            close(got[i]);
+        if (keep >= 0) {
+            dup2(keep, STDIN_FILENO);
+            close(keep);
+        }
+    }
+    snprintf(why, sizeof(why),
+             "%s: /dev/=%d, //dev/=%d, /.//dev/=%d, /dev/./=%d", name, got[0],
+             got[1], got[2], got[3]);
+    EXPECT_VALUE(lowest, why);
+
+    TEST("a character device named as a directory is ENOTDIR");
+    char slashed[136];
+    snprintf(slashed, sizeof(slashed), "%s/", node);
+    struct stat sst;
+    int srt = stat(slashed, &sst);
+    int serr = errno;
+    int dfd = open(node, O_RDONLY | O_DIRECTORY);
+    int derr = errno;
+    snprintf(why, sizeof(why), "%s/: stat=%s, O_DIRECTORY=%s", node,
+             srt == 0 ? "ok" : strerror(serr),
+             dfd >= 0 ? "ok" : strerror(derr));
+    EXPECT_VALUE(srt < 0 && serr == ENOTDIR && dfd < 0 && derr == ENOTDIR, why);
+    if (dfd >= 0)
+        close(dfd);
+
+    TEST("O_CREAT|O_EXCL on a node that exists is EEXIST");
+    int cfd = open(node, O_RDWR | O_CREAT | O_EXCL | O_NONBLOCK, 0644);
+    int cerr = errno;
+    snprintf(why, sizeof(why), "%s: %s", node,
+             cfd >= 0 ? "created" : strerror(cerr));
+    EXPECT_VALUE(cfd < 0 && cerr == EEXIST, why);
+    if (cfd >= 0)
+        close(cfd);
+}
+
+/* /dev while an alias makes the layer serve it: one identity through stat and
+ * through a descriptor, a '..' after a node that is ENOTDIR from a descriptor
+ * and from a cwd there, and a cwd reached through /dev/bus/.. that getcwd names
+ * /dev.
+ */
+static void check_served_dev(const char *alias)
+{
+    struct stat ps, fs;
+    char rel[64], cwd[256];
+    snprintf(rel, sizeof(rel), "%s/..", alias);
+
+    int dfd = open("/dev", O_RDONLY | O_DIRECTORY);
+    TEST("a served /dev opens on the lowest free descriptor");
+    EXPECT_TRUE(dfd >= 0 && dfd < 128, "open(/dev) descriptor number");
+
+    TEST("a served /dev reports devtmpfs");
+    {
+        struct statfs dsf;
+        EXPECT_TRUE(statfs("/dev", &dsf) == 0 && dsf.f_type == 0x01021994,
+                    "statfs(/dev)");
+    }
+
+    TEST("/dev has one identity through stat and through a descriptor");
+    if (dfd < 0 || stat("/dev", &ps) != 0 || fstat(dfd, &fs) != 0) {
+        FAIL("open, stat or fstat of /dev");
+        if (dfd >= 0)
+            close(dfd);
+        return;
+    }
+    EXPECT_TRUE(ps.st_dev == fs.st_dev && ps.st_ino == fs.st_ino,
+                "stat and fstat of /dev disagree");
+
+    TEST("a '..' after an alias node is ENOTDIR relative to a /dev dirfd");
+    EXPECT_ERRNO(fstatat(dfd, rel, &ps, 0), ENOTDIR, rel);
+    close(dfd);
+
+    TEST("a '..' after a node is ENOTDIR relative to a /dev cwd");
+    if (chdir("/dev") != 0) {
+        FAIL("chdir /dev");
+    } else {
+        int a = stat(rel, &ps), ae = errno;
+        int n = stat("null/..", &ps), ne = errno;
+        EXPECT_TRUE(a < 0 && ae == ENOTDIR && n < 0 && ne == ENOTDIR,
+                    "alias/.. or null/.. from /dev was not ENOTDIR");
+    }
+
+    TEST("a cwd reached through /dev/bus/.. is /dev");
+    EXPECT_TRUE(chdir("/dev/bus/..") == 0 && getcwd(cwd, sizeof(cwd)) &&
+                    !strcmp(cwd, "/dev"),
+                "getcwd after chdir(/dev/bus/..)");
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+}
+
+/* The aliases /dev lists, which is the union listing under test as well. The
+ * default fixture's two devices must be among them.
+ *
+ * Returns the number examined, which the caller prints.
+ */
+static int check_tty_aliases(void)
+{
+    const char *fixture = getenv("ELFUSE_USB_FIXTURE");
+    DIR *dp = opendir("/dev");
+    if (!dp)
+        return 0;
+
+    int n = 0;
+    bool acm0 = false, usb0 = false;
+    struct dirent *ent;
+    while ((ent = readdir(dp))) {
+        if (strncmp(ent->d_name, "ttyACM", 6) &&
+            strncmp(ent->d_name, "ttyUSB", 6))
+            continue;
+        n++;
+        acm0 |= !strcmp(ent->d_name, "ttyACM0");
+        usb0 |= !strcmp(ent->d_name, "ttyUSB0");
+        check_alias_node(ent->d_name, ent->d_name[3] == 'A');
+        if (n == 1)
+            check_served_dev(ent->d_name);
+    }
+    closedir(dp);
+    if (fixture && !strcmp(fixture, "1")) {
+        TEST("/dev lists the fixture's ttyACM0 and ttyUSB0");
+        EXPECT_TRUE(acm0 && usb0, "a fixture alias is missing from /dev");
+    }
+    return n;
+}
+
 /* A '..' after a usbfs node is ENOTDIR however the name is reached: spelled in
  * full, relative to a descriptor on the bus directory or on the host's /dev, or
  * relative to a cwd there, which chdir and fchdir publish through different
@@ -1259,6 +1513,7 @@ int main(void)
      * against, and a zero here means those assertions did not execute.
      */
     printf("  devices examined: %d\n", ndev);
+    printf("  tty aliases examined: %d\n", check_tty_aliases());
 
     SUMMARY("test-usb-sysfs");
     return fails > 0 ? 1 : 0;

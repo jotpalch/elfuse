@@ -75,11 +75,11 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
                                  char *out,
                                  size_t outsz);
 
-/* Rewrite a /dev/bus name whose '..' climb above /dev/bus, popping only
- * directories the layer serves, to the name under /dev it lands on, the rest
- * kept as written, and again while that name climbs out of /dev/bus. A backing
- * without /dev/bus, the macOS host's, cannot apply those '..'; a walk through
- * any other name is left to the backing.
+/* Rewrite a /dev name whose '..' pop only directories the layer serves, or /dev
+ * itself, to the name the walk lands on, the rest kept as written, and again
+ * while that name still folds. A backing without those directories, the macOS
+ * host's, cannot apply the '..'; a walk through any other name is left to
+ * classify_path and the backing.
  *
  * Returns true with @out filled, or false when nothing is rewritten.
  */
@@ -144,3 +144,28 @@ int usb_sysfs_device_info(int busnum, int devnum, usb_sysfs_devinfo_t *out);
  * Returns 0, or -1 with errno set.
  */
 int usb_sysfs_node_stat(int busnum, int devnum, struct stat *st);
+
+/* Whether @path is exactly "/dev/ttyACM<n>", "/dev/ttyUSB<n>" or "/dev". String
+ * work only; for a descriptor stamp, which is canonical and is only ever set on
+ * these names while the layer serves them.
+ */
+bool usb_tty_alias_path(const char *path);
+
+/* Whether @path, in any spelling this layer folds, names /dev while this layer
+ * serves it, which is while an alias exists; @out receives the canonical
+ * spelling. Takes usb_lock, and sysroot_lock before it, not nested, when the
+ * fold asks the backing about a name.
+ */
+bool usb_tty_alias_dir(const char *path, char *out, size_t outsz);
+
+/* The alias node a name resolves to, or false when no such alias exists. Takes
+ * usb_lock and looks the device up, and sysroot_lock before it, not nested,
+ * when the fold asks the backing about a name.
+ */
+bool usb_tty_alias_node(const char *path, char *out, size_t outsz);
+
+/* Whether @path could name something under /sys or /dev this layer serves,
+ * decided as the intercepts decide it. A '..' after a /dev name of the
+ * backing's asks the backing (sysroot_lock); usb_lock is not taken.
+ */
+bool usb_sysfs_path_might_be_ours(const char *path);

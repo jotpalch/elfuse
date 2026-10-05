@@ -281,7 +281,7 @@ $(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 $(call run-lane,test-path-fold,one answer per object however its path is spelled)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
-$(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point against every path class)
+$(call run-lane,test-usb-sysfs-matrix,every /sys and /dev entry point against every path class)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-usbdev-ioctl,the usbdevfs fd contract without hardware)
 $(call run-lane,test-usbdev-faults,the usbdevfs fd's forced failures)
@@ -1717,6 +1717,8 @@ test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 ## /sys behind the synthetic USB view, so this lane stages a sysroot skeleton
 ## (a net address, a THP knob, a node list) and runs the guest against it with
 ## the deterministic USB fixture so the /sys/bus/usb assertions have devices.
+## The /dev half needs names only the sysroot has: two alias-shaped regular
+## files and a directory, /dev/sub, to take a '..' after.
 test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
@@ -1724,20 +1726,23 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	mkdir -p "$$sysroot/sys/class/net/eth0" \
 		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
-		"$$sysroot/sys/devices/system/node"; \
+		"$$sysroot/sys/devices/system/node" "$$sysroot/dev/sub"; \
 	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
 	printf 'always [madvise] never\n' \
 		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
 	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	printf 'planted-acm7\n' > "$$sysroot/dev/ttyACM7"; \
+	printf 'planted-usb9\n' > "$$sysroot/dev/ttyUSB9"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot
 
 ## Every entry point that can name something under /sys or /dev/bus, against
-## every class of name those trees can hold. The layer synthesizes one subtree
-## on each side and the rest belongs to the sysroot, so the sysroot has to carry
-## the other side of each column: a /sys skeleton, a foreign /dev/bus, an /etc
-## file for the '..' chain that leaves the tree, and one name planted inside
-## /dev/bus/usb, which the layer owns and the backing must not reach into.
+## every class of name those trees can hold. The layer owns one subtree on each
+## side and adds the alias names to /dev, and the rest belongs to the sysroot,
+## so the sysroot has to carry the other side of each column: a /sys skeleton, a
+## foreign /dev/bus, an alias-shaped file in /dev, an /etc file for the '..' chain
+## that leaves the tree, and one name planted inside /dev/bus/usb, which the
+## layer owns and the backing must not reach into.
 ## Nothing is planted under the sysroot's /sys/bus: a Linux rootfs image carries
 ## an empty /sys, and its not having a `bus` is the shape the escape-syn column
 ## records. Expected values are the
@@ -1759,6 +1764,7 @@ test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
 	: > "$$sysroot/sys/fs/cgroup/g"; \
 	: > "$$sysroot/dev/bus/other/f"; \
 	: > "$$sysroot/dev/bus/usb/099/001"; \
+	printf 'planted-acm7\n' > "$$sysroot/dev/ttyACM7"; \
 	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-matrix

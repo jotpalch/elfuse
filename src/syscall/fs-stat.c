@@ -18,6 +18,7 @@
 #include "debug/log.h"
 
 #include "runtime/procemu.h"
+#include "runtime/usb-sysfs.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
@@ -154,7 +155,9 @@ static int write_linux_statx(guest_t *g,
 
 /* Whether a descriptor's identity comes from the stamp rather than from the
  * host object underneath it: O_PATH, /sys and /dev/bus do, /proc does not. See
- * docs/internals.md, "Filesystem Identity Of A Descriptor", for why.
+ * docs/internals.md, "Filesystem Identity Of A Descriptor", for why. A serial
+ * alias node and a served /dev do too: their host fds are on the macOS cu.*
+ * node and on a scratch directory.
  */
 static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
 {
@@ -162,7 +165,8 @@ static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
         return false;
     return snap->type == FD_PATH ||
            path_prefix_match(snap->proc_path, "/sys", 4) ||
-           path_prefix_match(snap->proc_path, "/dev/bus", 8);
+           path_prefix_match(snap->proc_path, "/dev/bus", 8) ||
+           usb_tty_alias_path(snap->proc_path);
 }
 
 static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
@@ -560,7 +564,7 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
     return n > 0 && (size_t) n < abssz;
 }
 
-/* What the synthetic USB tree answers for a /dev/bus name: 0 when it serves the
+/* What the synthetic USB tree answers for a /dev name: 0 when it serves the
  * name, -1 with errno set when it owns the name and the lookup failed, and
  * PROC_NOT_INTERCEPTED when the name is not ours at all.
  *
@@ -570,17 +574,19 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
  * serves usbfs nodes from the devtmpfs that carries the rest of /dev and
  * reports TMPFS_MAGIC for them (0x01021994, measured on 6.x alongside /dev and
  * /dev/null, which report the same). Both entry points ask this one question so
- * they agree on every /dev/bus name either can reach.
+ * they agree on every such name either can reach.
  *
  * The last two answers stay distinct because collapsing them is the bug
  * sys_faccessat had: a sysroot carrying a name inside /dev/bus/usb -- on a bus
  * number no device has -- would otherwise have its file answer statfs while
  * open, stat and access all report ENOENT for the same path. Only
- * PROC_NOT_INTERCEPTED means "ask the backing".
+ * PROC_NOT_INTERCEPTED means "ask the backing". The serial alias nodes and
+ * their directories are on the same devtmpfs on Linux.
  */
-static int statfs_dev_bus_class(const char *path)
+static int statfs_usb_dev_class(const char *path)
 {
-    if (!path || !path_prefix_match(path, "/dev/bus", 8))
+    if (!path || !path_prefix_match(path, "/dev", 4) ||
+        !usb_sysfs_path_might_be_ours(path))
         return PROC_NOT_INTERCEPTED;
     struct stat st;
     return proc_intercept_stat_at(path, &st, true);
@@ -710,10 +716,10 @@ static int64_t sys_statfs_impl(guest_t *g,
         return 0;
     }
 
-    int dev_bus = statfs_dev_bus_class(name);
-    if (dev_bus == -1)
+    int usb_dev = statfs_usb_dev_class(name);
+    if (usb_dev == -1)
         return linux_errno();
-    if (dev_bus == 0) {
+    if (usb_dev == 0) {
         linux_statfs_t lin_st;
         fill_dev_statfs(&lin_st);
         if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
@@ -873,7 +879,7 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
      * valid one whatever became of its name, so a claimed-and-failed lookup is
      * no reason to fail fstatfs, and the host answers as it did before.
      */
-    if (fd_name && statfs_dev_bus_class(fd_name) == 0) {
+    if (fd_name && statfs_usb_dev_class(fd_name) == 0) {
         host_fd_ref_close(&host_ref);
         linux_statfs_t dev_st;
         fill_dev_statfs(&dev_st);

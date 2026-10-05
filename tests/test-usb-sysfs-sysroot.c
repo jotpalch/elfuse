@@ -13,7 +13,7 @@
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Two regressions are pinned here.
+ * Three cases are pinned here, the first two after regressions.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -29,6 +29,13 @@
  * lands in the read-only tree, and fstatfs reports the /tmp filesystem instead
  * of sysfs. The cubic behavior that must survive: a relative walk resolved
  * against that cwd still reaches the synthetic attributes.
+ *
+ * F3: the same ownership question for the alias names in /dev. The lane's
+ * sysroot carries a regular file at /dev/ttyACM7 and /dev/ttyUSB9, alias-shaped
+ * names with no device behind them, and every entry point has to reach them.
+ * Listing and lookup are asserted together, absolutely, through a dirfd and
+ * through a cwd, and a '..' after the sysroot's /dev/sub lands on the served
+ * /dev.
  */
 
 #include <dirent.h>
@@ -226,6 +233,140 @@ int main(void)
             PASS();
         else
             FAIL("relative 1-1/idVendor against the /sys cwd");
+    }
+
+    if (chdir("/") != 0)
+        FAIL("chdir back to /");
+
+    /* F3: the /dev half of the ownership question */
+
+    TEST("an alias-shaped name the sysroot owns reaches the sysroot");
+    {
+        ssize_t n = read_file("/dev/ttyACM7", buf, sizeof(buf));
+        if (n < 0)
+            FAIL(
+                "open /dev/ttyACM7 (the layer claimed a name it does not "
+                "serve)");
+        else if (strcmp(buf, "planted-acm7\n") != 0)
+            FAIL("wrong /dev/ttyACM7 content");
+        else
+            PASS();
+    }
+
+    TEST("stat of a sysroot-owned alias-shaped name reports its file");
+    {
+        struct stat st;
+        EXPECT_TRUE(stat("/dev/ttyUSB9", &st) == 0 && S_ISREG(st.st_mode),
+                    "/dev/ttyUSB9 should be the sysroot's regular file");
+    }
+
+    TEST("an alias-shaped name nothing carries is ENOENT");
+    EXPECT_ERRNO(open("/dev/ttyACM31", O_RDONLY), ENOENT,
+                 "an unserved, unbacked alias name should be ENOENT");
+
+    /* Every listed name resolves, and a relative spelling through a descriptor
+     * or a cwd (chdir and fchdir both) reaches what the absolute one does.
+     */
+    const char *want[] = {"ttyACM0", "ttyUSB0", "ttyACM7", "ttyUSB9"};
+    const size_t nwant = sizeof(want) / sizeof(want[0]);
+    bool seen[sizeof(want) / sizeof(want[0])] = {false};
+    TEST("every name /dev lists is reachable: absolute, dirfd, chdir, fchdir");
+    {
+        DIR *dp = opendir("/dev");
+        char bad[256];
+        bad[0] = '\0';
+        if (!dp) {
+            FAIL("opendir /dev");
+        } else {
+            int dfd = dirfd(dp);
+            struct dirent *e;
+            while ((e = readdir(dp))) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                    continue;
+                if (strncmp(e->d_name, "tty", 3))
+                    continue;
+                for (size_t i = 0; i < nwant; i++)
+                    seen[i] |= !strcmp(e->d_name, want[i]);
+                char full[512];
+                snprintf(full, sizeof(full), "/dev/%s", e->d_name);
+                struct stat a, b, c, f;
+                if (lstat(full, &a) != 0) {
+                    snprintf(bad, sizeof(bad), "%s listed but lstat says %s",
+                             e->d_name, strerror(errno));
+                    break;
+                }
+                if (fstatat(dfd, e->d_name, &b, AT_SYMLINK_NOFOLLOW) != 0) {
+                    snprintf(bad, sizeof(bad), "%s: dirfd lookup says %s",
+                             e->d_name, strerror(errno));
+                    break;
+                }
+                if (chdir("/dev") != 0 || fstatat(AT_FDCWD, e->d_name, &c,
+                                                  AT_SYMLINK_NOFOLLOW) != 0) {
+                    snprintf(bad, sizeof(bad), "%s: chdir lookup says %s",
+                             e->d_name, strerror(errno));
+                    break;
+                }
+                if (chdir("/") != 0 || fchdir(dfd) != 0 ||
+                    fstatat(AT_FDCWD, e->d_name, &f, AT_SYMLINK_NOFOLLOW) !=
+                        0) {
+                    snprintf(bad, sizeof(bad), "%s: fchdir lookup says %s",
+                             e->d_name, strerror(errno));
+                    break;
+                }
+                if (chdir("/") != 0) {
+                    snprintf(bad, sizeof(bad), "chdir back to / says %s",
+                             strerror(errno));
+                    break;
+                }
+                if (a.st_ino != b.st_ino || a.st_ino != c.st_ino ||
+                    a.st_ino != f.st_ino ||
+                    (a.st_mode & S_IFMT) != (b.st_mode & S_IFMT) ||
+                    (a.st_mode & S_IFMT) != (c.st_mode & S_IFMT) ||
+                    (a.st_mode & S_IFMT) != (f.st_mode & S_IFMT)) {
+                    snprintf(bad, sizeof(bad),
+                             "%s: absolute, dirfd, chdir and fchdir do not all "
+                             "name one object",
+                             e->d_name);
+                    break;
+                }
+            }
+            closedir(dp);
+            if (chdir("/") != 0 && !bad[0])
+                snprintf(bad, sizeof(bad), "chdir back to / failed");
+            if (bad[0])
+                FAIL(bad);
+            else
+                PASS();
+        }
+    }
+
+    TEST("/dev lists the aliases and the sysroot's alias-shaped files");
+    {
+        const char *missing = NULL;
+        for (size_t i = 0; i < nwant && !missing; i++)
+            if (!seen[i])
+                missing = want[i];
+        EXPECT_TRUE(!missing, missing ? missing : "");
+    }
+
+    TEST("/dev/sub/.. is the served /dev and reaches the alias");
+    {
+        struct stat dev, up, node;
+        EXPECT_TRUE(stat("/dev", &dev) == 0 && stat("/dev/sub/..", &up) == 0 &&
+                        dev.st_dev == up.st_dev && dev.st_ino == up.st_ino &&
+                        stat("/dev/sub/../ttyACM0", &node) == 0 &&
+                        S_ISCHR(node.st_mode),
+                    "/dev/sub/.. or /dev/sub/../ttyACM0");
+    }
+
+    TEST("chdir /dev/sub/.. publishes /dev");
+    {
+        char cwd[64];
+        EXPECT_TRUE(chdir("/dev/sub/..") == 0 && getcwd(cwd, sizeof(cwd)) &&
+                        !strcmp(cwd, "/dev"),
+                    "getcwd after chdir(/dev/sub/..)");
+        if (chdir("/") != 0)
+            FAIL("chdir back to /");
     }
 
     SUMMARY("test-usb-sysfs-sysroot");

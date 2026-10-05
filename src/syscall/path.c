@@ -44,7 +44,6 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
  * module answers, not about what the filesystem can do.
  */
 #define SYSFS_PREFIX "/sys"
-#define DEV_USB_PREFIX "/dev/bus"
 
 static size_t bare_len(const char *path)
 {
@@ -240,9 +239,14 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (fuse_path_matches_mount(path))
         return true;
-    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1))
-        return true;
-    if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
+
+    /* The /dev names the USB layer serves (/dev/bus and the serial aliases) are
+     * asked of it, so this gate and the intercept decide ownership the same
+     * way. /sys keeps its literal, since it also fronts the syscpu stub, which
+     * the USB layer disowns.
+     */
+    if (path_prefix_match(path, SYSFS_PREFIX, sizeof(SYSFS_PREFIX) - 1) ||
+        usb_sysfs_path_might_be_ours(path))
         return true;
 
     /* Synthesized on open, so it has to exist for stat too. */
@@ -674,10 +678,11 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    /* A /dev/bus name whose '..' leave it is rewritten the same way, so the
-     * absolute spelling and one joined to a cwd or dirfd there land together.
+    /* A /dev name whose '..' pop the layer's directories is rewritten the same
+     * way, so the absolute spelling and one joined to a cwd or dirfd there land
+     * together.
      */
-    if (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
+    if (path_prefix_match(tx->guest_path, "/dev", 4)) {
         char resolved[LINUX_PATH_MAX];
         if (usb_dev_resolve_guest_path(tx->guest_path, resolved,
                                        sizeof(resolved))) {
@@ -1366,9 +1371,9 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
 }
 
 /* Rebuild @path against the guest directory @base as an absolute guest path.
- * Under /dev/bus the name is joined as written: the USB layer folds it and
- * stops at a '..' after a usbfs node, which a lexical fold here would pop.
- * Elsewhere the components are folded.
+ * Under /dev/bus and on a served /dev the name is joined as written: the USB
+ * layer folds it and stops at a '..' after a node, which a lexical fold here
+ * would pop. Elsewhere the components are folded.
  *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */
@@ -1377,7 +1382,7 @@ static int path_rebuild_under(const char *base,
                               char *out,
                               size_t outsz)
 {
-    if (path_prefix_match(base, "/dev/bus", 8)) {
+    if (path_prefix_match(base, "/dev/bus", 8) || !strcmp(base, "/dev")) {
         int n = snprintf(out, outsz, "%s/%s", base, path);
         if (n < 0 || (size_t) n >= outsz) {
             errno = ENAMETOOLONG;
@@ -1442,8 +1447,16 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
     if (!path || path[0] == '\0' || path[0] == '/')
         return 0;
 
+    /* Copied out, so the /dev check below, which takes usb_lock, does not run
+     * under cwd_lock.
+     */
     proc_cwd_view_t view;
     if (proc_acquire_cwd_view(&view) < 0)
+        return 0;
+    char base[LINUX_PATH_MAX];
+    bool fits = str_copy_trunc(base, view.path, sizeof(base)) < sizeof(base);
+    proc_release_cwd_view(&view);
+    if (!fits)
         return 0;
 
     /* /dev/pts and the synthetic USB trees join /proc here: all are served from
@@ -1451,15 +1464,16 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
      * relative path measured against one has to be rebuilt as a guest path and
      * re-offered to the intercepts. Without the /sys and /dev/bus arms a cwd
      * set by fchdir() onto a synthetic USB directory would resolve relative
-     * names straight against the scratch tree.
+     * names straight against the scratch tree. /dev joins them while an alias
+     * exists; the canonical name the layer hands back is unused, since base is
+     * already the guest's own.
      */
-    int rc = 0;
-    if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8) ||
-        !strncmp(view.path, "/sys", 4) || !strncmp(view.path, "/dev/bus", 8))
-        rc = path_rebuild_under(view.path, path, out, outsz) < 0 ? -1 : 1;
-
-    proc_release_cwd_view(&view);
-    return rc;
+    char alias_dir[sizeof("/dev")];
+    if (!strncmp(base, "/proc", 5) || !strncmp(base, "/dev/pts", 8) ||
+        !strncmp(base, "/sys", 4) || !strncmp(base, "/dev/bus", 8) ||
+        usb_tty_alias_dir(base, alias_dir, sizeof(alias_dir)))
+        return path_rebuild_under(base, path, out, outsz) < 0 ? -1 : 1;
+    return 0;
 }
 
 int resolve_proc_at_path(guest_fd_t dirfd,
