@@ -1709,16 +1709,20 @@ test-path-fold: $(ELFUSE_BIN) $(TEST_DIR)/test-path-fold
 # The fixture stays on: stage 2's FD_USBDEV constructor resolves its IOKit
 # device on first use rather than at open, so a modeled device with no hardware
 # behind it still opens, reads and stats like one -- which is what keeps this
-# lane's device half running on a machine with no USB device attached.
+# lane's device half running on a machine with no USB device attached. The
+# second run adds the serial fixture: a CDC device bound through its Union
+# descriptor and a two-port bridge.
 test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
+	ELFUSE_USB_FIXTURE=serial $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
 
 ## The /sys ours/not-ours split and the fchdir/cwd containment need a populated
 ## /sys behind the synthetic USB view, so this lane stages a sysroot skeleton
 ## (a net address, a THP knob, a node list) and runs the guest against it with
 ## the deterministic USB fixture so the /sys/bus/usb assertions have devices.
 ## The /dev half needs names only the sysroot has: two alias-shaped regular
-## files and a directory, /dev/sub, to take a '..' after.
+## files and a directory, /dev/sub, to take a '..' after. /sys/class/tty carries
+## a tty of the sysroot's own next to the aliases.
 test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
@@ -1726,11 +1730,13 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	mkdir -p "$$sysroot/sys/class/net/eth0" \
 		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
-		"$$sysroot/sys/devices/system/node" "$$sysroot/dev/sub"; \
+		"$$sysroot/sys/devices/system/node" "$$sysroot/dev/sub" \
+		"$$sysroot/sys/class/tty/ttyS0"; \
 	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
 	printf 'always [madvise] never\n' \
 		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
 	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	printf '4:64\n' > "$$sysroot/sys/class/tty/ttyS0/dev"; \
 	printf 'planted-acm7\n' > "$$sysroot/dev/ttyACM7"; \
 	printf 'planted-usb9\n' > "$$sysroot/dev/ttyUSB9"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
@@ -1738,11 +1744,12 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 
 ## Every entry point that can name something under /sys or /dev/bus, against
 ## every class of name those trees can hold. The layer owns one subtree on each
-## side and adds the alias names to /dev, and the rest belongs to the sysroot,
-## so the sysroot has to carry the other side of each column: a /sys skeleton, a
-## foreign /dev/bus, an alias-shaped file in /dev, an /etc file for the '..' chain
-## that leaves the tree, and one name planted inside /dev/bus/usb, which the
-## layer owns and the backing must not reach into.
+## side and adds the alias names to /dev and /sys/class/tty, and the rest
+## belongs to the sysroot, so the sysroot has to carry the other side of each
+## column: a /sys skeleton, a foreign /dev/bus, an alias-shaped file in /dev, an
+## /etc file for the '..' chain that leaves the tree, and one name planted
+## inside /dev/bus/usb, which the layer owns and the backing must not reach
+## into.
 ## Nothing is planted under the sysroot's /sys/bus: a Linux rootfs image carries
 ## an empty /sys, and its not having a `bus` is the shape the escape-syn column
 ## records. Expected values are the

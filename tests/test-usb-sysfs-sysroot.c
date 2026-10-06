@@ -15,13 +15,14 @@
  *
  * Three cases are pinned here, the first two after regressions.
  *
- * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
- * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
- * the sysroot rather than be answered ENOENT, which would shadow the backing
- * /sys and leave the layer self-contradicting -- access() reading the sysroot
- * file as present while open() reports it absent. The cubic behavior that must
- * survive: /sys/bus/usb still serves the synthetic tree, and its attributes are
- * still epoll-addable (a real sysfs attribute is pollable through kernfs).
+ * F1: the USB layer synthesizes /sys/bus/usb and the alias entries of
+ * /sys/class/tty. A name it does not model (the rest of /sys/class,
+ * /sys/kernel, /sys/devices) must fall through to the sysroot rather than be
+ * answered ENOENT, which would shadow the backing /sys and leave the layer
+ * self-contradicting: access() reading the sysroot file as present while open()
+ * reports it absent. The cubic behavior that must survive: /sys/bus/usb still
+ * serves the synthetic tree, and its attributes are still epoll-addable (a real
+ * sysfs attribute is pollable through kernfs).
  *
  * F2: a descriptor opened on a synthetic /sys or /dev/bus directory is stamped
  * with the guest spelling. fchdir() onto it must publish that spelling as the
@@ -117,9 +118,60 @@ int main(void)
             close(fd);
     }
 
+    /* /sys/class is synthesized (it holds the tty aliases) and backed, so its
+     * listing is the union of both.
+     */
     TEST("readdir(/sys/class) lists the sysroot's entries");
     EXPECT_TRUE(dir_has_entry("/sys/class", "net"),
                 "/sys/class did not list net");
+
+    /* Both sides carry tty, the layer for the aliases and the sysroot for
+     * ttyS0, and the union names it once.
+     */
+    TEST("readdir(/sys/class) lists tty once");
+    {
+        int ntty = 0;
+        DIR *d = opendir("/sys/class");
+        struct dirent *e;
+        while (d && (e = readdir(d)))
+            ntty += !strcmp(e->d_name, "tty");
+        if (d)
+            closedir(d);
+        EXPECT_TRUE(ntty == 1, "/sys/class did not list tty exactly once");
+    }
+
+    TEST("an unsynthesized /sys/class subtree reaches the sysroot");
+    EXPECT_TRUE(dir_has_entry("/sys/class/net", "eth0"),
+                "/sys/class/net did not list eth0");
+
+    /* /sys/class/tty is synthesized for the aliases and backed too, and a tty
+     * the sysroot carries is one the layer does not model, so it falls through.
+     * A '..' that walks into /sys/class/tty from a backing name still follows
+     * the alias link, so the walk lands in the tty directory's parent rather
+     * than in /sys/class/tty.
+     */
+    TEST("/sys/kernel/../class/tty/ttyACM0/.. follows the alias link");
+    {
+        struct stat via, direct, lexical;
+        EXPECT_TRUE(
+            stat("/sys/kernel/../class/tty/ttyACM0/..", &via) == 0 &&
+                stat("/sys/class/tty/ttyACM0/..", &direct) == 0 &&
+                stat("/sys/class/tty", &lexical) == 0 &&
+                via.st_ino == direct.st_ino && via.st_ino != lexical.st_ino,
+            "the walk did not land where /sys/class/tty/ttyACM0/.. does");
+    }
+
+    TEST("/sys/class/tty lists the sysroot's tty next to an alias");
+    EXPECT_TRUE(dir_has_entry("/sys/class/tty", "ttyS0") &&
+                    dir_has_entry("/sys/class/tty", "ttyACM0"),
+                "/sys/class/tty did not list both ttyS0 and ttyACM0");
+
+    TEST("the sysroot's own /sys/class/tty entry reaches the sysroot");
+    {
+        ssize_t n = read_file("/sys/class/tty/ttyS0/dev", buf, sizeof(buf));
+        EXPECT_TRUE(n > 0 && !strcmp(buf, "4:64\n"),
+                    "/sys/class/tty/ttyS0/dev did not read 4:64");
+    }
 
     TEST("/sys/kernel attribute reaches the sysroot");
     EXPECT_TRUE(read_file("/sys/kernel/mm/transparent_hugepage/enabled", buf,

@@ -117,13 +117,17 @@ typedef struct {
     char cu_name[64];    /* "cu.usbmodem1101" */
     char host_node[136]; /* the node an open of the alias opens */
     bool is_acm;
-    int index; /* minor within its class */
+    int index;      /* minor within its class */
+    int dev;        /* index into usb_devs[] */
+    unsigned ifnum; /* interface the Linux driver would bind */
+    unsigned port;  /* usb-serial port number (ttyUSB only) */
 } usb_tty_t;
 
 static usb_tty_t usb_ttys[USB_TTY_MAX];
 static int usb_nttys;
 
 static void tty_model_build(void);
+static const uint8_t *active_config(const usb_dev_t *d, size_t *len_out);
 
 /* IOKit property helpers */
 
@@ -345,11 +349,24 @@ typedef struct {
     const usb_fixture_ep_t *eps;
     unsigned neps;
 
-    /* The cu.* node an alias opens, NULL for none, and the bInterfaceClass of
-     * the interface it hangs off.
+    /* bInterfaceClass per interface, 0 meaning vendor-specific 0xff. A CDC
+     * composite declares 0x02 on control and 0x0a on data, which
+     * tty_linux_ifnum maps between.
+     */
+    uint8_t iface_class[4];
+
+    /* The cu.* node an alias opens, NULL for none, and the number and class of
+     * the interface it hangs off. callout2 is a second port on that interface.
      */
     const char *callout;
+    const char *callout2;
+    unsigned callout_ifnum;
     unsigned callout_ifclass;
+
+    /* A CDC Union descriptor after the first class-0x02 interface, naming it
+     * master and the callout's interface its subordinate.
+     */
+    bool cdc_union;
 } usb_fixture_spec_t;
 
 /* One fixture callout node, anchored to a fixture device by locationID as a
@@ -359,22 +376,37 @@ typedef struct {
 typedef struct {
     uint32_t loc;
     const char *cu;
+    unsigned ifnum;
     unsigned ifclass;
 } usb_fixture_tty_t;
 
 static usb_fixture_tty_t usb_fixture_ttys[USB_TTY_MAX];
 static int usb_n_fixture_ttys;
 
-/* The number of interface descriptors is the only thing that varies the blob
- * length: an 18-byte device descriptor, one configuration header, then one
- * interface descriptor per interface.
+/* A CDC Union functional descriptor with one subordinate interface. */
+#define USB_CDC_UNION_LEN 5
+
+/* Whether @s gets a Union descriptor: it asks for one and has a class-0x02
+ * interface to put it after.
+ */
+static bool usb_fixture_has_union(const usb_fixture_spec_t *s)
+{
+    for (unsigned i = 0; s->cdc_union && i < s->nifaces && i < 4; i++)
+        if (s->iface_class[i] == 0x02)
+            return true;
+    return false;
+}
+
+/* An 18-byte device descriptor, one configuration header, one interface
+ * descriptor with its endpoints per interface, and the Union descriptor.
  */
 static size_t usb_fixture_blob_len(const usb_fixture_spec_t *s)
 {
     unsigned neps = s->neps ? s->neps : 1;
     return USB_DEVICE_DESC_LEN + USB_CONFIG_DESC_LEN +
-           (size_t) s->nifaces *
-               (USB_INTERFACE_DESC_LEN + (size_t) neps * USB_ENDPOINT_DESC_LEN);
+           (size_t) s->nifaces * (USB_INTERFACE_DESC_LEN +
+                                  (size_t) neps * USB_ENDPOINT_DESC_LEN) +
+           (usb_fixture_has_union(s) ? USB_CDC_UNION_LEN : 0);
 }
 
 /* Fill @d from @s, writing the device, configuration and interface descriptors
@@ -407,7 +439,8 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     unsigned neps = s->neps ? s->neps : 1;
     size_t if_total =
         USB_INTERFACE_DESC_LEN + (size_t) neps * USB_ENDPOINT_DESC_LEN;
-    size_t cfg_total = USB_CONFIG_DESC_LEN + (size_t) s->nifaces * if_total;
+    size_t cfg_total = USB_CONFIG_DESC_LEN + (size_t) s->nifaces * if_total +
+                       (usb_fixture_has_union(s) ? USB_CDC_UNION_LEN : 0);
     build_device_descriptor(d, blob);
     uint8_t *c = blob + USB_DEVICE_DESC_LEN;
     c[0] = USB_CONFIG_DESC_LEN;
@@ -419,18 +452,30 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
     c[6] = 0;                    /* iConfiguration */
     c[7] = 0x80;                 /* bmAttributes: bus powered */
     c[8] = 50;                   /* bMaxPower: 100 mA */
+    uint8_t *q = c + USB_CONFIG_DESC_LEN;
+    bool unioned = false;
     for (unsigned i = 0; i < s->nifaces; i++) {
-        uint8_t *q = c + USB_CONFIG_DESC_LEN + (size_t) i * if_total;
         q[0] = USB_INTERFACE_DESC_LEN;
         q[1] = USB_DT_INTERFACE;
         unsigned ifnum = s->ifnum_base + i;
         q[2] = (uint8_t) ifnum; /* bInterfaceNumber */
         q[3] = 0;               /* bAlternateSetting */
         q[4] = (uint8_t) neps;  /* bNumEndpoints */
-        q[5] = 0xff;            /* bInterfaceClass: vendor-specific */
+        q[5] = i < 4 && s->iface_class[i] ? s->iface_class[i]
+                                          : 0xff; /* bInterfaceClass */
         q[6] = 0x00;
         q[7] = 0x00;
         q[8] = 0;
+        uint8_t *e0 = q + USB_INTERFACE_DESC_LEN;
+        if (s->cdc_union && !unioned && q[5] == 0x02) {
+            unioned = true;
+            e0[0] = USB_CDC_UNION_LEN;
+            e0[1] = 0x24; /* CS_INTERFACE */
+            e0[2] = 0x06; /* Union */
+            e0[3] = q[2];
+            e0[4] = (uint8_t) s->callout_ifnum;
+            e0 += USB_CDC_UNION_LEN;
+        }
 
         /* The endpoint the interface descriptor above says it has. Without it
          * the blob was self-contradictory, and every endpoint-addressed
@@ -440,8 +485,7 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
          * argument". Bulk IN, one per interface: 0x81, 0x82, ...
          */
         for (unsigned k = 0; k < neps; k++) {
-            uint8_t *e =
-                q + USB_INTERFACE_DESC_LEN + (size_t) k * USB_ENDPOINT_DESC_LEN;
+            uint8_t *e = e0 + (size_t) k * USB_ENDPOINT_DESC_LEN;
             e[0] = USB_ENDPOINT_DESC_LEN;
             e[1] = USB_DT_ENDPOINT;
             e[2] = s->eps ? s->eps[k].addr : (uint8_t) (0x81 + i);
@@ -451,6 +495,7 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
             e[5] = (uint8_t) (mps >> 8);
             e[6] = s->eps ? s->eps[k].interval : 0;
         }
+        q = e0 + (size_t) neps * USB_ENDPOINT_DESC_LEN;
     }
 }
 
@@ -486,8 +531,12 @@ static void usb_fixture_fill(usb_dev_t *d, const usb_fixture_spec_t *s)
  * the fd-contract lane answers the same thing in this mode as in the default
  * one.
  *
- * In the default set, each device carries one callout node: a CDC-ACM one on
- * bus 1 and a bridge's on bus 2.
+ * ELFUSE_USB_FIXTURE=serial: the default set plus a CDC-ACM device whose data
+ * interface comes before its control one, so only its Union descriptor names
+ * the interface cdc-acm binds, and a bridge with two ports on one interface.
+ *
+ * In the default set, bus 1 is a CDC-ACM composite whose callout hangs off the
+ * data interface, and bus 2 is a vendor bridge.
  */
 static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
 {
@@ -516,7 +565,9 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
             .vid = 0x1d6b,
             .pid = 0x0002,
             .nifaces = 2,
+            .iface_class = {0x02, 0x0a}, /* CDC control, CDC data */
             .callout = "cu.usbmodemFIX1",
+            .callout_ifnum = 1,
             .callout_ifclass = 0x0a, /* CDC data, where macOS hangs it */
         };
     if (n < cap)
@@ -528,6 +579,7 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
             .pid = 0x0100,
             .nifaces = 1,
             .callout = "cu.usbserial-FIX2",
+            .callout_ifnum = 0,
             .callout_ifclass = 0xff,
         };
     if (mode && !strcmp(mode, "badifnum") && n < cap)
@@ -550,6 +602,33 @@ static int usb_fixture_specs(usb_fixture_spec_t *specs, int cap)
             .eps = usb_fixture_loopback_eps,
             .neps = USB_FIXTURE_LOOPBACK_NEPS,
         };
+    if (mode && !strcmp(mode, "serial") && n + 2 <= cap) {
+        specs[n++] = (usb_fixture_spec_t) {
+            .busnum = 1,
+            .port = 3,
+            .devnum = 3,
+            .vid = 0x1d6b,
+            .pid = 0x0104,
+            .nifaces = 2,
+            .iface_class = {0x0a, 0x02}, /* CDC data first, then control */
+            .callout = "cu.usbmodemFIX3",
+            .callout_ifnum = 0,
+            .callout_ifclass = 0x0a,
+            .cdc_union = true,
+        };
+        specs[n++] = (usb_fixture_spec_t) {
+            .busnum = 2,
+            .port = 2,
+            .devnum = 2,
+            .vid = 0x0403, /* FTDI, so the port binds ftdi_sio */
+            .pid = 0x0101,
+            .nifaces = 1,
+            .callout = "cu.usbserial-FIX4A",
+            .callout2 = "cu.usbserial-FIX4B",
+            .callout_ifnum = 0,
+            .callout_ifclass = 0xff,
+        };
+    }
     return n;
 }
 
@@ -595,9 +674,16 @@ static void model_build(void)
                 continue;
             d->blob_len = usb_fixture_blob_len(&specs[k]);
             usb_fixture_fill(d, &specs[k]);
-            if (specs[k].callout && usb_n_fixture_ttys < USB_TTY_MAX)
-                usb_fixture_ttys[usb_n_fixture_ttys++] = (usb_fixture_tty_t) {
-                    d->location_id, specs[k].callout, specs[k].callout_ifclass};
+            const char *cus[] = {specs[k].callout, specs[k].callout2};
+            for (size_t c = 0; c < ARRAY_SIZE(cus); c++)
+                if (cus[c] && usb_n_fixture_ttys < USB_TTY_MAX)
+                    usb_fixture_ttys[usb_n_fixture_ttys++] =
+                        (usb_fixture_tty_t) {
+                            d->location_id,
+                            cus[c],
+                            specs[k].callout_ifnum,
+                            specs[k].callout_ifclass,
+                        };
             usb_ndevs++;
         }
         goto assign_devnums; /* run the same fallback+cap the registry path does
@@ -800,6 +886,65 @@ assign_devnums:
 
 /* tty alias model */
 
+/* The 9-byte alternate-setting-0 interface descriptor for @ifnum in the active
+ * configuration, or NULL when the device has no such interface.
+ */
+static const uint8_t *find_iface_desc(const usb_dev_t *d, unsigned ifnum)
+{
+    size_t cfg_len = 0;
+    const uint8_t *cfg = active_config(d, &cfg_len);
+    if (!cfg)
+        return NULL;
+    usb_desc_iter_t it;
+    usb_desc_iter_init(&it, cfg, cfg_len);
+    const uint8_t *q;
+    uint8_t qlen;
+    while ((q = usb_desc_iter_next(&it, &qlen))) {
+        if (q[1] == USB_DT_INTERFACE && qlen >= USB_INTERFACE_DESC_LEN &&
+            q[2] == ifnum && q[3] == 0)
+            return q;
+    }
+    return NULL;
+}
+
+/* The interface Linux binds the tty to. macOS hangs a CDC-ACM callout off the
+ * data interface, while cdc-acm registers on the control one: the master of the
+ * CDC Union functional descriptor (CS_INTERFACE 0x24, subtype 0x06) that lists
+ * the data interface as a subordinate (drivers/usb/class/cdc-acm.c, acm_probe).
+ * Without one, the nearest class-0x02 interface at or below the data one stands
+ * in. A bridge keeps its own interface.
+ */
+static unsigned tty_linux_ifnum(const usb_dev_t *d,
+                                unsigned iokit_ifnum,
+                                unsigned iokit_ifclass,
+                                bool is_acm)
+{
+    if (!is_acm || iokit_ifclass == 2)
+        return iokit_ifnum;
+
+    size_t cfg_len = 0;
+    const uint8_t *cfg = active_config(d, &cfg_len);
+    if (!cfg)
+        return iokit_ifnum;
+    usb_desc_iter_t it;
+    usb_desc_iter_init(&it, cfg, cfg_len);
+    int best = -1;
+    const uint8_t *q;
+    uint8_t qlen;
+    while ((q = usb_desc_iter_next(&it, &qlen))) {
+        if (q[1] == 0x24 && qlen >= 5 && q[2] == 0x06) {
+            for (uint8_t i = 4; i < qlen; i++)
+                if (q[i] == iokit_ifnum)
+                    return q[3];
+        }
+        if (q[1] == USB_DT_INTERFACE && qlen >= USB_INTERFACE_DESC_LEN &&
+            q[3] == 0 && q[5] == 2 /* Communications */ &&
+            q[2] <= iokit_ifnum && (int) q[2] > best)
+            best = q[2];
+    }
+    return best >= 0 ? (unsigned) best : iokit_ifnum;
+}
+
 static int find_dev_by_location(uint32_t loc)
 {
     for (int i = 0; i < usb_ndevs; i++)
@@ -813,7 +958,11 @@ static int find_dev_by_location(uint32_t loc)
  * (communications 0x02 or data 0x0a) is cdc-acm's on Linux, and any other is
  * usb-serial's.
  */
-static void tty_add(const char *cu, const char *host, unsigned ifclass)
+static void tty_add(const char *cu,
+                    const char *host,
+                    int di,
+                    unsigned ifnum,
+                    unsigned ifclass)
 {
     if (usb_nttys >= USB_TTY_MAX) {
         /* Say so, the way the devnum cap does: which aliases survive depends on
@@ -830,7 +979,10 @@ static void tty_add(const char *cu, const char *host, unsigned ifclass)
     str_copy_trunc(t->cu_name, cu, sizeof(t->cu_name));
     str_copy_trunc(t->host_node, host, sizeof(t->host_node));
     t->is_acm = ifclass == 0x02 || ifclass == 0x0a;
+    t->dev = di;
     t->index = -1;
+
+    t->ifnum = tty_linux_ifnum(&usb_devs[di], ifnum, ifclass, t->is_acm);
     usb_nttys++;
 }
 
@@ -860,9 +1012,10 @@ static void tty_scan_iokit(void)
         const char *cu = callout + 5;
 
         /* The nearest IOUSBHostInterface ancestor carries the locationID that
-         * keys the device model and the class that picks the alias kind.
+         * keys the device model, and the number and class of the interface the
+         * callout hangs off.
          */
-        long loc = -1, ifclass = -1;
+        long loc = -1, ifnum = -1, ifclass = -1;
         io_object_t cur = svc;
         IOObjectRetain(cur);
         for (int depth = 0; depth < 12 && cur != IO_OBJECT_NULL; depth++) {
@@ -875,6 +1028,7 @@ static void tty_scan_iokit(void)
             if (cur != IO_OBJECT_NULL &&
                 IOObjectConformsTo(cur, "IOUSBHostInterface")) {
                 loc = ioreg_num(cur, "locationID");
+                ifnum = ioreg_num(cur, "bInterfaceNumber");
                 ifclass = ioreg_num(cur, "bInterfaceClass");
                 break;
             }
@@ -883,8 +1037,14 @@ static void tty_scan_iokit(void)
             IOObjectRelease(cur);
         IOObjectRelease(svc);
 
-        if (loc >= 0 && find_dev_by_location((uint32_t) loc) >= 0)
-            tty_add(cu, callout, ifclass < 0 ? 0 : (unsigned) ifclass);
+        if (loc < 0 || ifnum < 0)
+            continue;
+        int di = find_dev_by_location((uint32_t) loc);
+        if (di < 0)
+            continue;
+
+        tty_add(cu, callout, di, (unsigned) ifnum,
+                ifclass < 0 ? 0 : (unsigned) ifclass);
     }
     if (it != IO_OBJECT_NULL)
         IOObjectRelease(it);
@@ -899,10 +1059,13 @@ static void tty_model_build(void)
 
     /* Test seam: the fixture's callout set replaces the registry's. */
     if (getenv("ELFUSE_USB_FIXTURE")) {
-        for (int i = 0; i < usb_n_fixture_ttys; i++)
-            if (find_dev_by_location(usb_fixture_ttys[i].loc) >= 0)
-                tty_add(usb_fixture_ttys[i].cu, "/dev/null",
-                        usb_fixture_ttys[i].ifclass);
+        for (int i = 0; i < usb_n_fixture_ttys; i++) {
+            int di = find_dev_by_location(usb_fixture_ttys[i].loc);
+            if (di < 0)
+                continue;
+            tty_add(usb_fixture_ttys[i].cu, "/dev/null", di,
+                    usb_fixture_ttys[i].ifnum, usb_fixture_ttys[i].ifclass);
+        }
     } else {
         tty_scan_iokit();
     }
@@ -913,8 +1076,18 @@ static void tty_model_build(void)
     qsort(usb_ttys, (size_t) usb_nttys, sizeof(usb_ttys[0]), tty_cmp);
 
     int nacm = 0, nusb = 0;
-    for (int i = 0; i < usb_nttys; i++)
-        usb_ttys[i].index = usb_ttys[i].is_acm ? nacm++ : nusb++;
+    for (int i = 0; i < usb_nttys; i++) {
+        usb_tty_t *t = &usb_ttys[i];
+        t->index = t->is_acm ? nacm++ : nusb++;
+
+        /* A usb-serial port's number counts the ports before it on the same
+         * interface (drivers/usb/serial/usb-serial.c, port->port_number = i).
+         */
+        for (int j = 0; j < i && !t->is_acm; j++)
+            if (!usb_ttys[j].is_acm && usb_ttys[j].dev == t->dev &&
+                usb_ttys[j].ifnum == t->ifnum)
+                t->port++;
+    }
 }
 
 /* scratch tree construction */
@@ -930,6 +1103,11 @@ static int usb_write_file(const char *dir,
         errno = ENAMETOOLONG;
         return -1;
     }
+
+    /* The file is 0444, so a second write, as a bound interface's flat copy
+     * gets with its driver, replaces it rather than opening it for writing.
+     */
+    unlink(path);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0444);
     if (fd < 0)
         return -1;
@@ -1010,6 +1188,38 @@ static const uint8_t *active_config(const usb_dev_t *d, size_t *len_out)
     return usb_desc_active_config(d->blob, d->blob_len, d->cfg_value, len_out);
 }
 
+/* The attribute files of one interface dir, from its alternate-setting-0
+ * descriptor @q. @driver names the Linux driver bound to it, NULL for none; its
+ * uevent then carries DRIVER=, as a bound interface's does.
+ */
+static void emit_interface_attrs(const char *idir,
+                                 const usb_dev_t *d,
+                                 const uint8_t *q,
+                                 const char *driver)
+{
+    unsigned ifnum = q[2], alt = q[3], neps = q[4];
+    unsigned icls = q[5], isub = q[6], ipro = q[7];
+    usb_write_fmt(idir, "bInterfaceNumber", "%02x\n", ifnum);
+    usb_write_fmt(idir, "bAlternateSetting", "%2d\n", alt);
+    usb_write_fmt(idir, "bNumEndpoints", "%02x\n", neps);
+    usb_write_fmt(idir, "bInterfaceClass", "%02x\n", icls);
+    usb_write_fmt(idir, "bInterfaceSubClass", "%02x\n", isub);
+    usb_write_fmt(idir, "bInterfaceProtocol", "%02x\n", ipro);
+    usb_write_fmt(idir, "uevent",
+                  "DEVTYPE=usb_interface\n"
+                  "%s%s%s"
+                  "PRODUCT=%x/%x/%x\n"
+                  "TYPE=%u/%u/%u\n"
+                  "INTERFACE=%u/%u/%u\n"
+                  "MODALIAS=usb:v%04Xp%04Xd%04Xdc%02Xdsc%02Xdp%02X"
+                  "ic%02Xisc%02Xip%02Xin%02X\n",
+                  driver ? "DRIVER=" : "", driver ? driver : "",
+                  driver ? "\n" : "", d->vid, d->pid, d->bcd_device,
+                  d->dev_class, d->dev_subclass, d->dev_protocol, icls, isub,
+                  ipro, d->vid, d->pid, d->bcd_device, d->dev_class,
+                  d->dev_subclass, d->dev_protocol, icls, isub, ipro, ifnum);
+}
+
 /* Emit one interface dir <name>:<cfg>.<if> per bInterfaceNumber (alternate
  * setting 0) of the active configuration, parsed from the raw config descriptor
  * already in the blob -- registry children vanish under capture, so they are
@@ -1040,35 +1250,16 @@ static void emit_interface_dirs(const char *devices_dir, const usb_dev_t *d)
 
     for (size_t i = 0; i < nif; i++) {
         const uint8_t *q = ifaces[i];
-        unsigned ifnum = q[2], alt = q[3], neps = q[4];
-        unsigned icls = q[5], isub = q[6], ipro = q[7];
         char idir[256];
         if (snprintf(idir, sizeof(idir), "%s/%s:%u.%u", devices_dir, d->name,
-                     d->cfg_value, ifnum) >= (int) sizeof(idir) ||
+                     d->cfg_value, q[2]) >= (int) sizeof(idir) ||
             mkdir(idir, 0755) != 0)
             continue;
-        usb_write_fmt(idir, "bInterfaceNumber", "%02x\n", ifnum);
-        usb_write_fmt(idir, "bAlternateSetting", "%2d\n", alt);
-        usb_write_fmt(idir, "bNumEndpoints", "%02x\n", neps);
-        usb_write_fmt(idir, "bInterfaceClass", "%02x\n", icls);
-        usb_write_fmt(idir, "bInterfaceSubClass", "%02x\n", isub);
-        usb_write_fmt(idir, "bInterfaceProtocol", "%02x\n", ipro);
+        emit_interface_attrs(idir, d, q, NULL);
         char ilink[300];
         if (snprintf(ilink, sizeof(ilink), "%s/subsystem", idir) <
             (int) sizeof(ilink))
             symlink("../../../usb", ilink);
-        usb_write_fmt(idir, "uevent",
-                      "DEVTYPE=usb_interface\n"
-                      "PRODUCT=%x/%x/%x\n"
-                      "TYPE=%u/%u/%u\n"
-                      "INTERFACE=%u/%u/%u\n"
-                      "MODALIAS=usb:v%04Xp%04Xd%04Xdc%02Xdsc%02Xdp%02X"
-                      "ic%02Xisc%02Xip%02Xin%02X\n",
-                      d->vid, d->pid, d->bcd_device, d->dev_class,
-                      d->dev_subclass, d->dev_protocol, icls, isub, ipro,
-                      d->vid, d->pid, d->bcd_device, d->dev_class,
-                      d->dev_subclass, d->dev_protocol, icls, isub, ipro,
-                      ifnum);
     }
 }
 
@@ -1201,6 +1392,142 @@ static void tty_alias_name(const usb_tty_t *t, char *buf, size_t bufsz)
     snprintf(buf, bufsz, "%s%d", t->is_acm ? "ttyACM" : "ttyUSB", t->index);
 }
 
+/* The Linux drivers an alias's interface and port bind: cdc-acm for a ttyACM,
+ * and for a ttyUSB the usb-serial driver of a common bridge vendor
+ * (drivers/usb/serial/ftdi_sio.c, cp210x.c, ch341.c, pl2303.c). The match is by
+ * vendor ID alone, so a bridge those drivers know under another vendor, or a
+ * modem option.c or qcserial.c drives, gets generic.c's names, which Linux
+ * binds only to IDs given as its module parameters. @usb is the name an
+ * interface's uevent carries and @serial the one a port's carries; a ttyACM has
+ * no port.
+ */
+static void tty_linux_driver(const usb_tty_t *t,
+                             const char **usb,
+                             const char **serial)
+{
+    static const struct {
+        uint16_t vid;
+        const char *usb, *serial;
+    } bridges[] = {
+        {0x0403, "ftdi_sio", "ftdi_sio"},
+        {0x10c4, "cp210x", "cp210x"},
+        {0x1a86, "ch341", "ch341-uart"},
+        {0x067b, "pl2303", "pl2303"},
+    };
+    *serial = NULL;
+    if (t->is_acm) {
+        *usb = "cdc_acm";
+        return;
+    }
+    *usb = "usbserial_generic";
+    *serial = "generic";
+    for (size_t i = 0; i < ARRAY_SIZE(bridges); i++) {
+        if (bridges[i].vid == usb_devs[t->dev].vid) {
+            *usb = bridges[i].usb;
+            *serial = bridges[i].serial;
+        }
+    }
+}
+
+/* The sysfs Linux gives one alias, which pyserial's list_ports_linux.py reads
+ * (pyserial 3.5, lines 30-62). The tty directory sits below the interface for a
+ * ttyACM and below the usb-serial port for a ttyUSB, with dev, uevent and
+ * device and subsystem links, and /sys/class/tty/<name> is a symlink to it, as
+ * drivers/base/core.c makes it. device lands on the interface or the port, its
+ * subsystem link names "usb" or "usb-serial", and the device directory with its
+ * idVendor and idProduct sits one level above the interface.
+ *
+ * The interface is nested under the device, as on Linux, because pyserial takes
+ * dirname of it; the flat sibling entries stay for libusb.
+ */
+static void emit_tty_sysfs(const char *sys_dir, const usb_tty_t *t)
+{
+    char alias[32];
+    tty_alias_name(t, alias, sizeof(alias));
+    const usb_dev_t *d = &usb_devs[t->dev];
+
+    char ifname[64];
+    snprintf(ifname, sizeof(ifname), "%s:%u.%u", d->name, d->cfg_value,
+             t->ifnum);
+
+    char ifdir[300];
+    if (snprintf(ifdir, sizeof(ifdir), "%s/bus/usb/devices/%s/%s", sys_dir,
+                 d->name, ifname) >= (int) sizeof(ifdir))
+        return;
+    if (mkdir(ifdir, 0755) < 0 && errno != EEXIST)
+        return;
+    /* Both copies of the interface carry the driver bound to it. */
+    const char *usb_drv, *serial_drv;
+    tty_linux_driver(t, &usb_drv, &serial_drv);
+    const uint8_t *idesc = find_iface_desc(d, t->ifnum);
+    if (idesc) {
+        char flat[300];
+        emit_interface_attrs(ifdir, d, idesc, usb_drv);
+        if (snprintf(flat, sizeof(flat), "%s/bus/usb/devices/%s", sys_dir,
+                     ifname) < (int) sizeof(flat))
+            emit_interface_attrs(flat, d, idesc, usb_drv);
+    }
+    char lnk[420];
+    if (snprintf(lnk, sizeof(lnk), "%s/subsystem", ifdir) < (int) sizeof(lnk))
+        symlink("../../../../../bus/usb", lnk);
+
+    /* parent: the directory the tty directory hangs off, relative to ifdir's
+     * parent. up: the components from the tty directory back to /sys.
+     */
+    char parent[200], ttydir[420], target[420];
+    const char *up;
+    if (t->is_acm) {
+        snprintf(parent, sizeof(parent), "%s", ifname);
+        up = "../../../../../../..";
+    } else {
+        char portdir[360];
+        if (snprintf(portdir, sizeof(portdir), "%s/%s", ifdir, alias) >=
+            (int) sizeof(portdir))
+            return;
+        if (mkdir(portdir, 0755) < 0 && errno != EEXIST)
+            return;
+        if (snprintf(lnk, sizeof(lnk), "%s/subsystem", portdir) <
+            (int) sizeof(lnk))
+            symlink("../../../../../../bus/usb-serial", lnk);
+
+        /* The attribute 60-serial.rules reads to build the -port<N> half of the
+         * by-id name (drivers/usb/serial/bus.c, port_number_show).
+         */
+        usb_write_fmt(portdir, "port_number", "%u\n", t->port);
+        usb_write_fmt(portdir, "uevent", "DRIVER=%s\n", serial_drv);
+        snprintf(parent, sizeof(parent), "%s/%s", ifname, alias);
+        up = "../../../../../../../..";
+    }
+
+    if (snprintf(ttydir, sizeof(ttydir), "%s/bus/usb/devices/%s/%s/tty",
+                 sys_dir, d->name, parent) >= (int) sizeof(ttydir))
+        return;
+    if (mkdir(ttydir, 0755) < 0 && errno != EEXIST)
+        return;
+    size_t tl = strlen(ttydir);
+    if (snprintf(ttydir + tl, sizeof(ttydir) - tl, "/%s", alias) >=
+        (int) (sizeof(ttydir) - tl))
+        return;
+    if (mkdir(ttydir, 0755) < 0 && errno != EEXIST)
+        return;
+    int major = t->is_acm ? TTY_ACM_MAJOR : TTY_USB_MAJOR;
+    usb_write_fmt(ttydir, "dev", "%d:%d\n", major, t->index);
+    usb_write_fmt(ttydir, "uevent", "MAJOR=%d\nMINOR=%d\nDEVNAME=%s\n", major,
+                  t->index, alias);
+    snprintf(target, sizeof(target), "../../../%s", t->is_acm ? ifname : alias);
+    if (snprintf(lnk, sizeof(lnk), "%s/device", ttydir) < (int) sizeof(lnk))
+        symlink(target, lnk);
+    snprintf(target, sizeof(target), "%s/class/tty", up);
+    if (snprintf(lnk, sizeof(lnk), "%s/subsystem", ttydir) < (int) sizeof(lnk))
+        symlink(target, lnk);
+
+    snprintf(target, sizeof(target), "../../bus/usb/devices/%s/%s/tty/%s",
+             d->name, parent, alias);
+    if (snprintf(lnk, sizeof(lnk), "%s/class/tty/%s", sys_dir, alias) <
+        (int) sizeof(lnk))
+        symlink(target, lnk);
+}
+
 /* Parse "ttyACM<n>" or "ttyUSB<n>", decimal with no leading zero as devtmpfs
  * names them, and below USB_TTY_MAX, which no alias index reaches.
  *
@@ -1244,9 +1571,13 @@ static void emit_tty_dev_entries(void)
     }
 }
 
+/* A safety bound on the recursion, at the deepest directory the tree holds: a
+ * ttyUSB's class directory, <dev>/<if>/ttyUSBn/tty/ttyUSBn under
+ * bus/usb/devices, eight below the root.
+ */
 static void usb_remove_tree(const char *dir, int depth)
 {
-    if (depth > 6)
+    if (depth > 8)
         return;
     DIR *dp = opendir(dir);
     if (dp) {
@@ -1334,6 +1665,19 @@ static int ensure_usb_tree(void)
         snprintf(sub, sizeof(sub), "%s/bus/usb", usb_sys_dir);
         if (mkdir(sub, 0755) < 0)
             goto fail;
+        snprintf(sub, sizeof(sub), "%s/class", usb_sys_dir);
+        if (mkdir(sub, 0755) < 0)
+            goto fail;
+        snprintf(sub, sizeof(sub), "%s/class/tty", usb_sys_dir);
+        if (mkdir(sub, 0755) < 0)
+            goto fail;
+
+        /* Present with no ttyUSB device, as with usb-serial loaded on Linux, so
+         * no subsystem link dangles.
+         */
+        snprintf(sub, sizeof(sub), "%s/bus/usb-serial", usb_sys_dir);
+        if (mkdir(sub, 0755) < 0)
+            goto fail;
     }
     snprintf(devices_dir, sizeof(devices_dir), "%s/bus/usb/devices",
              usb_sys_dir);
@@ -1360,6 +1704,8 @@ static int ensure_usb_tree(void)
         usb_write_file(busdir, node, "", 0);
     }
 
+    for (int i = 0; i < usb_nttys; i++)
+        emit_tty_sysfs(usb_sys_dir, &usb_ttys[i]);
     emit_tty_dev_entries();
 
     static bool atexit_armed;
@@ -1495,15 +1841,15 @@ static usb_path_kind_t classify_path(const char *path,
     return USB_PATH_DEV_NODE;
 }
 
-/* True when a folded /sys-relative suffix names something under the one subtree
- * this layer synthesizes, /sys/bus/usb. It gates a single decision: what to do
- * when a /sys name resolves to nothing in the scratch tree. Under /sys/bus/usb
- * an absence is authoritative -- a missing device is ENOENT, the way a real
- * sysfs answers -- so this returns true and the caller keeps the ENOENT.
- * Anywhere else under /sys (/sys/class, /sys/devices, /sys/kernel, a bus other
- * than usb) we model nothing, so a miss must not be reported as ENOENT: that
- * would shadow a populated sysroot /sys. This returns false there and the
- * caller reports PROC_NOT_INTERCEPTED so the sysroot backing answers.
+/* True when a folded /sys-relative suffix names something under /sys/bus/usb,
+ * the one subtree whose absences this layer answers. It gates a single
+ * decision: what to do when a /sys name resolves to nothing in the scratch
+ * tree. Under /sys/bus/usb an absence is authoritative, a missing device being
+ * ENOENT as a real sysfs answers, so this returns true and the caller keeps the
+ * ENOENT. Anywhere else under /sys, /sys/class/tty and /sys/bus/usb-serial
+ * included, a name the scratch tree lacks may be the sysroot's, and reporting
+ * ENOENT would shadow it. This returns false there and the caller reports
+ * PROC_NOT_INTERCEPTED so the sysroot backing answers.
  *
  * The /sys root and its /sys/bus parent are not "owned" by this test, but they
  * exist as real directories in the scratch tree, so they resolve and are served
@@ -1639,10 +1985,10 @@ static bool usb_dev_names_dir(const char *folded)
  * /sys/bus/usb/devices/../devices/2-1, which Linux resolves.
  *
  * On /sys that ours/not-ours gate is all the fold decides: a link can sit
- * mid-path, as in <dev>/subsystem/.., and Linux applies the '..' to what the
- * link resolved to, so usb_sys_resolve_suffix builds the served path. On /dev
- * classify_path reads the folded name itself, and a '..' is applied as
- * usb_dev_dotdot says.
+ * mid-path, as in <dev>/subsystem/.. or <tty>/device/.., and Linux applies the
+ * '..' to what the link resolved to, so usb_sys_resolve_suffix builds the
+ * served path. On /dev classify_path reads the folded name itself, and a '..'
+ * is applied as usb_dev_dotdot says.
  *
  * A trailing slash survives the fold: it is what makes an attribute file used
  * as a directory report ENOTDIR.
@@ -2194,8 +2540,8 @@ static int usb_sys_resolve_suffix(const char *raw_sfx,
  * Returns false with *err_out set to 0 when the name is not ours (the caller
  * reports PROC_NOT_INTERCEPTED so the sysroot backing answers), or to an errno
  * when the name is ours and the resolve genuinely failed. An absence under
- * /sys/bus/usb is authoritative -- that subtree is the one thing this layer
- * synthesizes -- so it comes back as ENOENT rather than as a fall-through.
+ * /sys/bus/usb is authoritative (usb_sys_suffix_owned), so it comes back as
+ * ENOENT rather than as a fall-through.
  */
 static bool usb_resolve_or_disown(const char *raw_sfx,
                                   const char *norm,
@@ -2666,9 +3012,10 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     }
 
     if (kind == USB_PATH_SYS) {
-        /* The scratch tree holds real symlinks for `subsystem` entries;
-         * readlink passes their targets through. Plain dirs/files answer EINVAL
-         * and missing paths ENOENT, exactly as sysfs would.
+        /* The scratch tree holds real symlinks for the subsystem and device
+         * links and the /sys/class/tty entries; readlink passes their targets
+         * through. Plain dirs/files answer EINVAL and missing paths ENOENT,
+         * exactly as sysfs would.
          */
         pthread_mutex_lock(&usb_lock);
         int rc = -1;
@@ -2728,46 +3075,128 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     return -1;
 }
 
-/* True when @sfx (a /sys-relative spelling) names one of the `subsystem`
- * symlinks this layer materializes. Caller holds usb_lock and has run
- * ensure_usb_tree().
+/* Apply a '/'-separated component sequence to a /sys-relative spelling, the way
+ * a lexical walk does: '.' and an empty component are skipped, '..' pops the
+ * last component, anything else is appended. marks[] records where each
+ * component began so a pop is exact.
  *
- * The name alone is not enough: /sys/bus/usb/devices/9-9/subsystem names no
- * link at all when there is no device 9-9, and rewriting a walk through a link
- * that does not exist would turn a Linux ENOENT into a successful lookup
- * somewhere else entirely.
+ * Returns false when the sequence climbs above /sys or does not fit, which the
+ * caller turns into "no rewrite" rather than an answer.
  */
-static bool usb_sys_is_subsystem_link(const char *sfx)
+static bool usb_rel_apply(char *rel,
+                          size_t relsz,
+                          size_t *len_io,
+                          size_t *marks,
+                          size_t maxmarks,
+                          size_t *depth_io,
+                          const char *seq)
 {
-    char host[PATH_MAX];
-    int n = snprintf(host, sizeof(host), "%s/%s", usb_sys_dir, sfx);
-    if (n < 0 || (size_t) n >= sizeof(host))
-        return false;
+    size_t len = *len_io, depth = *depth_io;
+    for (const char *p = seq; *p;) {
+        const char *seg = p;
+        while (*p && *p != '/')
+            p++;
+        size_t seglen = (size_t) (p - seg);
+        while (*p == '/')
+            p++;
+        if (seglen == 0 || (seglen == 1 && seg[0] == '.'))
+            continue;
+        if (seglen == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (depth == 0)
+                return false;
+            len = marks[--depth];
+            rel[len] = '\0';
+            continue;
+        }
+        if (depth >= maxmarks)
+            return false;
+        marks[depth++] = len;
+        if (len + (len ? 1 : 0) + seglen + 1 > relsz)
+            return false;
+        if (len)
+            rel[len++] = '/';
+        memcpy(rel + len, seg, seglen);
+        len += seglen;
+        rel[len] = '\0';
+    }
+    *len_io = len;
+    *depth_io = depth;
+    return true;
+}
+
+/* Whether @path has a component named @name with another after it. */
+static bool path_has_inner_component(const char *path, const char *name)
+{
+    size_t nl = strlen(name);
+    for (const char *p = path; (p = strchr(p, '/'));) {
+        p++;
+        if (!strncmp(p, name, nl) && p[nl] == '/' && p[nl + 1])
+            return true;
+    }
+    return false;
+}
+
+/* What the /sys walk does at @rel, whose scratch-tree path @host is not a link:
+ * 1 to walk on through a directory, 0 to leave the whole name to the lookup, or
+ * -1 with errno set. A regular file there is ENOTDIR, as Linux answers a name
+ * under one. A name the tree lacks is absent under bus/usb, which the layer
+ * owns, and may be the backing's in /sys/class/tty, which the lookup asks;
+ * elsewhere it is walked through only where the backing has a directory, since
+ * other intercepts serve names neither side carries.
+ */
+static int usb_walk_non_link(const char *host, const char *rel)
+{
     struct stat st;
-    return lstat(host, &st) == 0 && S_ISLNK(st.st_mode);
+    if (lstat(host, &st) == 0) {
+        if (S_ISDIR(st.st_mode))
+            return 1;
+        errno = ENOTDIR;
+        return -1;
+    }
+    if (errno != ENOENT)
+        return -1;
+    if (!strncmp(rel, "bus/usb/", 8))
+        return -1;
+    if (!strncmp(rel, "class/tty/", 10))
+        return 0;
+    char guest[LINUX_PATH_MAX];
+    int n = snprintf(guest, sizeof(guest), "/sys/%s", rel);
+    return n > 0 && (size_t) n < sizeof(guest) && usb_backing_is_dir(guest);
 }
 
 int usb_sysfs_resolve_guest_path(const char *guest_path,
                                  char *out,
                                  size_t outsz)
 {
-    /* Every `subsystem` link this layer plants sits under /sys/bus/usb/devices,
-     * so nothing else can move a walk, and a path that cannot contain one is
-     * rejected before the tree is touched.
+    /* Only a link before the last component moves a walk. The tree has three
+     * kinds: an entry of /sys/class/tty, and the subsystem and device links
+     * under /sys/bus/usb/devices. A path spelled through none of them, and with
+     * no '..' that could lead into one, is rejected before the tree is touched.
      */
-    if (strncmp(guest_path, "/sys/bus/usb/devices/", 21) != 0 ||
-        !strstr(guest_path, "/subsystem"))
+    bool via_class = !strncmp(guest_path, "/sys/class/tty/", 15) &&
+                     strchr(guest_path + 15, '/');
+    bool via_devices =
+        !strncmp(guest_path, "/sys/bus/usb/devices/", 21) &&
+        (path_has_inner_component(guest_path + 20, "subsystem") ||
+         path_has_inner_component(guest_path + 20, "device"));
+    if (!via_class && !via_devices &&
+        !path_has_inner_component(guest_path, ".."))
         return 0;
 
+    /* The tree is built once and never changed, so the walk reads it without
+     * usb_lock, which leaves it free to ask the backing.
+     */
     pthread_mutex_lock(&usb_lock);
-    int rc = 0;
-    if (ensure_usb_tree() < 0)
-        goto out;
+    bool built = ensure_usb_tree() == 0;
+    pthread_mutex_unlock(&usb_lock);
+    if (!built)
+        return 0;
 
     char rel[LINUX_PATH_MAX];
     size_t len = 0;
     size_t marks[64];
     size_t depth = 0;
+    int hops = 0;
     bool rewrote = false;
     rel[0] = '\0';
 
@@ -2785,55 +3214,65 @@ int usb_sysfs_resolve_guest_path(const char *guest_path,
             continue;
         if (seglen == 2 && seg[0] == '.' && seg[1] == '.') {
             if (depth == 0)
-                goto out; /* above /sys; not a name this layer can place */
+                return 0; /* above /sys; not a name this layer can place */
             len = marks[--depth];
             rel[len] = '\0';
             continue;
         }
         if (depth >= ARRAY_SIZE(marks))
-            goto out;
+            return 0;
         marks[depth++] = len;
         if (len + (len ? 1 : 0) + seglen + 1 > sizeof(rel))
-            goto out;
+            return 0;
         if (len)
             rel[len++] = '/';
         memcpy(rel + len, seg, seglen);
         len += seglen;
         rel[len] = '\0';
 
-        /* A `subsystem` link with nothing after it is the object the caller
-         * named, and lstat/readlink/O_NOFOLLOW have to keep seeing the link
-         * itself, so only a link the walk continues through is substituted.
-         * What it is substituted with is where it points -- every one of them
-         * points at /sys/bus/usb -- so the components that follow are applied
-         * to the target, which is what makes `subsystem/..` name /sys/bus the
-         * way the kernel does.
+        /* Only a link the walk continues through is substituted: a final link
+         * is what lstat, readlink and O_NOFOLLOW name. Its target is read and
+         * applied to the link's directory, so subsystem/.. names /sys/bus and
+         * <tty>/device/.. names the interface's parent, as the kernel walks.
          */
-        if (*p && seglen == 9 && !memcmp(seg, "subsystem", 9)) {
-            if (!usb_sys_is_subsystem_link(rel))
-                goto out;
-            memcpy(rel, "bus/usb", 8);
-            len = 7;
-            depth = 2;
-            marks[0] = 0;
-            marks[1] = 3;
-            rewrote = true;
+        if (!*p)
+            break;
+        char host[PATH_MAX], tgt[PATH_MAX];
+        int hn = snprintf(host, sizeof(host), "%s/%s", usb_sys_dir, rel);
+        if (hn < 0 || (size_t) hn >= sizeof(host))
+            return 0;
+        ssize_t tn = readlink(host, tgt, sizeof(tgt) - 1);
+        if (tn <= 0) {
+            int walk = usb_walk_non_link(host, rel);
+            if (walk <= 0)
+                return walk;
+            continue;
         }
+        tgt[tn] = '\0';
+
+        /* Linux's MAXSYMLINKS (include/linux/namei.h), an ABI cap. A walk past
+         * it before the last component is left as written, and the host, which
+         * follows at most 32 links, refuses it with ELOOP as Linux does.
+         */
+        if (++hops > 40)
+            return 0;
+        len = marks[--depth]; /* pop the link itself */
+        rel[len] = '\0';
+        if (!usb_rel_apply(rel, sizeof(rel), &len, marks, ARRAY_SIZE(marks),
+                           &depth, tgt))
+            return 0;
+        rewrote = true;
     }
 
     if (!rewrote)
-        goto out;
+        return 0;
 
     /* A trailing slash survives: it is what makes a non-directory named as a
      * directory report ENOTDIR, and the rewrite must not answer that question.
      */
     const char *tail = guest_path[strlen(guest_path) - 1] == '/' ? "/" : "";
     int n = snprintf(out, outsz, "/sys%s%s%s", len ? "/" : "", rel, tail);
-    rc = (n > 0 && (size_t) n < outsz) ? 1 : 0;
-
-out:
-    pthread_mutex_unlock(&usb_lock);
-    return rc;
+    return (n > 0 && (size_t) n < outsz) ? 1 : 0;
 }
 
 /* One pass of usb_dev_resolve_guest_path. Caller holds usb_lock with the model

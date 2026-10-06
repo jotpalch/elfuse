@@ -650,28 +650,35 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    /* A /sys walk that passes through one of the synthetic USB `subsystem`
-     * symlinks is rewritten to the canonical guest spelling of where it lands,
-     * before anything decides whose name it is. The links exist only in the
-     * synthetic tree, so no other layer can resolve them: the sysroot has no
-     * such link, and a lexical fold puts the walk back in the device directory
-     * it had just left. Doing it here, once, is what makes open, stat, lstat,
-     * readlink and getdents64 answer from one name -- the union listing of
-     * `<dev>/subsystem/..` offered /sys/bus/pci while every lookup of
-     * `<dev>/subsystem/../pci` denied it, because each entry point folded the
-     * name for itself.
+    /* A /sys walk that passes through one of the synthetic USB symlinks, an
+     * entry of /sys/class/tty or a subsystem or device link, is rewritten to
+     * the canonical guest spelling of where it lands, before anything decides
+     * whose name it is. The links exist only in the synthetic tree, so no other
+     * layer can resolve them: the sysroot has no such link, and a lexical fold
+     * puts the walk back in the directory it had just left. Doing it here,
+     * once, is what makes open, stat, lstat, readlink and getdents64 answer
+     * from one name: the union listing of <dev>/subsystem/.. offered
+     * /sys/bus/pci while every lookup of <dev>/subsystem/../pci denied it,
+     * because each entry point folded the name for itself.
      *
-     * Cheap for everything else: the prefix test rejects every path that cannot
-     * contain such a link before the USB layer is called at all.
+     * Cheap for everything else: the USB layer is called only for a name
+     * spelled through one of the link directories or carrying a '..' that could
+     * lead into one.
      */
-    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21)) {
+    if (!strncmp(tx->guest_path, "/sys/bus/usb/devices/", 21) ||
+        !strncmp(tx->guest_path, "/sys/class/tty/", 15) ||
+        (!strncmp(tx->guest_path, "/sys/", 5) &&
+         strstr(tx->guest_path, "/../"))) {
         /* Through a local buffer, not straight into guest_buf: guest_path may
          * already be guest_buf (the FUSE resolver above puts it there), and the
          * rewrite reads its input while writing its output.
          */
         char resolved[LINUX_PATH_MAX];
-        if (usb_sysfs_resolve_guest_path(tx->guest_path, resolved,
-                                         sizeof(resolved)) == 1) {
+        int rc = usb_sysfs_resolve_guest_path(tx->guest_path, resolved,
+                                              sizeof(resolved));
+        if (rc < 0)
+            return -1;
+        if (rc == 1) {
             str_copy_trunc(tx->guest_buf, resolved, sizeof(tx->guest_buf));
             tx->guest_path = tx->guest_buf;
             tx->intercept_path = tx->guest_buf;
@@ -1373,7 +1380,9 @@ static bool proc_path_fd_is_dir(const fd_entry_t *snap)
 /* Rebuild @path against the guest directory @base as an absolute guest path.
  * Under /dev/bus and on a served /dev the name is joined as written: the USB
  * layer folds it and stops at a '..' after a node, which a lexical fold here
- * would pop. Elsewhere the components are folded.
+ * would pop. Under /sys it is joined as written too, since the link walk
+ * applies a '..' to what a link resolved to. Elsewhere the components are
+ * folded.
  *
  * Returns 0, or -1 with errno set to ENAMETOOLONG.
  */
@@ -1382,7 +1391,8 @@ static int path_rebuild_under(const char *base,
                               char *out,
                               size_t outsz)
 {
-    if (path_prefix_match(base, "/dev/bus", 8) || !strcmp(base, "/dev")) {
+    if (path_prefix_match(base, "/dev/bus", 8) || !strcmp(base, "/dev") ||
+        path_prefix_match(base, "/sys", 4)) {
         int n = snprintf(out, outsz, "%s/%s", base, path);
         if (n < 0 || (size_t) n >= outsz) {
             errno = ENAMETOOLONG;

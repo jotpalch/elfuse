@@ -11,16 +11,17 @@
  *
  * The layer owns one subtree on each side, /sys/bus/usb and /dev/bus/usb, on
  * top of a backing /sys and /dev/bus that a sysroot supplies, and adds the
- * serial alias names to /dev while one exists. Its contract is not per-syscall:
- * a name is this layer's or it is not, and every entry point has to answer from
- * that one decision. Four regressions all came from an entry point re-deriving
- * it: lstat/open(O_NOFOLLOW)/readlink shadowed the backing because their
- * resolve succeeded where stat's failed, getdents64 replaced the backing
- * listing instead of extending it, /dev/bus had no fall-through arm at all
- * while access(2) fell through anyway, and fstatfs never saw the sysfs identity
- * statfs was handing out. Pinning them one assertion at a time is what let them
- * appear, so this is a matrix instead: every entry point against every path
- * class, so a fix that unifies one pair and splits another cannot pass.
+ * serial alias names to /dev and /sys/class/tty while one exists. Its contract
+ * is not per-syscall: a name is this layer's or it is not, and every entry
+ * point has to answer from that one decision. Four regressions all came from an
+ * entry point re-deriving it: lstat/open(O_NOFOLLOW)/readlink shadowed the
+ * backing because their resolve succeeded where stat's failed, getdents64
+ * replaced the backing listing instead of extending it, /dev/bus had no
+ * fall-through arm at all while access(2) fell through anyway, and fstatfs
+ * never saw the sysfs identity statfs was handing out. Pinning them one
+ * assertion at a time is what let them appear, so this is a matrix instead:
+ * every entry point against every path class, so a fix that unifies one pair
+ * and splits another cannot pass.
  *
  * EXPECTED VALUES ARE MEASURED, NOT ASSUMED. Every cell below was recorded by
  * running this same binary natively on Linux (docker gcc:14, aarch64, kernel
@@ -109,6 +110,8 @@ enum {
     COL_DEV_DOTDOT,   /* /dev/null followed by '..' */
     COL_FOLD_FILE,    /* a '..' after the backing's file, back into usb */
     COL_FOLD_ABSENT,  /* a '..' after a malformed usb name, back into usb */
+    COL_SYS_FOLD_IN2, /* COL_SYS_FOLD_IN through a name the scratch tree lacks
+                       */
     COL_COUNT,
 };
 
@@ -119,7 +122,7 @@ static const char *col_name[COL_COUNT] = {
     "subsys-out",  "dev-fold-out",  "dev-fold-in",     "sys-fold-in",
     "node-dotdot", "dev-climb",     "dev-climb-f",     "tty-alias",
     "tty-planted", "tty-absent",    "tty-dot-node",    "tty-dotdot",
-    "dev-dotdot",  "dev-fold-file", "dev-fold-absent",
+    "dev-dotdot",  "dev-fold-file", "dev-fold-absent", "sys-fold-in2",
 };
 
 /* COL_TTY_DOT_NODE is the alias node with a trailing "." component: a character
@@ -167,7 +170,7 @@ static const char *col_path(int c)
     case COL_SYNTH_DIR:
         return "/sys/bus/usb/devices";
     case COL_BACK_SYS:
-        return "/sys/class";
+        return "/sys/kernel";
     case COL_BACK_DEV:
         return "/dev/bus/other/f";
     case COL_SUBSYS:
@@ -194,6 +197,8 @@ static const char *col_path(int c)
         return "/dev/bus/other/../usb/001/001";
     case COL_SYS_FOLD_IN:
         return "/sys/class/../bus/usb/devices";
+    case COL_SYS_FOLD_IN2:
+        return "/sys/devices/../bus/usb/devices";
     case COL_NODE_DOTDOT:
         return "/dev/bus/usb/001/001/..";
     case COL_CLIMB:
@@ -250,13 +255,11 @@ static const char *col_path(int c)
  * applied to only one direction cannot pass.
  */
 
-/* COL_SYS_FOLD_IN is the /sys mirror of COL_FOLD_IN, and the one direction that
- * stays unmet. /sys/class/../bus/usb/devices folds to a name this layer owns
- * and serves, and ownership is decided on that folded name, but the resolve
- * behind it joins the unfolded suffix onto the scratch tree, which carries no
- * `class`, so the lookup fails and the layer answers its own authoritative
- * ENOENT for a directory it does serve. It is an XFAIL; the vectors header says
- * why a fold cannot fix this half the way it fixes the /dev one.
+/* COL_SYS_FOLD_IN and COL_SYS_FOLD_IN2 are the /sys mirror of COL_FOLD_IN, the
+ * same spelling through /sys/class, which the scratch tree carries, and
+ * /sys/devices, which only the sysroot has. The resolve joins the unfolded
+ * suffix onto the scratch tree, so the first resolves and the second is an
+ * XFAIL; the vectors header says why a fold cannot repair it.
  */
 
 /* The /dev half of the ownership question for the alias names. COL_TTY is a
@@ -842,9 +845,16 @@ int main(void)
                 rows[r].fn(col_path(c), cell);
             }
 
+            /* Both directions are printed: a '?' cell that starts matching is
+             * an XPASS, so an expectation that has gone stale shows in the
+             * lane's output instead of staying recorded as false.
+             */
             if (xfail) {
                 if (strcmp(cell, want))
                     printf("XFAIL: %s [%s] %s: Linux %s, elfuse %s\n",
+                           rows[r].name, col_name[c], col_path(c), want, cell);
+                else
+                    printf("XPASS: %s [%s] %s: Linux %s, elfuse %s\n",
                            rows[r].name, col_name[c], col_path(c), want, cell);
                 continue;
             }

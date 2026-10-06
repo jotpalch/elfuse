@@ -39,11 +39,12 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz);
  * host/sysroot backing carries under the same name.
  *
  * /sys and /dev/bus exist on both sides: a Linux sysroot has class/, devices/,
- * kernel/ under /sys and other buses under /dev/bus, while this layer adds only
- * bus/usb and usb. Serving the synthetic directory alone made getdents64
- * replace that listing rather than extend it, so `ls /sys` saw an almost-empty
- * sysfs while every hidden name stayed openable by its exact path --
- * enumeration and direct access disagreed.
+ * kernel/ under /sys and other buses under /dev/bus, while this layer adds
+ * bus/usb, bus/usb-serial and class/tty under /sys, usb under /dev/bus, and the
+ * alias names under /dev while one exists. Serving the synthetic directory
+ * alone made getdents64 replace that listing rather than extend it, so ls /sys
+ * saw an almost-empty sysfs while every hidden name stayed openable by its
+ * exact path: enumeration and direct access disagreed.
  *
  * False for the one subtree this layer does own, /sys/bus/usb and /dev/bus/usb:
  * there an absence is authoritative (lookup answers ENOENT rather than falling
@@ -52,24 +53,26 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz);
 bool usb_sysfs_dir_unions_backing(const char *guest_path);
 
 /* Rewrite @guest_path into the canonical guest spelling of the object it names,
- * when its walk passes *through* one of the synthetic `subsystem` symlinks this
- * layer plants and continues past it.
+ * when its walk passes through one of the synthetic symlinks this layer plants,
+ * an entry of /sys/class/tty or a subsystem or device link, and continues past
+ * it.
  *
- * Those links are the only way a /sys walk can leave this layer's subtree
- * without saying so lexically: `<dev>/subsystem` points at /sys/bus/usb, so
- * `<dev>/subsystem/../pci` names /sys/bus/pci, exactly as the kernel resolves
- * it. Deciding ownership on the lexical fold instead reads that name as
- * `<dev>/pci`, claims it as ours because it starts with bus/usb, and answers
- * ENOENT -- shadowing a populated backing /sys/bus/pci that the *listing* of
- * `<dev>/subsystem/..` had just offered. Resolving first, once, in the path
- * layer, is what keeps the listing and every lookup answering from the same
- * name.
+ * Such a link lets a /sys walk leave this layer's subtree without saying so
+ * lexically: <dev>/subsystem points at /sys/bus/usb, so <dev>/subsystem/../pci
+ * names /sys/bus/pci, exactly as the kernel resolves it. Deciding ownership on
+ * the lexical fold instead reads that name as <dev>/pci, claims it as ours
+ * because it starts with bus/usb, and answers ENOENT, shadowing a populated
+ * backing /sys/bus/pci that the listing of <dev>/subsystem/.. had just offered.
+ * Resolving first, once, in the path layer, is what keeps the listing and every
+ * lookup answering from the same name.
  *
  * A link named as the final component is left alone: it is the object the
  * caller asked for, and lstat, readlink and O_NOFOLLOW must keep seeing it.
  *
- * Returns 1 with @out filled, or 0 when no rewrite applies (including when the
- * link named does not exist, so a missing device stays ENOENT).
+ * Returns 1 with @out filled, 0 when no rewrite applies (including when the
+ * link named does not exist, so a missing device stays ENOENT), or -1 with
+ * errno set when a name the walk passes through is a regular file or is absent
+ * under /sys/bus/usb.
  */
 int usb_sysfs_resolve_guest_path(const char *guest_path,
                                  char *out,

@@ -42,6 +42,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1368,6 +1369,170 @@ static void check_served_dev(const char *alias)
         FAIL("chdir back to /");
 }
 
+/* The DRIVER= value of the uevent in @dir, empty when it carries none. */
+static void uevent_driver(const char *dir, char *out, size_t cap)
+{
+    char path[512], buf[1024];
+    out[0] = '\0';
+    snprintf(path, sizeof(path), "%s/uevent", dir);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+    const char *d = strstr(buf, "DRIVER=");
+    if (!d || (d != buf && d[-1] != '\n'))
+        return;
+    d += 7;
+    size_t len = strcspn(d, "\n");
+    if (len < cap) {
+        memcpy(out, d, len);
+        out[len] = '\0';
+    }
+}
+
+/* How many ttyUSB ports in @ifdir come before @name, which is the number Linux
+ * gives a usb-serial port on its interface.
+ */
+static unsigned ports_before(const char *ifdir, const char *name)
+{
+    unsigned n = 0;
+    unsigned long mine = strtoul(name + 6, NULL, 10);
+    DIR *d = opendir(ifdir);
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        if (!strncmp(e->d_name, "ttyUSB", 6) &&
+            strtoul(e->d_name + 6, NULL, 10) < mine)
+            n++;
+    if (d)
+        closedir(d);
+    return n;
+}
+
+/* /sys/class/tty/<name> as Linux lays it out: a symlink to the tty directory,
+ * whose device link lands on the interface cdc-acm binds (its control one,
+ * class 02) or on the usb-serial port, numbered on its interface, whose
+ * subsystem names "usb" or "usb-serial", whose uevent names the driver Qt
+ * requires, and above which sits the device with its idVendor. Its dev
+ * attribute is checked against a stat of the node: pyserial reads one, and an
+ * open goes through the other.
+ */
+static void check_alias_class(const char *classdir, const char *name, bool acm)
+{
+    char p[512], real[PATH_MAX], val[64];
+    struct stat lst;
+
+    TEST("/sys/class/tty/<name> is a symlink");
+    EXPECT_TRUE(lstat(classdir, &lst) == 0 && S_ISLNK(lst.st_mode), classdir);
+
+    TEST("the alias's device subsystem is usb or usb-serial");
+    snprintf(p, sizeof(p), "%s/device/subsystem", classdir);
+    const char *base = realpath(p, real) ? strrchr(real, '/') : NULL;
+    EXPECT_TRUE(base && !strcmp(base + 1, acm ? "usb" : "usb-serial"), p);
+
+    char port[16];
+    snprintf(p, sizeof(p), "%s/device/..", classdir);
+    snprintf(port, sizeof(port), "%u", acm ? 0 : ports_before(p, name));
+    TEST("the alias binds the interface or port Linux binds");
+    snprintf(p, sizeof(p), "%s/device", classdir);
+    EXPECT_TRUE(attr_str(p, acm ? "bInterfaceClass" : "port_number", val,
+                         sizeof(val)) == 0 &&
+                    !strcmp(val, acm ? "02" : port),
+                p);
+
+    /* cdc_acm for a ttyACM; for a ttyUSB the FTDI fixture's ftdi_sio, and
+     * generic.c's names for a vendor the table does not know.
+     */
+    TEST("the bound interface and port name the Linux driver");
+    char ifdrv[32], portdrv[32], flatdrv[32], vend[8];
+    snprintf(p, sizeof(p), "%s/device%s", classdir, acm ? "" : "/..");
+    uevent_driver(p, ifdrv, sizeof(ifdrv));
+    const char *ifname = realpath(p, real) ? strrchr(real, '/') : NULL;
+    snprintf(p, sizeof(p), "/sys/bus/usb/devices/%s", ifname ? ifname + 1 : "");
+    uevent_driver(p, flatdrv, sizeof(flatdrv));
+    snprintf(p, sizeof(p), "%s/device", classdir);
+    uevent_driver(p, portdrv, sizeof(portdrv));
+    snprintf(p, sizeof(p), "%s/device/%s", classdir, acm ? ".." : "../..");
+    bool ftdi = attr_str(p, "idVendor", vend, sizeof(vend)) == 0 &&
+                !strcmp(vend, "0403");
+    const char *want_if = acm    ? "cdc_acm"
+                          : ftdi ? "ftdi_sio"
+                                 : "usbserial_generic";
+    const char *want_port = ftdi ? "ftdi_sio" : "generic";
+    char dwhy[160];
+    snprintf(dwhy, sizeof(dwhy), "%s: interface %s, flat copy %s, port %s",
+             name, ifdrv, flatdrv, portdrv);
+    EXPECT_TRUE(!strcmp(ifdrv, want_if) && !strcmp(flatdrv, want_if) &&
+                    (acm || !strcmp(portdrv, want_port)),
+                dwhy);
+
+    TEST("the device directory sits above the alias's device link");
+    snprintf(p, sizeof(p), "%s/device/%s", classdir, acm ? ".." : "../..");
+    base = realpath(p, real) ? strrchr(real, '/') : NULL;
+    EXPECT_TRUE(base && !strchr(base, ':') &&
+                    attr_str(real, "idVendor", val, sizeof(val)) == 0,
+                p);
+
+    char node[128], want[64], why[256];
+    snprintf(node, sizeof(node), "/dev/%s", name);
+
+    TEST("the tty alias dev attribute matches the node's rdev");
+    struct stat nst;
+    if (attr_str(classdir, "dev", val, sizeof(val)) != 0) {
+        FAIL("dev attribute missing");
+        return;
+    }
+    if (stat(node, &nst) != 0) {
+        printf("      %s: %s\n", node, strerror(errno));
+        FAIL("stat the node");
+        return;
+    }
+    snprintf(want, sizeof(want), "%u:%u", (unsigned) major(nst.st_rdev),
+             (unsigned) minor(nst.st_rdev));
+    snprintf(why, sizeof(why), "%s: dev reads \"%s\", node rdev is \"%s\"",
+             name, val, want);
+    EXPECT_VALUE(S_ISCHR(nst.st_mode) && !strcmp(val, want), why);
+}
+
+/* Divergences from Linux this layer knows about and does not close, printed
+ * with both values rather than asserted, the way the matrix lane prints its
+ * XFAIL cells. Printing them is the point: a fidelity gap that nothing reports
+ * is one nobody re-measures.
+ */
+static void report_alias_divergences(const char *classdir, const char *alias)
+{
+    char p[512];
+
+    /* Linux publishes one interface directory and makes the flat
+     * /sys/bus/usb/devices/<if> name a symlink to it. This layer emits the
+     * interface twice, nested and flat, so libusb keeps the flat name it walks,
+     * and the same interface has two inodes.
+     */
+    char target[512];
+    ssize_t n;
+    snprintf(p, sizeof(p), "%s/device", classdir);
+    n = readlink(p, target, sizeof(target) - 1);
+    if (n <= 0)
+        return;
+    target[n] = '\0';
+    const char *leaf = strrchr(target, '/');
+    if (!leaf || !strchr(leaf, ':'))
+        return; /* the ttyUSB port level, not an interface dir */
+    struct stat nested, flat;
+    char flatp[512];
+    snprintf(flatp, sizeof(flatp), "/sys/bus/usb/devices/%s", leaf + 1);
+    if (stat(p, &nested) == 0 && stat(flatp, &flat) == 0 &&
+        nested.st_ino != flat.st_ino)
+        printf(
+            "XFAIL: interface %s: Linux one inode (the flat name is a symlink "
+            "to the nested one), elfuse two directories, ino %llu and %llu\n",
+            leaf + 1, (unsigned long long) nested.st_ino,
+            (unsigned long long) flat.st_ino);
+}
+
 /* The aliases /dev lists, which is the union listing under test as well. The
  * default fixture's two devices must be among them.
  *
@@ -1391,6 +1556,10 @@ static int check_tty_aliases(void)
         acm0 |= !strcmp(ent->d_name, "ttyACM0");
         usb0 |= !strcmp(ent->d_name, "ttyUSB0");
         check_alias_node(ent->d_name, ent->d_name[3] == 'A');
+        char classdir[256];
+        snprintf(classdir, sizeof(classdir), "/sys/class/tty/%s", ent->d_name);
+        check_alias_class(classdir, ent->d_name, ent->d_name[3] == 'A');
+        report_alias_divergences(classdir, ent->d_name);
         if (n == 1)
             check_served_dev(ent->d_name);
     }
@@ -1398,6 +1567,14 @@ static int check_tty_aliases(void)
     if (fixture && !strcmp(fixture, "1")) {
         TEST("/dev lists the fixture's ttyACM0 and ttyUSB0");
         EXPECT_TRUE(acm0 && usb0, "a fixture alias is missing from /dev");
+    }
+    if (fixture && !strcmp(fixture, "serial")) {
+        struct stat st;
+        TEST("/dev lists the serial fixture's ttyACM1, ttyUSB1 and ttyUSB2");
+        EXPECT_TRUE(stat("/dev/ttyACM1", &st) == 0 &&
+                        stat("/dev/ttyUSB1", &st) == 0 &&
+                        stat("/dev/ttyUSB2", &st) == 0,
+                    "a serial-fixture alias is missing");
     }
     return n;
 }
@@ -1499,6 +1676,68 @@ static void check_dotdot_leaves_bus(void)
         FAIL("chdir back to /");
 }
 
+/* Walks through the class entries and subsystem links. A name the tree lacks
+ * before a '..' is ENOENT, and the 41st link one walk crosses is ELOOP, as
+ * Linux's MAXSYMLINKS makes it: each subsystem/ttyACM0 pair below is two.
+ */
+static void check_class_walk(void)
+{
+    struct stat st;
+    char p[1024];
+
+    TEST("a missing class/tty name before '..' is ENOENT");
+    EXPECT_ERRNO(stat("/sys/class/tty/ttyACM9/../ttyACM0/..", &st), ENOENT,
+                 "/sys/class/tty/ttyACM9/../ttyACM0/..");
+
+    TEST("a missing usb device before '..' is ENOENT");
+    EXPECT_ERRNO(stat("/sys/bus/usb/devices/9-9/../1-1/subsystem/..", &st),
+                 ENOENT, "/sys/bus/usb/devices/9-9/../1-1/subsystem/..");
+
+    TEST("a name the tree and the backing both lack stops the walk");
+    EXPECT_ERRNO(stat("/sys/no-such/../class/tty/ttyACM0/dev", &st), ENOENT,
+                 "/sys/no-such/../class/tty/ttyACM0/dev");
+    EXPECT_ERRNO(
+        stat("/sys/no-such/../bus/usb/devices/1-1/subsystem/devices", &st),
+        ENOENT, "/sys/no-such/../bus/usb/devices/1-1/subsystem/devices");
+
+    TEST("a '..' after an attribute file is ENOTDIR");
+    EXPECT_ERRNO(stat("/sys/class/tty/ttyACM0/dev/../dev", &st), ENOTDIR,
+                 "/sys/class/tty/ttyACM0/dev/../dev");
+
+    TEST("a name relative to a /sys cwd walks the links too");
+    char vid[16];
+    if (chdir("/sys/class/tty") != 0) {
+        FAIL("chdir /sys/class/tty");
+    } else {
+        EXPECT_TRUE(
+            attr_str("ttyACM0/device/..", "idVendor", vid, sizeof(vid)) == 0,
+            "ttyACM0/device/../idVendor from /sys/class/tty");
+        if (chdir("/") != 0)
+            FAIL("chdir back to /");
+    }
+
+    /* 39, 40 and 41 links before the last component: the first two resolve and
+     * the 41st is ELOOP. Each subsystem/ttyACM0 pair below is two links.
+     */
+    TEST("a walk resolves 40 links and refuses the 41st with ELOOP");
+    static const char *const tails[] = {"/dev", "/device/uevent", "/dev"};
+    for (int k = 0; k < 3; k++) {
+        int pairs = k == 2 ? 20 : 19;
+        int n = snprintf(p, sizeof(p), "/sys/class/tty/ttyACM0");
+        for (int i = 0; i < pairs; i++)
+            n += snprintf(p + n, sizeof(p) - (size_t) n, "/subsystem/ttyACM0");
+        snprintf(p + n, sizeof(p) - (size_t) n, "%s", tails[k]);
+        int rc = stat(p, &st), err = errno;
+        if (k < 2 ? rc != 0 : rc == 0 || err != ELOOP) {
+            printf("      %d links: rc=%d errno=%d\n", 1 + 2 * pairs + (k == 1),
+                   rc, err);
+            FAIL("link count");
+            return;
+        }
+    }
+    PASS();
+}
+
 int main(void)
 {
     printf("test-usb-sysfs: synthetic USB tree contract\n");
@@ -1508,6 +1747,7 @@ int main(void)
     int ndev = check_devices();
     check_node_dotdot_relative();
     check_dotdot_leaves_bus();
+    check_class_walk();
 
     /* Stated, not implied: the second half is only as strong as the bus it ran
      * against, and a zero here means those assertions did not execute.

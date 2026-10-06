@@ -1594,10 +1594,13 @@ character devices, major 189, minor `(bus - 1) * 128 + (dev - 1)`, and the
 open intercept diverts an open away from the placeholder into the usbdevfs
 fd constructor (see [USB Device Passthrough](#usb-device-passthrough)).
 
-One layout deviation is deliberate: the `/sys/bus/usb/devices` entries are
+Two layout deviations are deliberate. The `/sys/bus/usb/devices` entries are
 real directories, not symlinks into `/sys/devices/...`, so `realpath()` of
 an entry canonicalizes to itself. libusb opens attributes relative to the
-entry and nusb canonicalizes the entry path; both tolerate this.
+entry and nusb canonicalizes the entry path; both tolerate this. And an
+interface a serial alias binds is emitted twice, nested under its device for
+the `/sys/class/tty` links and pyserial's `dirname`, and flat for libusb, so
+one interface has two inodes.
 
 The tree follows the `/sys/devices/system/cpu` one-shot rule: it is built
 lazily under `usb_lock` on first access and then stays fixed for the
@@ -1605,7 +1608,7 @@ process. Hotplug support, once the uevent layer can observe attach and
 detach, would discard the tree so that the next access re-enumerates; until
 then a replugged device is not picked up within a run.
 
-A second, smaller deviation is in `/dev/bus/usb` and in a served `/dev`: the
+A third, smaller deviation is in `/dev/bus/usb` and in a served `/dev`: the
 usbfs nodes and the serial alias names are placeholder files, so `getdents64`
 reports them with `d_type` `DT_REG` where Linux reports `DT_CHR`. `stat()` is
 correct, since the intercept fills `S_IFCHR` with the Linux major and minor,
@@ -1648,11 +1651,12 @@ Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 
 ### Ownership Of `/sys` And `/dev` Names
 
-The layer synthesizes `/sys/bus/usb` and `/dev/bus/usb` on top of a `/sys` and
-a `/dev` that a sysroot supplies, and adds the serial alias names `ttyACM<n>`
-and `ttyUSB<n>` to `/dev`. Which side answers a name is one decision, taken
-once in `classify_and_normalize`, and every entry point (`open`, `stat`,
-`lstat`, `readlink`, `access`, `getdents64`, `statfs`, `chdir`) answers from it.
+The layer synthesizes `/sys/bus/usb`, `/sys/class/tty`, `/sys/bus/usb-serial`
+and `/dev/bus/usb` on top of a `/sys` and a `/dev` that a sysroot supplies, and
+adds the serial alias names `ttyACM<n>` and `ttyUSB<n>` to `/dev`. Which side
+answers a name is one decision, taken once in `classify_and_normalize`, and
+every entry point (`open`, `stat`, `lstat`, `readlink`, `access`, `getdents64`,
+`statfs`, `chdir`) answers from it.
 An entry point that re-derives the decision is how four regressions arrived,
 each one a shadow: the layer claiming a name it does not serve and reporting
 `ENOENT` for a file the sysroot really has.
