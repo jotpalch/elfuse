@@ -1708,8 +1708,7 @@ not exist is left to the intercepts, which answer `ENOENT`, though calls that
 skip the intercepts, such as `chmod`, still reach the backing for it. A `..`
 after any other name under `/dev/bus` belongs to the backing, so the path layer
 looks the name up there and applies the `..` only to a directory the guest may
-search, following the name first when it is a symbolic link, as Linux does. The
-guest's effective user and group IDs and the supplementary groups `getgroups`
+search, as Linux does. The guest's effective user and group IDs and the supplementary groups `getgroups`
 reports are judged against the mode bits and the owner and group its `stat`
 reports, which follow a `chown` the host refused, and root may search any
 directory. `/dev/bus/other/f/../../usb/099/../001/001` is `ENOTDIR` for a file
@@ -1721,31 +1720,46 @@ not root. A relative name is folded only through `/dev/bus` and `/dev/bus/usb`,
 so `099/../001/001` from a `/dev/bus/usb` cwd and `other/f/../../../null` from a
 `/dev/bus` cwd go through the same steps.
 
-The links the path layer follows before a `..` go on to the sysroot resolver
-with the name they lead to, so they count toward one `MAXSYMLINKS` with the
-links it follows after them, and one with a relative target keeps a host
-fallback for that name refused, as after a relative link the resolver follows
-itself.
+A symbolic link the backing holds under `/dev/bus` is followed by the path layer
+too, wherever the walk meets it, and the walk goes on from its target, so the
+link resolves in the guest namespace, where `/dev/bus/usb` is the layer's: with
+a sysroot link from `/dev/bus/link` to `usb`, `/dev/bus/link/001/001` and
+`/dev/bus/link/001/../001/001` are the usbfs node. A link that ends the name is
+followed when the backing would follow it, so `stat`, a trailing slash and an
+`open` with `O_CREAT` but neither `O_EXCL` nor `O_NOFOLLOW` reach `/dev/bus/usb`
+while `lstat`, `readlink` and `mkdir` see the link. The links the path layer
+follows go on to the sysroot resolver with the name they lead to, so they count
+toward one `MAXSYMLINKS` with the links it follows after them, and the name
+takes the host fallback rule for a name reached through a link rather than the
+one for a name the guest typed.
 
 A name that enters `/dev/bus` through a `..` from outside it is not checked this
 way: `/etc/../dev/bus/usb/099/001` reaches a `dev/bus/usb/099/001` the sysroot
-plants, where Linux answers `ENOENT`. Only the name right before a `..` has its
-link followed in the guest namespace: a link earlier in a `/dev/bus` name is
-followed in the sysroot alone, which does not hold the layer's `/dev/bus/usb`,
-so with a sysroot link from `/dev/bus/link` to `usb`,
-`/dev/bus/link/001/../001/001` and `/dev/bus/link/001/001` are `ENOENT` where
-Linux serves the node. Only the search on the name before a `..` uses the
-guest's IDs; the host walks every other name with the host user's credentials,
-as for any sysroot path. With `mine` at mode `700` and owned by the host user,
-the default guest uid 1000 reaches `/dev/bus/mine/f`, where Linux answers
-`EACCES`, and gets `EACCES`, as on Linux, for `/dev/bus/mine/../usb/001/001`.
-Under `--fakeroot`, with `other` at mode `000` and a host user other than root,
-`/dev/bus/other/f/../../usb/001/001` is `EACCES` for a file `f`, where Linux
-answers `ENOTDIR`. The search check and the lookup of the rewritten name are two
-steps, and the rewritten name drops the name checked, so the walk goes on when
-another thread or process renames or replaces that name between them, where
-Linux walks the name once and fails at a missing name or a file, or follows the
-new link.
+plants, where Linux answers `ENOENT`. Nor is a link outside `/dev/bus` whose
+target is under it: the sysroot resolver follows it alone, so with a sysroot
+link from `/lk/u` to `/dev/bus/usb`, `/lk/u/001/001` is `ENOENT` where Linux
+serves the node. Outside `/dev/bus`, a link that ends the name of an `open` with
+`O_CREAT` is left to the host, which follows it in its own namespace and counts
+it apart from the links followed before it. A `..` that pops `/dev/bus/usb` onto
+a name outside it is left to the backing: on a sysroot without `dev/bus/usb` the
+backing cannot walk it, so `/dev/bus/usb/../other/f` is `ENOENT` where Linux
+reaches the backing's file, and on one with it the backing follows a link after
+the `..` within the sysroot, so with `link` to `usb`,
+`/dev/bus/usb/../link/001/001` is `ENOENT` on either where Linux serves the
+node. Only the search on the name
+before a `..` uses the guest's IDs; the host walks every other name with the
+host user's credentials, as for any sysroot path. With `mine` at mode `700` and
+owned by the host user, the default guest uid 1000 reaches `/dev/bus/mine/f`,
+where Linux answers `EACCES`, and gets `EACCES`, as on Linux, for
+`/dev/bus/mine/../usb/001/001`. Under `--fakeroot`, with `other` at mode `000`
+and a host user other than root, `/dev/bus/other/f/../../usb/001/001` is
+`EACCES` for a file `f`, where Linux answers `ENOTDIR`. The search check and the
+lookup of the rewritten name are two steps, and the rewritten name drops the
+name checked, so the walk goes on when another thread or process renames or
+replaces that name between them, where Linux walks the name once and fails at a
+missing name or a file, or follows the new link. Following a link is two steps
+as well, the lookup that finds it and the read of its target, so a link replaced
+between them by another kind of file fails the walk with `EINVAL`.
 
 ### Filesystem Identity Of A Descriptor
 

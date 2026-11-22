@@ -1844,12 +1844,13 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 # absolute target the guest writes as a relative one. Both hrel targets name the
 # host directory by its absolute path in the guest, as a '..' stops at the guest
 # root.
-USB_SYSFS_BACKING = mkdir -p "$$tmpdir/host" "$$sysroot/lk"; \
-	: > "$$tmpdir/host/f"; \
+USB_SYSFS_BACKING = mkdir -p "$$tmpdir/host" "$$sysroot/lk" \
+		"$$sysroot/dev/bus/usb"; : > "$$tmpdir/host/f"; \
 	ln -s "../..$$tmpdir/host" "$$sysroot/dev/bus/hrel"; \
 	ln -s "..$$tmpdir/host" "$$sysroot/lk/hrel"; \
 	ln -s "$$tmpdir/host" "$$sysroot/dev/bus/habs"; \
 	ln -s "$$tmpdir/host" "$$sysroot/lk/habs"; \
+	ln -s /lk/cf "$$sysroot/dev/bus/cl"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot backing
 
