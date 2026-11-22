@@ -36,6 +36,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-interp-fallback test-sysroot-interp-cased \
         test-sysroot-absock-names test-absock-cleanup test-registry-stale-pid \
         test-linkat-symlink-fallback test-casefold-host \
+        test-usb-sysfs-sysroot-caseexact \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
         test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
@@ -1836,7 +1837,41 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" --user 4242:4242 \
 		$(TEST_DIR)/test-usb-sysfs-sysroot search; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" --fakeroot \
-		$(TEST_DIR)/test-usb-sysfs-sysroot search root
+		$(TEST_DIR)/test-usb-sysfs-sysroot search root; \
+	$(USB_SYSFS_BACKING)
+
+# The backing run, with links a guest cannot make, since elfuse stores an
+# absolute target the guest writes as a relative one. Both hrel targets name the
+# host directory by its absolute path in the guest, as a '..' stops at the guest
+# root.
+USB_SYSFS_BACKING = mkdir -p "$$tmpdir/host" "$$sysroot/lk"; \
+	: > "$$tmpdir/host/f"; \
+	ln -s "../..$$tmpdir/host" "$$sysroot/dev/bus/hrel"; \
+	ln -s "..$$tmpdir/host" "$$sysroot/lk/hrel"; \
+	ln -s "$$tmpdir/host" "$$sysroot/dev/bus/habs"; \
+	ln -s "$$tmpdir/host" "$$sysroot/lk/habs"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-sysroot backing
+
+## The backing run of test-usb-sysfs-sysroot again over a scratch Case-sensitive
+## HFS+ image, where the sysroot resolvers take their byte-exact walk. Not wired
+## into `check`, as the other disk-image targets are not; skips when hdiutil
+## cannot make or attach the image.
+test-usb-sysfs-sysroot-caseexact: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
+	@dmg=$$(mktemp -u).dmg; mnt=""; \
+	trap '[ -n "$$mnt" ] && hdiutil detach "$$mnt" -force -quiet >/dev/null 2>&1; rm -f "$$dmg"' EXIT; \
+	if ! hdiutil create -size 16m -fs "Case-sensitive HFS+" \
+	        -volname elfusebus -quiet "$$dmg" >/dev/null 2>&1; then \
+		printf "$(YELLOW)SKIP$(RESET) test-usb-sysfs-sysroot-caseexact (hdiutil create failed)\n"; \
+		exit 0; \
+	fi; \
+	mnt=$$(hdiutil attach "$$dmg" -nobrowse | awk '/\/Volumes\//{print $$NF}'); \
+	if [ -z "$$mnt" ]; then \
+		printf "$(YELLOW)SKIP$(RESET) test-usb-sysfs-sysroot-caseexact (hdiutil attach failed)\n"; \
+		exit 0; \
+	fi; \
+	set -e; tmpdir="$$mnt"; sysroot="$$mnt/sysroot"; mkdir -p "$$sysroot/dev/bus"; \
+	$(USB_SYSFS_BACKING)
 
 ## Every entry point that can name something under /sys or /dev/bus, against
 ## every class of name those trees can hold. The layer synthesizes one subtree
