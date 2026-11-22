@@ -1729,10 +1729,9 @@ link resolves in the guest namespace, where `/dev/bus/usb` is the layer's: with
 a sysroot link from `/dev/bus/link` to `usb`, `/dev/bus/link/001/001` and
 `/dev/bus/link/001/../001/001` are the usbfs node. A link that ends the name is
 followed when the sysroot resolver would follow it, so `stat` and a trailing
-slash reach `/dev/bus/usb` while `lstat` and `readlink` see the link. The links
-followed there do not count toward the `MAXSYMLINKS` the sysroot resolver
-applies once a target leaves `/dev/bus`, so a chain split between the two can
-follow more links than Linux allows before `ELOOP`.
+slash reach `/dev/bus/usb` while `lstat` and `readlink` see the link. Those
+links and the ones the sysroot resolver follows once a target leaves `/dev/bus`
+count toward one `MAXSYMLINKS`, as the links of one Linux walk do.
 
 A name that enters `/dev/bus` through a `..` from outside it is not checked this
 way: `/etc/../dev/bus/usb/099/001` reaches a `dev/bus/usb/099/001` the sysroot

@@ -631,7 +631,7 @@ static int path_dev_bus_follow_link(char *name,
             return 0;
         memcpy(prefix, name, (size_t) (end - name));
         prefix[end - name] = '\0';
-        hp = path_resolve_sysroot_nofollow_path(prefix, host, sizeof(host));
+        hp = path_resolve_sysroot_nofollow_path(prefix, host, sizeof(host), 0);
         if (!hp || lstat(hp, &st) < 0)
             return 0;
         if (S_ISLNK(st.st_mode))
@@ -692,7 +692,7 @@ static int path_backing_dotdot(char *name, size_t namesz, const char *dotdot)
 
     errno = 0;
     const char *hp =
-        path_resolve_sysroot_nofollow_path(name, host, sizeof(host));
+        path_resolve_sysroot_nofollow_path(name, host, sizeof(host), 0);
     if (!hp) {
         if (errno == 0)
             errno = ENOENT;
@@ -741,14 +741,15 @@ static int path_backing_dotdot(char *name, size_t namesz, const char *dotdot)
  * /dev/bus/usb that is not a bus or device number. A '..' or a link among the
  * names outside /dev/bus/usb is the backing's. What follows can climb out
  * again, as in /dev/bus/../bus/../null; each pass applies a '..' or follows a
- * link, and MAXSYMLINKS bounds the links. @flags decide whether a link that
- * ends the name is followed.
+ * link, and *@links, the links followed, stops at MAXSYMLINKS. @flags decide
+ * whether a link that ends the name is followed.
  *
  * Returns 0, or -1 with errno set.
  */
-static int path_rewrite_dev_climb(path_translation_t *tx, unsigned int flags)
+static int path_rewrite_dev_climb(path_translation_t *tx,
+                                  unsigned int flags,
+                                  unsigned *links)
 {
-    unsigned links = 0;
     while (path_prefix_match(tx->guest_path, "/dev/bus", 8)) {
         char resolved[LINUX_PATH_MAX];
         const char *dotdot = NULL;
@@ -766,14 +767,14 @@ static int path_rewrite_dev_climb(path_translation_t *tx, unsigned int flags)
                            path_has_trailing_slash(tx->guest_path));
             str_copy_trunc(resolved, tx->guest_path, sizeof(resolved));
             rc = path_dev_bus_follow_link(resolved, sizeof(resolved), NULL,
-                                          follow, &links);
+                                          follow, links);
             if (rc <= 0)
                 return rc;
             break;
         }
         case DEV_CLIMB_BACKING_DOTDOT:
             rc = path_dev_bus_follow_link(resolved, sizeof(resolved), dotdot,
-                                          true, &links);
+                                          true, links);
             if (rc < 0 ||
                 (rc == 0 &&
                  path_backing_dotdot(resolved, sizeof(resolved), dotdot) < 0))
@@ -791,14 +792,16 @@ static int path_rewrite_dev_climb(path_translation_t *tx, unsigned int flags)
 
 /* Rewrite a /dev/bus or /sys/bus/usb path into the canonical guest spelling of
  * where it lands, in tx->guest_buf, before anything decides whose name it is.
- * The /dev/bus climb runs first because a climb can land in /sys. @flags are as
- * for path_rewrite_dev_climb.
+ * The /dev/bus climb runs first because a climb can land in /sys. @flags and
+ * *@links are as for path_rewrite_dev_climb.
  *
  * Returns 0, or -1 with errno set.
  */
-static int path_rewrite_usb_aliases(path_translation_t *tx, unsigned int flags)
+static int path_rewrite_usb_aliases(path_translation_t *tx,
+                                    unsigned int flags,
+                                    unsigned *links)
 {
-    if (path_rewrite_dev_climb(tx, flags) < 0)
+    if (path_rewrite_dev_climb(tx, flags, links) < 0)
         return -1;
 
     /* A /sys walk that passes through one of the synthetic USB `subsystem`
@@ -914,7 +917,8 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    if (path_rewrite_usb_aliases(tx, flags) < 0)
+    unsigned links = 0;
+    if (path_rewrite_usb_aliases(tx, flags, &links) < 0)
         return -1;
 
     /* /dev/shm/<leaf> maps into the per-UID host backing dir, through the same
@@ -1000,13 +1004,13 @@ int path_translate_at(guest_fd_t dirfd,
     if (lookup_flags & PATH_TR_CREATE) {
         tx->host_path = path_resolve_sysroot_create_path(
             tx->guest_path, tx->host_buf, sizeof(tx->host_buf),
-            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0);
+            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0, links);
     } else if (lookup_flags & PATH_TR_NOFOLLOW) {
         tx->host_path = path_resolve_sysroot_nofollow_path(
-            tx->guest_path, tx->host_buf, sizeof(tx->host_buf));
+            tx->guest_path, tx->host_buf, sizeof(tx->host_buf), links);
     } else {
         tx->host_path = path_resolve_sysroot_path(tx->guest_path, tx->host_buf,
-                                                  sizeof(tx->host_buf));
+                                                  sizeof(tx->host_buf), links);
     }
 
     /* The resolvers above key off guest_path[0] == '/': a relative path is
@@ -1245,24 +1249,30 @@ static size_t path_lexical_depth(const char *path)
  */
 static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz);
 
-const char *path_resolve_sysroot_path(const char *path, char *buf, size_t bufsz)
+const char *path_resolve_sysroot_path(const char *path,
+                                      char *buf,
+                                      size_t bufsz,
+                                      unsigned links)
 {
-    return proc_resolve_sysroot_path(path, buf, bufsz);
+    return proc_resolve_sysroot_path(path, buf, bufsz, links);
 }
 
 const char *path_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz)
+                                               size_t bufsz,
+                                               unsigned links)
 {
-    return proc_resolve_sysroot_nofollow_path(path, buf, bufsz);
+    return proc_resolve_sysroot_nofollow_path(path, buf, bufsz, links);
 }
 
 const char *path_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents)
+                                             bool create_parents,
+                                             unsigned links)
 {
-    return proc_resolve_sysroot_create_path(path, buf, bufsz, create_parents);
+    return proc_resolve_sysroot_create_path(path, buf, bufsz, create_parents,
+                                            links);
 }
 
 int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
@@ -1307,7 +1317,7 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             }
         }
         const char *host_path = path_resolve_sysroot_nofollow_path(
-            path, sysroot_buf, sizeof(sysroot_buf));
+            path, sysroot_buf, sizeof(sysroot_buf), 0);
         if (!host_path) {
             errno = ENAMETOOLONG;
             return -1;
@@ -2359,13 +2369,13 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
          */
         bool create_parents = climbed && (flags & PATH_TR_CREATE_PARENTS) != 0;
         checked = path_resolve_sysroot_create_path(
-            abs_path, host_buf, sizeof(host_buf), create_parents);
+            abs_path, host_buf, sizeof(host_buf), create_parents, 0);
     } else if (flags & PATH_TR_NOFOLLOW) {
         checked = path_resolve_sysroot_nofollow_path(abs_path, host_buf,
-                                                     sizeof(host_buf));
+                                                     sizeof(host_buf), 0);
     } else {
         checked =
-            path_resolve_sysroot_path(abs_path, host_buf, sizeof(host_buf));
+            path_resolve_sysroot_path(abs_path, host_buf, sizeof(host_buf), 0);
     }
 
     char fallback_buf[LINUX_PATH_MAX];

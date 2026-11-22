@@ -322,10 +322,14 @@ bool proc_sysroot_casefold_enabled(void);
  * Returns path unchanged when no sysroot applies or when any other
  * sysroot-backed path does not exist, or NULL if sysroot path construction
  * would truncate or escape containment checks.
+ *
+ * @links counts the links the caller already followed to reach @path, so the
+ * two together stop at MAXSYMLINKS, as one Linux walk does.
  */
 const char *proc_resolve_sysroot_path(const char *path,
                                       char *buf,
-                                      size_t bufsz);
+                                      size_t bufsz,
+                                      unsigned links);
 
 /* Resolve an absolute guest path through the stored sysroot for operations that
  * must not follow the final path component (readlinkat, O_NOFOLLOW,
@@ -333,7 +337,8 @@ const char *proc_resolve_sysroot_path(const char *path,
  */
 const char *proc_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz);
+                                               size_t bufsz,
+                                               unsigned links);
 
 /* Resolve an absolute guest path through the stored sysroot for operations that
  * may create the final path. Unlike proc_resolve_sysroot_path(), this prefixes
@@ -342,7 +347,8 @@ const char *proc_resolve_sysroot_nofollow_path(const char *path,
 const char *proc_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents);
+                                             bool create_parents,
+                                             unsigned links);
 
 /* execve. */
 

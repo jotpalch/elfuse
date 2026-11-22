@@ -299,14 +299,17 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path);
 
 const char *path_resolve_sysroot_path(const char *path,
                                       char *buf,
-                                      size_t bufsz);
+                                      size_t bufsz,
+                                      unsigned links);
 const char *path_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz);
+                                               size_t bufsz,
+                                               unsigned links);
 const char *path_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents);
+                                             bool create_parents,
+                                             unsigned links);
 
 bool path_openat2_stays_beneath(const char *path, bool clamp_at_root);
 int path_openat2_normalize_in_root(const char *path, char *out, size_t outsz);

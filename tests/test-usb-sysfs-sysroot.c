@@ -15,7 +15,7 @@
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Six regressions are pinned here.
+ * Seven regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -49,6 +49,9 @@
  *
  * F6: a link the sysroot holds under /dev/bus is followed in the guest's
  * namespace, where /dev/bus/usb is the layer's.
+ *
+ * F7: those links count toward one MAXSYMLINKS with the ones the sysroot
+ * resolver follows after them.
  */
 
 #include <dirent.h>
@@ -191,6 +194,40 @@ static bool make_file(const char *path)
     return fd >= 0 && close(fd) == 0;
 }
 
+/* Make @n links in a new @dir, each to the next and the last to @last. */
+static bool make_chain(const char *dir, int n, const char *last)
+{
+    char name[64], target[64];
+
+    if (mkdir(dir, 0755) != 0)
+        return false;
+    for (int i = 0; i < n; i++) {
+        snprintf(name, sizeof(name), "%s/l%d", dir, i);
+        if (i + 1 < n)
+            snprintf(target, sizeof(target), "l%d", i + 1);
+        else
+            snprintf(target, sizeof(target), "%s", last);
+        if (symlink(target, name) != 0)
+            return false;
+    }
+    return true;
+}
+
+/* /dev/bus/@name/l0 starts 25 links, and @n more under /lk/@name end at its
+ * directory d, which holds a file x.
+ */
+static bool make_split(const char *name, int n)
+{
+    char a[64], b[64], first[64], d[64], x[64];
+    snprintf(a, sizeof(a), "/dev/bus/%s", name);
+    snprintf(b, sizeof(b), "/lk/%s", name);
+    snprintf(first, sizeof(first), "/lk/%s/l0", name);
+    snprintf(d, sizeof(d), "/lk/%s/d", name);
+    snprintf(x, sizeof(x), "/lk/%s/d/x", name);
+    return make_chain(a, 25, first) && make_chain(b, n, "d") &&
+           mkdir(d, 0755) == 0 && make_file(x);
+}
+
 static bool same_file(const char *path, const struct stat *want)
 {
     struct stat st;
@@ -208,6 +245,8 @@ static void check_backing_names(void)
                 make_file("/dev/bus/plain/f") &&
                 stat("/dev/bus/plain/f", &file) == 0;
     made = made && symlink("usb", "/dev/bus/ulnk") == 0;
+    made = made && mkdir("/lk", 0755) == 0 && make_split("c40", 15) &&
+           make_split("c41", 16);
     EXPECT_TRUE(made, "make the fixture");
 
     /* The sysroot has no dev/bus/usb for the host to walk the '..' through. */
@@ -244,6 +283,21 @@ static void check_backing_names(void)
                     lstat("/dev/bus/ulnk", &st) == 0 && S_ISLNK(st.st_mode) &&
                     n == 3 && !memcmp(buf, "usb", 3),
                 "stat, lstat and readlink of /dev/bus/ulnk");
+
+    /* Linux counts the links of one walk toward MAXSYMLINKS, 40
+     * (include/linux/namei.h), and c40 and c41 start 25 under /dev/bus.
+     */
+    TEST("40 links from /dev/bus/c40/l0 to /lk/c40/d resolve");
+    EXPECT_TRUE(stat("/dev/bus/c40/l0/x", &st) == 0 && S_ISREG(st.st_mode) &&
+                    stat("/dev/bus/c40/l0/../d/x", &st) == 0 &&
+                    S_ISREG(st.st_mode),
+                "stat through 40 links");
+
+    TEST("41 links from /dev/bus/c41/l0 are ELOOP");
+    EXPECT_ERRNO(stat("/dev/bus/c41/l0/x", &st), ELOOP,
+                 "stat(\"/dev/bus/c41/l0/x\")");
+    EXPECT_ERRNO(stat("/dev/bus/c41/l0/../d/x", &st), ELOOP,
+                 "stat(\"/dev/bus/c41/l0/../d/x\")");
 }
 
 int main(int argc, char **argv)
