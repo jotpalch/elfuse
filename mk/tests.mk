@@ -1837,6 +1837,11 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 		$(TEST_DIR)/test-usb-sysfs-sysroot search; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" --fakeroot \
 		$(TEST_DIR)/test-usb-sysfs-sysroot search root; \
+	mkdir "$$tmpdir/host" "$$sysroot/lk"; : > "$$tmpdir/host/f"; \
+	ln -s "../..$$tmpdir/host" "$$sysroot/dev/bus/hrel"; \
+	ln -s "..$$tmpdir/host" "$$sysroot/lk/hrel"; \
+	ln -s "$$tmpdir/host" "$$sysroot/dev/bus/habs"; \
+	ln -s "$$tmpdir/host" "$$sysroot/lk/habs"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot backing
 

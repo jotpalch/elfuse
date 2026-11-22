@@ -15,7 +15,7 @@
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Five regressions are pinned here.
+ * Six regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -45,6 +45,10 @@
  * F5: a '..' over /dev/bus/usb reaches a name the backing owns, though the
  * sysroot has no dev/bus/usb for the host to walk. The lane runs the guest
  * again with the argument backing.
+ *
+ * F6: links the path layer follows count toward one MAXSYMLINKS with the
+ * sysroot resolver's, and a relative one keeps a host fallback refused. The
+ * lane links hrel and habs under /dev/bus and /lk to a host directory.
  */
 
 #include <dirent.h>
@@ -187,6 +191,40 @@ static bool make_file(const char *path)
     return fd >= 0 && close(fd) == 0;
 }
 
+/* Make @n links in a new @dir, each to the next and the last to @last. */
+static bool make_chain(const char *dir, int n, const char *last)
+{
+    char name[64], target[64];
+
+    if (mkdir(dir, 0755) != 0)
+        return false;
+    for (int i = 0; i < n; i++) {
+        snprintf(name, sizeof(name), "%s/l%d", dir, i);
+        if (i + 1 < n)
+            snprintf(target, sizeof(target), "l%d", i + 1);
+        else
+            snprintf(target, sizeof(target), "%s", last);
+        if (symlink(target, name) != 0)
+            return false;
+    }
+    return true;
+}
+
+/* /dev/bus/@name/l0 starts 25 links, and @n more under /lk/@name end at its
+ * directory d, which holds a file x.
+ */
+static bool make_split(const char *name, int n)
+{
+    char a[64], b[64], first[64], d[64], x[64];
+    snprintf(a, sizeof(a), "/dev/bus/%s", name);
+    snprintf(b, sizeof(b), "/lk/%s", name);
+    snprintf(first, sizeof(first), "/lk/%s/l0", name);
+    snprintf(d, sizeof(d), "/lk/%s/d", name);
+    snprintf(x, sizeof(x), "/lk/%s/d/x", name);
+    return make_chain(a, 25, first) && make_chain(b, n, "d") &&
+           mkdir(d, 0755) == 0 && make_file(x);
+}
+
 static bool same_file(const char *path, const struct stat *want)
 {
     struct stat st;
@@ -196,7 +234,7 @@ static bool same_file(const char *path, const struct stat *want)
 
 static void check_backing_names(void)
 {
-    struct stat file, dotted;
+    struct stat file, dotted, st;
 
     TEST("the names to test are made");
     bool made =
@@ -204,6 +242,7 @@ static void check_backing_names(void)
         stat("/dev/bus/plain/f", &file) == 0 &&
         mkdir("/dev/bus/a..b", 0755) == 0 && make_file("/dev/bus/a..b/f") &&
         stat("/dev/bus/a..b/f", &dotted) == 0;
+    made = made && make_split("c40", 15) && make_split("c41", 16);
     EXPECT_TRUE(made, "make the fixture");
 
     /* The sysroot has no dev/bus/usb for the host to walk the '..' through. */
@@ -215,6 +254,32 @@ static void check_backing_names(void)
     TEST("/dev/bus/usb/../a..b/f is the backing's file");
     EXPECT_TRUE(same_file("/dev/bus/usb/../a..b/f", &dotted),
                 "stat(\"/dev/bus/usb/../a..b/f\")");
+
+    /* Linux counts the links of one walk toward MAXSYMLINKS, 40
+     * (include/linux/namei.h), and c40 and c41 start 25 under /dev/bus.
+     */
+    TEST("40 links before a '..' resolve");
+    EXPECT_TRUE(stat("/dev/bus/c40/l0/../d/x", &st) == 0 && S_ISREG(st.st_mode),
+                "stat(\"/dev/bus/c40/l0/../d/x\")");
+
+    TEST("41 links before a '..' are ELOOP");
+    EXPECT_ERRNO(stat("/dev/bus/c41/l0/../d/x", &st), ELOOP,
+                 "stat(\"/dev/bus/c41/l0/../d/x\")");
+
+    /* A sysroot link reaches the host only through an absolute target, which
+     * test-sysroot-symlink-escape pins for a link the resolver follows.
+     */
+    TEST("a relative link to the host before a '..' is ELOOP");
+    EXPECT_ERRNO(stat("/dev/bus/hrel/../host/f", &st), ELOOP,
+                 "stat(\"/dev/bus/hrel/../host/f\")");
+    EXPECT_ERRNO(stat("/lk/hrel/../host/f", &st), ELOOP,
+                 "stat(\"/lk/hrel/../host/f\")");
+
+    TEST("an absolute one reaches the host's file");
+    EXPECT_TRUE(stat("/dev/bus/habs/../host/f", &st) == 0 &&
+                    S_ISREG(st.st_mode) &&
+                    stat("/lk/habs/../host/f", &st) == 0 && S_ISREG(st.st_mode),
+                "stat of habs/../host/f under /dev/bus and /lk");
 }
 
 int main(int argc, char **argv)
