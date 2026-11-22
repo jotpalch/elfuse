@@ -2338,8 +2338,21 @@ dev_climb_t usb_sysfs_resolve_dev_climb(const char *guest_path,
         frc = usb_suffix_normalize(skip_slashes(guest_path + 8), true, folded,
                                    sizeof(folded), &rest, &kind);
     pthread_mutex_unlock(&usb_lock);
-    if (frc != 0)
+    if (frc < 0)
         return DEV_CLIMB_NONE;
+
+    /* Every '..' popped a directory the layer serves. A name the backing owns
+     * is left, and the backing must not walk the layer's directories to reach
+     * it, so the folded name takes the place of the guest's.
+     */
+    if (frc == 1) {
+        int bus = 0;
+        int n = snprintf(out, outsz, "/dev/bus/%s", folded);
+        if (usb_dev_kind(folded, &bus) != USB_PATH_DEV_FOREIGN || n < 0 ||
+            (size_t) n >= outsz || !strcmp(out, guest_path))
+            return DEV_CLIMB_NONE;
+        return DEV_CLIMB_REWRITTEN;
+    }
 
     switch (kind) {
     case USB_PATH_DEV_FOREIGN: {

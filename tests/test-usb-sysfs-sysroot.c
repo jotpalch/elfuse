@@ -15,7 +15,7 @@
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Four regressions are pinned here.
+ * Five regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -41,6 +41,11 @@
  * empty, so the lane adds directories at modes 000, 010 and 100 and runs the
  * guest with the argument search as uid 4242, then with search root under
  * --fakeroot.
+ *
+ * F5: a '..' that pops /dev/bus/usb onto a name the backing owns reaches that
+ * name, though the sysroot has no dev/bus/usb for the host to walk. The lane
+ * runs the guest again with the argument backing, which makes the names it
+ * needs under the sysroot's /dev/bus.
  */
 
 #include <dirent.h>
@@ -177,6 +182,35 @@ static void check_dotdot_search(bool root)
     }
 }
 
+static bool make_file(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT, 0644);
+    return fd >= 0 && close(fd) == 0;
+}
+
+static bool same_file(const char *path, const struct stat *want)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && st.st_dev == want->st_dev &&
+           st.st_ino == want->st_ino;
+}
+
+static void check_backing_names(void)
+{
+    struct stat file;
+
+    TEST("the names to test are made");
+    bool made = mkdir("/dev/bus/plain", 0755) == 0 &&
+                make_file("/dev/bus/plain/f") &&
+                stat("/dev/bus/plain/f", &file) == 0;
+    EXPECT_TRUE(made, "make the fixture");
+
+    /* The sysroot has no dev/bus/usb for the host to walk the '..' through. */
+    TEST("/dev/bus/usb/../plain/f is the backing's file");
+    EXPECT_TRUE(same_file("/dev/bus/usb/../plain/f", &file),
+                "stat(\"/dev/bus/usb/../plain/f\")");
+}
+
 int main(int argc, char **argv)
 {
     char buf[256];
@@ -186,6 +220,11 @@ int main(int argc, char **argv)
         check_dotdot_search(root);
         SUMMARY(root ? "test-usb-sysfs-sysroot search root"
                      : "test-usb-sysfs-sysroot search");
+        return fails ? 1 : 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "backing")) {
+        check_backing_names();
+        SUMMARY("test-usb-sysfs-sysroot backing");
         return fails ? 1 : 0;
     }
 

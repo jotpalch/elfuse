@@ -112,7 +112,8 @@ typedef enum {
  * not a bus or device number, fails the walk, as on Linux; one after a name
  * shaped like a node, or a name below one, is left as written. A '..' after a
  * name outside /dev/bus/usb stops the walk, since only the backing can say
- * whether that name is a directory.
+ * whether that name is a directory. A name that the layer's '..' folds onto a
+ * name outside /dev/bus/usb is rewritten to the folded name.
  */
 dev_climb_t usb_sysfs_resolve_dev_climb(const char *guest_path,
                                         char *out,

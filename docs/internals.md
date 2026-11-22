@@ -1692,7 +1692,9 @@ A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
 A backing cannot apply such a `..` on `/dev/bus`: the directories are the
 layer's, and the macOS host has no `/dev/bus` at all. So a `/dev/bus` name that
 climbs out over the layer's own directories is first rewritten in the path
-layer to `/dev` followed by what comes after the `..` that climbed. A further
+layer to `/dev` followed by what comes after the `..` that climbed, and one
+whose `..` pops them onto a name the backing owns, as in
+`/dev/bus/usb/../other/f`, to the folded name. A further
 `..` is applied to `/dev` and stops at `/`, so `/dev/bus/../../proc/self/status`
 reaches the `/proc` intercept. When the climb ends the name, the rewrite ends
 in `.`, as in `/dev/.`, so `rmdir` and `rename` fail rather than act on the

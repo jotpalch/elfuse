@@ -1836,7 +1836,9 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" --user 4242:4242 \
 		$(TEST_DIR)/test-usb-sysfs-sysroot search; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" --fakeroot \
-		$(TEST_DIR)/test-usb-sysfs-sysroot search root
+		$(TEST_DIR)/test-usb-sysfs-sysroot search root; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-sysroot backing
 
 ## Every entry point that can name something under /sys or /dev/bus, against
 ## every class of name those trees can hold. The layer synthesizes one subtree
