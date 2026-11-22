@@ -859,8 +859,11 @@ int64_t sys_openat_path(guest_t *g,
     path_translation_t tx;
     unsigned int tx_flags =
         (linux_flags & LINUX_O_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE;
-    if (linux_flags & LINUX_O_CREAT)
+    if (linux_flags & LINUX_O_CREAT) {
         tx_flags = PATH_TR_CREATE | PATH_TR_CREATE_PARENTS;
+        if (!(linux_flags & (LINUX_O_EXCL | LINUX_O_NOFOLLOW)))
+            tx_flags |= PATH_TR_CREATE_FOLLOW;
+    }
     if (path_translate_at(dirfd, pathp, tx_flags, &tx) < 0)
         return linux_errno();
 

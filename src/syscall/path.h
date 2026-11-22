@@ -22,6 +22,11 @@ typedef enum {
     PATH_TR_NOFOLLOW = 1u << 0,
     PATH_TR_CREATE = 1u << 1,
     PATH_TR_CREATE_PARENTS = 1u << 2,
+
+    /* A create that follows a link ending the name, as open(O_CREAT) does
+     * without O_EXCL or O_NOFOLLOW.
+     */
+    PATH_TR_CREATE_FOLLOW = 1u << 3,
 } path_translate_flags_t;
 
 /* AT_SYMLINK_NOFOLLOW, already extracted by the caller as a plain int/bool,
