@@ -7,15 +7,15 @@
  * Code under test: the /sys ours/not-ours split in src/runtime/usb-sysfs.c, the
  * /sys + /dev/bus arms of sys_fchdir (src/syscall/fs.c) and
  * resolve_proc_cwd_path (src/syscall/path.c), the /dev/bus climb rewrite in
- * usb_sysfs_resolve_dev_climb and path_translate_at, and the backing '..' in
- * path_backing_dotdot.
+ * usb_sysfs_resolve_dev_climb and path_translate_at, and the backing '..' and
+ * links in path_backing_dotdot and path_dev_bus_follow_link.
  *
  * Run under --sysroot over a tree that carries a real /sys skeleton
  * (/sys/class/net/eth0/address, /sys/kernel/mm/transparent_hugepage/enabled,
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Five regressions are pinned here.
+ * Six regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -46,6 +46,9 @@
  * name, though the sysroot has no dev/bus/usb for the host to walk. The lane
  * runs the guest again with the argument backing, which makes the names it
  * needs under the sysroot's /dev/bus.
+ *
+ * F6: a link the sysroot holds under /dev/bus is followed in the guest's
+ * namespace, where /dev/bus/usb is the layer's.
  */
 
 #include <dirent.h>
@@ -197,18 +200,50 @@ static bool same_file(const char *path, const struct stat *want)
 
 static void check_backing_names(void)
 {
-    struct stat file;
+    struct stat file, node, dir, st;
+    char buf[16];
 
     TEST("the names to test are made");
     bool made = mkdir("/dev/bus/plain", 0755) == 0 &&
                 make_file("/dev/bus/plain/f") &&
                 stat("/dev/bus/plain/f", &file) == 0;
+    made = made && symlink("usb", "/dev/bus/ulnk") == 0;
     EXPECT_TRUE(made, "make the fixture");
 
     /* The sysroot has no dev/bus/usb for the host to walk the '..' through. */
     TEST("/dev/bus/usb/../plain/f is the backing's file");
     EXPECT_TRUE(same_file("/dev/bus/usb/../plain/f", &file),
                 "stat(\"/dev/bus/usb/../plain/f\")");
+
+    /* Linux follows a link where the walk meets it, in the guest namespace. */
+    TEST("/dev/bus/usb/001/001 is a char device");
+    EXPECT_TRUE(stat("/dev/bus/usb/001/001", &node) == 0 &&
+                    S_ISCHR(node.st_mode) && stat("/dev/bus/usb", &dir) == 0,
+                "stat(\"/dev/bus/usb/001/001\")");
+
+    TEST("/dev/bus/ulnk/001/001 is the node");
+    EXPECT_TRUE(same_file("/dev/bus/ulnk/001/001", &node),
+                "stat(\"/dev/bus/ulnk/001/001\")");
+
+    TEST("/dev/bus/ulnk/001/../001/001 is the node");
+    EXPECT_TRUE(same_file("/dev/bus/ulnk/001/../001/001", &node),
+                "stat(\"/dev/bus/ulnk/001/../001/001\")");
+
+    TEST("/dev/bus/usb/../ulnk/001/001 is the node");
+    EXPECT_TRUE(same_file("/dev/bus/usb/../ulnk/001/001", &node),
+                "stat(\"/dev/bus/usb/../ulnk/001/001\")");
+
+    TEST("\"ulnk/001/001\" in a /dev/bus cwd is the node");
+    EXPECT_TRUE(chdir("/dev/bus") == 0 && same_file("ulnk/001/001", &node),
+                "stat(\"ulnk/001/001\")");
+
+    TEST("stat follows /dev/bus/ulnk, lstat and readlink do not");
+    ssize_t n = readlink("/dev/bus/ulnk", buf, sizeof(buf));
+    EXPECT_TRUE(same_file("/dev/bus/ulnk", &dir) &&
+                    same_file("/dev/bus/ulnk/", &dir) &&
+                    lstat("/dev/bus/ulnk", &st) == 0 && S_ISLNK(st.st_mode) &&
+                    n == 3 && !memcmp(buf, "usb", 3),
+                "stat, lstat and readlink of /dev/bus/ulnk");
 }
 
 int main(int argc, char **argv)
