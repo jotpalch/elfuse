@@ -554,6 +554,27 @@ static bool sysroot_path_exists(const char *resolved_path, bool follow_final)
     return lstat(resolved_path, &st) == 0;
 }
 
+/* Whether the host lacks the directory that would hold @path, an absolute name.
+ * Any answer but ENOENT or ENOTDIR counts as present, which fails closed.
+ */
+static bool host_parent_absent(const char *path)
+{
+    char parent[LINUX_PATH_MAX];
+    if (str_copy_trunc(parent, path, sizeof(parent)) >= sizeof(parent))
+        return false;
+    size_t len = strlen(parent);
+    while (len > 1 && parent[len - 1] == '/')
+        parent[--len] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash)
+        return false;
+    if (slash == parent)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+    return access(parent, F_OK) < 0 && (errno == ENOENT || errno == ENOTDIR);
+}
+
 static const char *copy_host_fallback_path(const char *path,
                                            char *buf,
                                            size_t bufsz)
@@ -1384,7 +1405,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
 
     /* Parent doesn't exist in sysroot. Only the temp roots and the guest system
      * directories are forced to resolve there; everything else falls back to
-     * the host literal.
+     * the host literal, except after a link.
      */
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
@@ -1393,7 +1414,13 @@ const char *proc_resolve_sysroot_create_path(const char *path,
 
     if (!is_sysroot_backed_temp_path(path_to_check) &&
         !is_guest_system_path(path_to_check)) {
+        /* A link's target the host holds would make this a host create, which
+         * is refused. One it lacks fails on the sysroot spelling, as a create
+         * below a dangling link does on Linux.
+         */
         if (followed_link) {
+            if (host_parent_absent(path_to_check))
+                return buf;
             errno = ELOOP;
             return NULL;
         }
