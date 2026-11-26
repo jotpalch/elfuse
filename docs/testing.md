@@ -157,6 +157,11 @@ What they do:
     is wrong, whatever the folding lane says of it. The i18n lane
     runs in its `csapfs` mode, pinning the two divergences that
     configuration accepts (see `docs/filenames.md`)
+  - the `/dev/bus` backing run of `test-usb-sysfs-sysroot` again over a
+    scratch case-sensitive HFS+ image
+    (`test-usb-sysfs-sysroot-caseexact`), where the sysroot resolvers
+    take their byte-exact walk; it skips when `hdiutil` cannot make or
+    attach the image
   - the sysroot procfs exec, FUSE-on-Alpine, and `timeout=0` regressions
   - the Rosetta CLI gating regressions
   - the hot-syscall guardrail (`tests/test-bench-guardrail.sh`)
