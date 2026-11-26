@@ -287,6 +287,21 @@ static void test_link_budget_and_loops(void)
     EXPECT_TRUE(lstat(path, &st) == 0 && S_ISLNK(st.st_mode) &&
                     readlink(path, buf, sizeof(buf) - 1) > 0,
                 "the link itself exists");
+
+    TEST("a create below a dangling link reports ENOENT");
+    EXPECT_TRUE(link_to("/No.Such.Dir", "dangling-dir") == 0, "symlink");
+    at(path, sizeof(path), "dangling-dir/Made.Here");
+    EXPECT_ERRNO(mkdir(path, 0755), ENOENT, "should be ENOENT");
+
+    /* The macOS host holds /System/Library, so only the file the sysroot holds
+     * at /System decides this one.
+     */
+    TEST("a create below a link through a file reports ENOTDIR");
+    EXPECT_TRUE(file_write("/System", "") == 0 &&
+                    link_to("/System/Library", "through-file") == 0,
+                "fixture");
+    at(path, sizeof(path), "through-file/Made.Here");
+    EXPECT_ERRNO(mkdir(path, 0755), ENOTDIR, "should be ENOTDIR");
 }
 
 static void test_unlink_and_create(void)

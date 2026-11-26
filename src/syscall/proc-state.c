@@ -554,6 +554,22 @@ static bool sysroot_path_exists(const char *resolved_path, bool follow_final)
     return lstat(resolved_path, &st) == 0;
 }
 
+/* Whether the host holds the directory that would hold @path, an absolute name
+ * with no trailing slash, by the test the lookup resolver applies to a name
+ * reached through a link.
+ */
+static bool host_holds_parent(const char *path)
+{
+    char parent[LINUX_PATH_MAX];
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] != '/')
+        n--;
+    if (n > 1)
+        n--;
+    snprintf(parent, sizeof(parent), "%.*s", (int) n, path);
+    return sysroot_path_exists(parent, true);
+}
+
 static const char *copy_host_fallback_path(const char *path,
                                            char *buf,
                                            size_t bufsz)
@@ -1276,7 +1292,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
         return buf;
 
     char parent[LINUX_PATH_MAX];
-    bool parent_present;
+    bool parent_present, parent_notdir;
 
     /* The target does not exist yet, so what has to be decided is where it
      * would go: the host spelling of every component leading to it, and whether
@@ -1324,6 +1340,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
          */
         parent[walk.parent_offset] = '\0';
         parent_present = walk.parent_found;
+        parent_notdir = walk.notdir;
 
         /* A fold above the leaf means the parent the guest named is not the
          * entry the volume matched, so that parent does not exist. Both other
@@ -1372,6 +1389,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
          */
         if (!parent_present && errno != ENOENT && errno != ENOTDIR)
             return NULL;
+        parent_notdir = !parent_present && errno == ENOTDIR;
     }
 
     if (parent_present) {
@@ -1384,7 +1402,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
 
     /* Parent doesn't exist in sysroot. Only the temp roots and the guest system
      * directories are forced to resolve there; everything else falls back to
-     * the host literal.
+     * the host literal, except after a link.
      */
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
@@ -1393,7 +1411,13 @@ const char *proc_resolve_sysroot_create_path(const char *path,
 
     if (!is_sysroot_backed_temp_path(path_to_check) &&
         !is_guest_system_path(path_to_check)) {
+        /* A link's target the host holds would make this a host create, which
+         * is refused. One it lacks, or one a file cuts short, fails on the
+         * sysroot spelling, as on Linux.
+         */
         if (followed_link) {
+            if (parent_notdir || !host_holds_parent(path_to_check))
+                return buf;
             errno = ELOOP;
             return NULL;
         }
