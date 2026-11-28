@@ -1847,15 +1847,17 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	$(USB_SYSFS_BACKING)
 
 # The backing run. The lane makes the links to the host directory, whose path
-# only it knows. A '..' stops at the guest root, so both hrel targets name the
+# only it knows, and cl, as elfuse stores an absolute target a guest writes as a
+# relative one. A '..' stops at the guest root, so both hrel targets name the
 # host directory by its absolute path in the guest, which has to lie outside
 # every root the sysroot keeps, such as /tmp and /etc.
-USB_SYSFS_BACKING = mkdir -p "$$tmpdir/host" "$$sysroot/lk"; \
-	: > "$$tmpdir/host/f"; \
+USB_SYSFS_BACKING = mkdir -p "$$tmpdir/host" "$$sysroot/lk" \
+		"$$sysroot/dev/bus/usb"; : > "$$tmpdir/host/f"; \
 	ln -s "../..$$tmpdir/host" "$$sysroot/dev/bus/hrel"; \
 	ln -s "..$$tmpdir/host" "$$sysroot/lk/hrel"; \
 	ln -s "$$tmpdir/host" "$$sysroot/dev/bus/habs"; \
 	ln -s "$$tmpdir/host" "$$sysroot/lk/habs"; \
+	ln -s /lk/cf "$$sysroot/dev/bus/cl"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot backing
 

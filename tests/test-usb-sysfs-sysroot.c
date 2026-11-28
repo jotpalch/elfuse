@@ -7,15 +7,15 @@
  * Code under test: the /sys ours/not-ours split in src/runtime/usb-sysfs.c, the
  * /sys + /dev/bus arms of sys_fchdir (src/syscall/fs.c) and
  * resolve_proc_cwd_path (src/syscall/path.c), the /dev/bus climb rewrite in
- * usb_sysfs_resolve_dev_climb and path_translate_at, and the backing '..' in
- * path_backing_dotdot.
+ * usb_sysfs_resolve_dev_climb and path_translate_at, and the backing '..' and
+ * links in path_backing_dotdot and path_dev_bus_follow_link.
  *
  * Run under --sysroot over a tree that carries a real /sys skeleton
  * (/sys/class/net/eth0/address, /sys/kernel/mm/transparent_hugepage/enabled,
  * /sys/devices/system/node/online) and with ELFUSE_USB_FIXTURE set so the USB
  * tree carries two deterministic devices with no hardware attached.
  *
- * Five regressions are pinned here.
+ * Six regressions are pinned here.
  *
  * F1: the USB layer synthesizes only /sys/bus/usb. A name it does not model
  * (everything under /sys/class, /sys/kernel, /sys/devices) must fall through to
@@ -46,6 +46,8 @@
  * sysroot resolver's, and a relative one keeps a host fallback refused. The
  * lane runs the guest again with the argument backing, with hrel and habs under
  * /dev/bus and /lk linked to a host directory.
+ *
+ * F6: a /dev/bus link resolves in the guest namespace wherever it sits.
  */
 
 #include <dirent.h>
@@ -222,15 +224,78 @@ static bool make_split(const char *top, const char *name, int n)
            mkdir(d, 0755) == 0 && make_file(x);
 }
 
-static void check_backing_names(void)
+/* /dev/bus/@name/l0 starts @n links there that end at its directory d, which
+ * holds a file x.
+ */
+static bool make_local(const char *name, int n)
+{
+    char a[64], d[64], x[64];
+    snprintf(a, sizeof(a), "/dev/bus/%s", name);
+    snprintf(d, sizeof(d), "/dev/bus/%s/d", name);
+    snprintf(x, sizeof(x), "/dev/bus/%s/d/x", name);
+    return make_chain(a, n, "d") && mkdir(d, 0755) == 0 && make_file(x);
+}
+
+static bool same_file(const char *path, const struct stat *want)
 {
     struct stat st;
+    return stat(path, &st) == 0 && st.st_dev == want->st_dev &&
+           st.st_ino == want->st_ino;
+}
+
+static void check_backing_names(void)
+{
+    struct stat node, dir, st;
+    char buf[16];
 
     TEST("the names to test are made");
     bool made = make_split("/lk", "c40", 15) && make_split("/lk", "c41", 16);
     made = made && (mkdir("/tmp", 01777) == 0 || errno == EEXIST) &&
            make_split("/tmp", "t40", 15) && make_split("/tmp", "t41", 16);
+    made = made && make_local("w40", 40) && make_local("w41", 41) &&
+           symlink("usb", "/dev/bus/ulnk") == 0 &&
+           symlink("usb/001/001", "/dev/bus/unode") == 0 &&
+           symlink("/nonexist/cf", "/dev/bus/cn") == 0;
+    for (const char *c = "xyms"; made && *c; c++) {
+        char name[16], target[16];
+        snprintf(name, sizeof(name), "/dev/bus/cl%c", *c);
+        snprintf(target, sizeof(target), "../../lk/cf%c", *c);
+        made = symlink(target, name) == 0;
+    }
+    made = made && make_file("/System") &&
+           symlink("../../System/Library", "/dev/bus/sx") == 0;
     EXPECT_TRUE(made, "make the fixture");
+
+    /* Linux follows a link where the walk meets it, in the guest namespace. */
+    TEST("/dev/bus/usb/001/001 is a char device");
+    EXPECT_TRUE(stat("/dev/bus/usb/001/001", &node) == 0 &&
+                    S_ISCHR(node.st_mode) && stat("/dev/bus/usb", &dir) == 0,
+                "stat(\"/dev/bus/usb/001/001\")");
+
+    TEST("/dev/bus/ulnk/001/001 is the node");
+    EXPECT_TRUE(same_file("/dev/bus/ulnk/001/001", &node),
+                "stat(\"/dev/bus/ulnk/001/001\")");
+
+    TEST("/dev/bus/ulnk/001/../001/001 is the node");
+    EXPECT_TRUE(same_file("/dev/bus/ulnk/001/../001/001", &node),
+                "stat(\"/dev/bus/ulnk/001/../001/001\")");
+
+    TEST("stat follows /dev/bus/ulnk, lstat and readlink do not");
+    ssize_t n = readlink("/dev/bus/ulnk", buf, sizeof(buf));
+    EXPECT_TRUE(same_file("/dev/bus/ulnk", &dir) &&
+                    same_file("/dev/bus/ulnk/", &dir) &&
+                    lstat("/dev/bus/ulnk", &st) == 0 && S_ISLNK(st.st_mode) &&
+                    n == 3 && !memcmp(buf, "usb", 3),
+                "stat, lstat and readlink of /dev/bus/ulnk");
+
+    TEST("lstat follows it with a trailing slash");
+    EXPECT_TRUE(lstat("/dev/bus/ulnk/", &st) == 0 && st.st_dev == dir.st_dev &&
+                    st.st_ino == dir.st_ino,
+                "lstat(\"/dev/bus/ulnk/\")");
+
+    TEST("and keeps the slash for a link to the node");
+    EXPECT_ERRNO(stat("/dev/bus/unode/", &st), ENOTDIR,
+                 "stat(\"/dev/bus/unode/\")");
 
     /* Linux counts the links of one walk toward MAXSYMLINKS, 40
      * (include/linux/namei.h), and c40 and c41 start 25 under /dev/bus.
@@ -258,6 +323,78 @@ static void check_backing_names(void)
     EXPECT_ERRNO(mkdir("/dev/bus/t41/l0/../d/m", 0755), ELOOP,
                  "mkdir(\"/dev/bus/t41/l0/../d/m\")");
 
+    TEST("40 links and 41 with no '..' likewise");
+    EXPECT_TRUE(stat("/dev/bus/c40/l0/x", &st) == 0 && S_ISREG(st.st_mode) &&
+                    mkdir("/dev/bus/c40/l0/n", 0755) == 0,
+                "stat and mkdir through /dev/bus/c40/l0");
+    EXPECT_TRUE(stat("/dev/bus/t40/l0/x", &st) == 0 && S_ISREG(st.st_mode) &&
+                    mkdir("/dev/bus/t40/l0/n", 0755) == 0,
+                "stat and mkdir through /dev/bus/t40/l0");
+    EXPECT_ERRNO(stat("/dev/bus/c41/l0/x", &st), ELOOP,
+                 "stat(\"/dev/bus/c41/l0/x\")");
+    EXPECT_ERRNO(mkdir("/dev/bus/c41/l0/n", 0755), ELOOP,
+                 "mkdir(\"/dev/bus/c41/l0/n\")");
+    EXPECT_ERRNO(stat("/dev/bus/t41/l0/x", &st), ELOOP,
+                 "stat(\"/dev/bus/t41/l0/x\")");
+    EXPECT_ERRNO(mkdir("/dev/bus/t41/l0/n", 0755), ELOOP,
+                 "mkdir(\"/dev/bus/t41/l0/n\")");
+
+    TEST("40 links under /dev/bus alone resolve and 41 are ELOOP");
+    EXPECT_TRUE(stat("/dev/bus/w40/l0/x", &st) == 0 && S_ISREG(st.st_mode),
+                "stat(\"/dev/bus/w40/l0/x\")");
+    EXPECT_ERRNO(stat("/dev/bus/w41/l0/x", &st), ELOOP,
+                 "stat(\"/dev/bus/w41/l0/x\")");
+
+    /* The lane plants dev/bus/usb for the backing to walk. */
+    TEST("a '..' that pops /dev/bus/usb counts the link before it");
+    EXPECT_ERRNO(stat("/dev/bus/ulnk/../c40/l0/x", &st), ELOOP,
+                 "stat(\"/dev/bus/ulnk/../c40/l0/x\")");
+
+    TEST("open with O_CREAT follows a link to the node");
+    int fd = open("/dev/bus/unode", O_RDWR | O_CREAT, 0644);
+    EXPECT_TRUE(fd >= 0 && fstat(fd, &st) == 0 && st.st_dev == node.st_dev &&
+                    st.st_ino == node.st_ino,
+                "open(\"/dev/bus/unode\", O_RDWR | O_CREAT)");
+    if (fd >= 0)
+        close(fd);
+
+    TEST("O_EXCL and O_NOFOLLOW stop at a dangling link");
+    EXPECT_ERRNO(open("/dev/bus/clx", O_WRONLY | O_CREAT | O_EXCL, 0644),
+                 EEXIST, "open(\"/dev/bus/clx\", O_CREAT | O_EXCL)");
+    EXPECT_ERRNO(open("/dev/bus/cly", O_WRONLY | O_CREAT | O_NOFOLLOW, 0644),
+                 ELOOP, "open(\"/dev/bus/cly\", O_CREAT | O_NOFOLLOW)");
+    EXPECT_TRUE(lstat("/lk/cfx", &st) < 0 && lstat("/lk/cfy", &st) < 0,
+                "neither target is made");
+
+    TEST("mkdir and symlink stop at a link that ends the name");
+    EXPECT_ERRNO(mkdir("/dev/bus/clm", 0755), EEXIST,
+                 "mkdir(\"/dev/bus/clm\")");
+    EXPECT_ERRNO(symlink("x", "/dev/bus/cls"), EEXIST,
+                 "symlink(\"x\", \"/dev/bus/cls\")");
+    EXPECT_TRUE(lstat("/lk/cfm", &st) < 0 && lstat("/lk/cfs", &st) < 0,
+                "neither target is made");
+
+    /* The lane makes cl, whose absolute target /lk/cf the host would follow
+     * outside the sysroot.
+     */
+    TEST("open with O_CREAT through a dangling link makes its target");
+    fd = open("/dev/bus/cl", O_WRONLY | O_CREAT, 0644);
+    EXPECT_TRUE(fd >= 0 && stat("/lk/cf", &st) == 0 && S_ISREG(st.st_mode),
+                "open(\"/dev/bus/cl\", O_WRONLY | O_CREAT)");
+    if (fd >= 0)
+        close(fd);
+
+    TEST("and through one to a missing directory is ENOENT");
+    EXPECT_ERRNO(open("/dev/bus/cn", O_WRONLY | O_CREAT, 0644), ENOENT,
+                 "open(\"/dev/bus/cn\", O_WRONLY | O_CREAT)");
+
+    /* The macOS host holds /System/Library; the sysroot holds a file at
+     * /System.
+     */
+    TEST("a create through a link below a file is ENOTDIR");
+    EXPECT_ERRNO(mkdir("/dev/bus/sx/n", 0755), ENOTDIR,
+                 "mkdir(\"/dev/bus/sx/n\")");
+
     /* A sysroot link reaches the host only through an absolute target, which
      * test-sysroot-symlink-escape pins for a link the resolver follows.
      */
@@ -278,6 +415,26 @@ static void check_backing_names(void)
                  "mkdir(\"/dev/bus/habs/../host/n\")");
     EXPECT_ERRNO(mkdir("/lk/habs/../host/n", 0755), ELOOP,
                  "mkdir(\"/lk/habs/../host/n\")");
+
+    TEST("hrel/f is ELOOP and habs/f the host's file");
+    EXPECT_ERRNO(stat("/dev/bus/hrel/f", &st), ELOOP,
+                 "stat(\"/dev/bus/hrel/f\")");
+    EXPECT_ERRNO(stat("/lk/hrel/f", &st), ELOOP, "stat(\"/lk/hrel/f\")");
+    EXPECT_TRUE(stat("/dev/bus/habs/f", &st) == 0 && S_ISREG(st.st_mode) &&
+                    stat("/lk/habs/f", &st) == 0 && S_ISREG(st.st_mode),
+                "stat of habs/f under /dev/bus and /lk");
+
+    int dfd = open("/dev/bus", O_RDONLY | O_DIRECTORY);
+    TEST("\"ulnk/001/001\" against a /dev/bus dirfd is the node");
+    EXPECT_TRUE(dfd >= 0 && fstatat(dfd, "ulnk/001/001", &st, 0) == 0 &&
+                    st.st_dev == node.st_dev && st.st_ino == node.st_ino,
+                "fstatat(/dev/bus, \"ulnk/001/001\")");
+    if (dfd >= 0)
+        close(dfd);
+
+    TEST("\"ulnk/001/001\" in a /dev/bus cwd is the node");
+    EXPECT_TRUE(chdir("/dev/bus") == 0 && same_file("ulnk/001/001", &node),
+                "stat(\"ulnk/001/001\")");
 }
 
 int main(int argc, char **argv)
