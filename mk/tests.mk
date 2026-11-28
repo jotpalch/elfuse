@@ -36,6 +36,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-interp-fallback test-sysroot-interp-cased \
         test-sysroot-absock-names test-absock-cleanup test-registry-stale-pid \
         test-linkat-symlink-fallback test-casefold-host \
+        test-usb-sysfs-sysroot-caseexact \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
         test-usb-desc-host test-usbdev-urb-host test-elf-headers-host \
@@ -336,6 +337,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-sysroot-pathmax,guest paths at the host path ceiling)
 	$(call run-lane,test-sysroot-corpus,frozen on-disk spelling corpus)
 	$(call run-lane,test-sysroot-path-matrix,addressing modes agree across the path matrix)
+	$(call run-lane,test-usb-sysfs-sysroot-caseexact,the /dev/bus backing run on a case-sensitive volume)
 	$(call run-lane,test-usage-synopsis,usage synopsis renderings)
 	$(call run-lane,test-shebang-host,shebang parser unit test)
 	$(call run-lane,test-shim-futex-stats,futex EL1 fast path is live)
@@ -1841,7 +1843,41 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" --user 4242:4242 \
 		$(TEST_DIR)/test-usb-sysfs-sysroot search; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" --fakeroot \
-		$(TEST_DIR)/test-usb-sysfs-sysroot search root
+		$(TEST_DIR)/test-usb-sysfs-sysroot search root; \
+	$(USB_SYSFS_BACKING)
+
+# The backing run. The lane makes the links to the host directory, whose path
+# only it knows. A '..' stops at the guest root, so both hrel targets name the
+# host directory by its absolute path in the guest, which has to lie outside
+# every root the sysroot keeps, such as /tmp and /etc.
+USB_SYSFS_BACKING = mkdir -p "$$tmpdir/host" "$$sysroot/lk"; \
+	: > "$$tmpdir/host/f"; \
+	ln -s "../..$$tmpdir/host" "$$sysroot/dev/bus/hrel"; \
+	ln -s "..$$tmpdir/host" "$$sysroot/lk/hrel"; \
+	ln -s "$$tmpdir/host" "$$sysroot/dev/bus/habs"; \
+	ln -s "$$tmpdir/host" "$$sysroot/lk/habs"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-sysroot backing
+
+# The sysroot resolvers take their byte-exact walk only on a case-sensitive
+# volume, which the default macOS one is not, so check runs this over a scratch
+# Case-sensitive HFS+ image. It skips when hdiutil cannot make or attach one.
+## Re-run the /dev/bus backing run on a case-sensitive volume
+test-usb-sysfs-sysroot-caseexact: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
+	@dmg=$$(mktemp -u).dmg; mnt=$$(mktemp -d); \
+	trap 'hdiutil detach "$$mnt" -force -quiet >/dev/null 2>&1; rmdir "$$mnt" 2>/dev/null; rm -f "$$dmg"' EXIT; \
+	if ! hdiutil create -size 16m -fs "Case-sensitive HFS+" \
+	        -volname elfusebus -quiet "$$dmg" >/dev/null 2>&1; then \
+		printf "$(YELLOW)SKIP$(RESET) test-usb-sysfs-sysroot-caseexact (hdiutil create failed)\n"; \
+		exit 0; \
+	fi; \
+	if ! hdiutil attach "$$dmg" -nobrowse -mountpoint "$$mnt" -quiet \
+	        >/dev/null 2>&1; then \
+		printf "$(YELLOW)SKIP$(RESET) test-usb-sysfs-sysroot-caseexact (hdiutil attach failed)\n"; \
+		exit 0; \
+	fi; \
+	set -e; tmpdir="$$mnt"; sysroot="$$mnt/sysroot"; mkdir -p "$$sysroot/dev/bus"; \
+	$(USB_SYSFS_BACKING)
 
 ## Every entry point that can name something under /sys or /dev/bus, against
 ## every class of name those trees can hold. The layer synthesizes one subtree
