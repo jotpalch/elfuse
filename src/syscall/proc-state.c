@@ -853,11 +853,13 @@ static bool is_sysroot_backed_temp_path(const char *path)
  * rather than like a host path, which is what the host kernel would make of it.
  *
  * Iterative because a chain may be MAXSYMLINKS deep and each step needs a whole
- * path buffer; recursing would put 40 of them on the stack.
+ * path buffer; recursing would put 40 of them on the stack. The count starts at
+ * @links, the links the caller followed to reach @path.
  */
 static casefold_verdict_t resolve_through_links(const char *sr,
                                                 const char *path,
                                                 bool follow_final,
+                                                unsigned links,
                                                 char *buf,
                                                 size_t bufsz,
                                                 casefold_walk_t *walk,
@@ -869,7 +871,7 @@ static casefold_verdict_t resolve_through_links(const char *sr,
     char norm[LINUX_PATH_MAX];
     const char *cur = path;
 
-    for (int depth = 0;; depth++) {
+    for (unsigned depth = links;; depth++) {
         casefold_verdict_t verdict;
         char target[LINUX_PATH_MAX];
         const char *rest;
@@ -950,6 +952,7 @@ static casefold_verdict_t resolve_byte_exact_through_links(
     const char *sr,
     const char *path,
     bool follow_final,
+    unsigned links,
     char *buf,
     size_t bufsz,
     char *guest_out,
@@ -965,7 +968,7 @@ static casefold_verdict_t resolve_byte_exact_through_links(
         return CASEFOLD_ERROR;
     }
 
-    for (int depth = 0;; depth++) {
+    for (unsigned depth = links;; depth++) {
         const char *p = cur;
         size_t guest_len = 0;
         bool found_link = false;
@@ -1068,7 +1071,8 @@ static casefold_verdict_t resolve_byte_exact_through_links(
 static const char *proc_resolve_sysroot_path_flags(const char *path,
                                                    char *buf,
                                                    size_t bufsz,
-                                                   bool follow_final)
+                                                   bool follow_final,
+                                                   const path_walk_t *walked)
 {
     char sr[LINUX_PATH_MAX], clamped[LINUX_PATH_MAX];
     int seeded =
@@ -1098,8 +1102,9 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
      */
     bool present;
     bool folded = false;
-    bool followed_link = false;
-    bool followed_relative_link = false;
+    unsigned links = walked ? walked->links : 0;
+    bool followed_link = links > 0;
+    bool followed_relative_link = walked && walked->relative;
     bool walk_typed_all = false;
 
     /* One byte, not a 4 KiB zero-fill: only the leading NUL is read, and these
@@ -1110,7 +1115,7 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     if (casefold_active()) {
         casefold_walk_t walk;
         casefold_verdict_t verdict = resolve_through_links(
-            sr, lookup, follow_final, buf, bufsz, &walk, followed,
+            sr, lookup, follow_final, links, buf, bufsz, &walk, followed,
             sizeof(followed), &followed_relative_link);
 
         if (verdict == CASEFOLD_ERROR)
@@ -1146,15 +1151,18 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
          * the same absolute path from the guest: the sysroot when it is there,
          * the host when it is not and the path is not a guest system directory.
          */
-        followed_link = rebase_after_link(&lookup, followed);
-    } else if (!forced_original_path) {
+        followed_link = rebase_after_link(&lookup, followed) || followed_link;
+    } else if (!forced_original_path || links) {
+        /* A walk the caller started goes on here under any root, or the host
+         * would follow the links left and count them from zero.
+         */
         casefold_verdict_t verdict = resolve_byte_exact_through_links(
-            sr, lookup, follow_final, buf, bufsz, followed, sizeof(followed),
-            &followed_relative_link);
+            sr, lookup, follow_final, links, buf, bufsz, followed,
+            sizeof(followed), &followed_relative_link);
         if (verdict == CASEFOLD_ERROR)
             return NULL;
         present = verdict == CASEFOLD_FOUND;
-        followed_link = rebase_after_link(&lookup, followed);
+        followed_link = rebase_after_link(&lookup, followed) || followed_link;
 
         /* A probe that dies with ENOTDIR found a sysroot component that is not
          * a directory. Linux resolves left to right and fails there with
@@ -1207,8 +1215,11 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     if (folded)
         return buf;
 
+    /* A name the caller reached through links is not one the guest typed, so it
+     * takes the rule below for a followed link.
+     */
     char real_input_path[LINUX_PATH_MAX];
-    if (!forced_original_path && realpath(path, real_input_path)) {
+    if (!forced_original_path && !links && realpath(path, real_input_path)) {
         size_t sr_len = strlen(sr);
         if (strncmp(real_input_path, sr, sr_len) != 0 ||
             (sr_len != 1 && real_input_path[sr_len] != '\0' &&
@@ -1254,22 +1265,27 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     return path;
 }
 
-const char *proc_resolve_sysroot_path(const char *path, char *buf, size_t bufsz)
+const char *proc_resolve_sysroot_path(const char *path,
+                                      char *buf,
+                                      size_t bufsz,
+                                      const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_path_flags(path, buf, bufsz, true);
+    return proc_resolve_sysroot_path_flags(path, buf, bufsz, true, walked);
 }
 
 const char *proc_resolve_sysroot_nofollow_path(const char *path,
                                                char *buf,
-                                               size_t bufsz)
+                                               size_t bufsz,
+                                               const path_walk_t *walked)
 {
-    return proc_resolve_sysroot_path_flags(path, buf, bufsz, false);
+    return proc_resolve_sysroot_path_flags(path, buf, bufsz, false, walked);
 }
 
 const char *proc_resolve_sysroot_create_path(const char *path,
                                              char *buf,
                                              size_t bufsz,
-                                             bool create_parents)
+                                             bool create_parents,
+                                             const path_walk_t *walked)
 {
     char sr[LINUX_PATH_MAX], clamped[LINUX_PATH_MAX];
     int seeded = sysroot_seed_host_path(path, buf, bufsz, sr, clamped, false);
@@ -1300,7 +1316,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      * neither: a parent stored escaped reads as absent, and a wrong-case one
      * folds onto a directory the create would then land in.
      */
-    bool followed_link = false;
+    bool followed_link = walked && walked->links > 0;
     bool followed_relative_link = false;
 
     /* One byte, not a 4 KiB zero-fill: only the leading NUL is read, and these
@@ -1316,11 +1332,11 @@ const char *proc_resolve_sysroot_create_path(const char *path,
          * of them lets a create below a link land beside the link instead of
          * inside the directory the link names.
          */
-        if (resolve_through_links(sr, lookup, false, buf, bufsz, &walk,
-                                  followed, sizeof(followed),
+        if (resolve_through_links(sr, lookup, false, walked ? walked->links : 0,
+                                  buf, bufsz, &walk, followed, sizeof(followed),
                                   &followed_relative_link) == CASEFOLD_ERROR)
             return NULL;
-        followed_link = rebase_after_link(&lookup, followed);
+        followed_link = rebase_after_link(&lookup, followed) || followed_link;
         if (str_copy_trunc(parent, buf, sizeof(parent)) >= sizeof(parent)) {
             errno = ENAMETOOLONG;
             return NULL;
@@ -1353,7 +1369,21 @@ const char *proc_resolve_sysroot_create_path(const char *path,
             return NULL;
         }
     } else {
-        /* @buf already holds sr + the clamped lookup, spelled by the seed. */
+        /* @buf already holds sr + the clamped lookup, spelled by the seed. A
+         * walk the caller started goes on through the links before the leaf, as
+         * for a lookup, so the host's access below finds none left.
+         */
+        if (followed_link) {
+            if (resolve_byte_exact_through_links(
+                    sr, lookup, false, walked->links, buf, bufsz, followed,
+                    sizeof(followed), NULL) == CASEFOLD_ERROR)
+                return NULL;
+            rebase_after_link(&lookup, followed);
+            if (snprintf(buf, bufsz, "%s%s", sr, lookup) >= (int) bufsz) {
+                errno = ENAMETOOLONG;
+                return NULL;
+            }
+        }
 
         /* An all-slash guest path ("/", "///") names the root, which always
          * exists and has no parent to check; trimming it would walk strrchr
