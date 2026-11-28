@@ -370,18 +370,26 @@ component is, and only the last one honors a caller's request not to. So
 ### A link may not leave the sysroot
 
 An absolute target resolves against the sysroot, exactly as the same path typed
-by the guest would, which is what a chroot-like tree owes. It does not,
-however, inherit the host fallback that a typed path gets. A path the guest
-names itself may fall through to the host when the sysroot does not have it; a
-path arrived at by following a link may not, because anything able to write a
-symlink into the tree could otherwise hand the guest a file from outside it.
+by the guest would, which is what a chroot-like tree owes. It inherits the host
+fallback that a typed path gets only in part. A path the guest names itself may
+fall through to the host when the sysroot does not have it. A path arrived at
+through a relative link may not, because a guest able to write a symlink into
+the tree could otherwise hand itself a file from outside it, and neither may a
+create through any link, so that no link makes a new host file. A guest cannot
+store an absolute target, since creation rewrites the one it writes to a
+relative one, so a name reached only through absolute links keeps the fallback
+for a lookup.
 
-A link whose target the sysroot does not hold therefore ends one of two ways:
+Outside the roots the sysroot keeps, a link whose target the sysroot does not
+hold therefore ends one of these ways:
 
 - the host has nothing there either, so the link simply dangles and the guest
-  gets `ENOENT`
+  gets `ENOENT`, or `ENOTDIR` where a file in the sysroot cuts the walk short
 - the host does have something there, which is the escape the rule exists to
-  stop, and the guest gets `ELOOP`
+  stop: the guest gets `ELOOP` after a relative link, and for a create whose
+  directory only the host holds
+- the host does have it and every link followed was absolute, so a lookup
+  reaches the host's file
 
 Operations that do not follow are untouched throughout: `lstat`, `readlink`,
 `unlink`, `rename`, and `linkat` without `AT_SYMLINK_FOLLOW` all keep seeing the
